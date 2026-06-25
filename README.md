@@ -28,12 +28,35 @@ built-in keyboard to stop registering stray presses.
 ## Requirements
 
 * Python 3.11+ (for `tomllib`) and
-  [`python-evdev`](https://python-evdev.readthedocs.io/)
-  * Debian/Ubuntu/Pop!\_OS: `sudo apt install python3-evdev`
-  * Arch: `sudo pacman -S python-evdev`
+  [`python-evdev`](https://python-evdev.readthedocs.io/).
 * `systemd` and `sudo` (the daemon is a root system service).
-* The tray additionally needs PyGObject + `AyatanaAppIndicator3` — see
-  [Tray icon](#tray-icon).
+* The tray (optional) additionally needs PyGObject + GTK 3 +
+  `AyatanaAppIndicator3` — see [Tray icon](#tray-icon).
+
+Install the dependencies for your distro — the **daemon** line is required, the
+**tray** line is only needed if you want the [tray icon](#tray-icon):
+
+**Ubuntu / Debian / Pop!\_OS** (`apt`) — needs Python ≥ 3.11 for `tomllib`
+(Ubuntu 24.04+; on 22.04 install a newer Python):
+
+```sh
+sudo apt install python3 python3-evdev                                    # daemon
+sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 # tray
+```
+
+**Fedora** (`dnf`):
+
+```sh
+sudo dnf install python3 python3-evdev                                    # daemon
+sudo dnf install python3-gobject gtk3 libayatana-appindicator-gtk3        # tray
+```
+
+**Arch / Manjaro** (`pacman`):
+
+```sh
+sudo pacman -S python python-evdev                                        # daemon
+sudo pacman -S python-gobject gtk3 libayatana-appindicator                # tray
+```
 
 ## Install
 
@@ -191,9 +214,8 @@ systemctl --user enable --now kb-kill-tray   # tray only; install.sh already doe
 * Works natively on **COSMIC** and **KDE Plasma**. On **GNOME** it needs the
   [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/)
   (GNOME has no native tray).
-* Requires PyGObject with `Gtk 3.0` and `AyatanaAppIndicator3`
-  (`gir1.2-ayatanaappindicator3-0.1` on Debian/Pop, `libayatana-appindicator`
-  on Arch).
+* Requires PyGObject with `Gtk 3.0` and `AyatanaAppIndicator3` — install the
+  "tray" line for your distro in [Requirements](#requirements).
 * The icons live in `~/.config/kb-kill/icons/` and the menu lists every group
   from your config, so multiple groups each get their own toggle entry.
 
