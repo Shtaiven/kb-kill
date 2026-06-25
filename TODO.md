@@ -1,6 +1,4 @@
 # TODO
-- pixi installable
-- pyproject.toml or pixi.toml
 - Better logo
 - Config from tray icon
 - Better tray UI
