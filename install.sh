@@ -8,6 +8,20 @@
 # Idempotent — re-run it to redeploy after editing the daemon code.
 set -euo pipefail
 
+# Run as the normal user, NOT under sudo. This script does the user-side setup
+# (symlinks in ~/.local/bin, config in ~/.config, the tray *user* service) as you
+# and self-elevates with sudo only for the root daemon parts. Under `sudo`, those
+# user files would be created root-owned in your home and `systemctl --user`
+# would target root's bus, not yours — so refuse and point at the right command.
+if [ "$(id -u)" -eq 0 ]; then
+  printf '\033[0;31m[error]\033[0m Do not run this installer as root / with sudo.\n' >&2
+  if [ -n "${SUDO_USER:-}" ]; then
+    printf '  Run it as your normal user; it calls sudo itself when needed:\n' >&2
+    printf '      ./install.sh\n' >&2
+  fi
+  exit 1
+fi
+
 PROJECT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 USER_NAME="${SUDO_USER:-$USER}"
 USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
