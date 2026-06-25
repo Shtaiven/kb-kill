@@ -9,6 +9,20 @@
 # install.sh placed (binaries, units, icons) and stops the services.
 set -euo pipefail
 
+# Run as the normal user, NOT under sudo. This script does the user-side teardown
+# (your ~/.local/bin symlinks, the tray *user* service) as you and self-elevates
+# with sudo only for the root daemon parts. Under `sudo`, `systemctl --user`
+# would target root's bus, not yours, so the tray wouldn't actually be stopped —
+# refuse and point at the right command.
+if [ "$(id -u)" -eq 0 ]; then
+  printf '\033[0;31m[error]\033[0m Do not run this uninstaller as root / with sudo.\n' >&2
+  if [ -n "${SUDO_USER:-}" ]; then
+    printf '  Run it as your normal user; it calls sudo itself when needed:\n' >&2
+    printf '      ./uninstall.sh\n' >&2
+  fi
+  exit 1
+fi
+
 PROJECT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 USER_NAME="${SUDO_USER:-$USER}"
 USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
