@@ -28,6 +28,11 @@ This program is written mostly by agentic AI (Claude using Opus 4.8). Read the s
 * No virtual device. kb-kill runs as a **hardened root system daemon** so that no
   ordinary user process needs access to your keyboards — see
   [Security model](#security-model).
+* **It follows whoever is logged in.** The daemon has no config of its own: a tiny
+  per-user service (`kb-kill-push`) hands it your config, and the daemon uses the
+  config of whoever currently controls the seat — graphical desktop **or** TTY —
+  switching automatically on fast-user-switch / VT change. Nothing is tied to the
+  person who installed it.
 
 ## Requirements
 
@@ -70,15 +75,18 @@ kb-kill is self-contained — run its installer (it uses `sudo` for the root par
 ./install.sh
 ```
 
-This: symlinks `kb-kill`/`kb-kill-tray` into `~/.local/bin`; installs the default
-config to `~/.config/kb-kill/kb-kill.toml` (asks before overwriting an existing
-one); installs + enables the **tray** user service; copies the daemon to
-`/usr/local/bin/kb-kill` (root-owned) and the hardened unit to
-`/etc/systemd/system/kb-kill.service`; and enables the system service.
+This: symlinks `kb-kill-push`/`kb-kill-tray` into `~/.local/bin`; installs the
+default config to `~/.config/kb-kill/kb-kill.toml` (asks before overwriting an
+existing one); installs + enables the **push** user service (mandatory — it feeds
+your config to the daemon) and the **tray** user service (optional UI); copies the
+daemon to `/usr/local/bin/kb-kill-daemon` (root-owned) and the hardened unit to
+`/etc/systemd/system/kb-kill-daemon.service`; and enables the system service. (It
+also cleans up the pre-rename `kb-kill.service` / `/usr/local/bin/kb-kill` if present.)
 
 ```sh
-systemctl status kb-kill                 # the root daemon
-journalctl -u kb-kill -f                 # watch KILLED / WOKEN live
+systemctl status kb-kill-daemon          # the root daemon
+systemctl --user status kb-kill-push     # the per-user config pusher (mandatory)
+journalctl -u kb-kill-daemon -f          # watch "live config", KILLED / WOKEN live
 ```
 
 Then, for the full security benefit, remove yourself from the `input` group so no
@@ -91,6 +99,10 @@ sudo gpasswd -d "$USER" input            # then log out and back in
 Re-run `./install.sh` to redeploy after editing the daemon code (the daemon runs
 from the root-owned copy, not your working tree).
 
+On a multi-user machine, every user who wants kb-kill enables their own
+`kb-kill-push` (the installer does it for the user who runs it). The root daemon
+is shared and always uses the config of whoever is **currently** at the seat.
+
 To remove everything (binaries, units, icons; stops the services) while keeping
 your config and the project files:
 
@@ -100,9 +112,11 @@ your config and the project files:
 
 ## Configuration
 
-Config is [TOML](https://toml.io), read from the first of: `--config PATH`,
-`$KB_KILL_CONFIG`, `~/.config/kb-kill/kb-kill.toml`, `~/.kb-kill`,
-`/etc/kb-kill/kb-kill.toml`.
+Config is [TOML](https://toml.io). Your `kb-kill-push` service finds it from the
+first of: `$KB_KILL_CONFIG`, `~/.config/kb-kill/kb-kill.toml`, `~/.kb-kill`,
+`/etc/kb-kill/kb-kill.toml`, and pushes it to the daemon. (The daemon never reads
+the file itself; `kb-kill-daemon detect`/`monitor` and `-c PATH` use the same search
+for the invoking user.)
 
 A simple single-keyboard config:
 
@@ -114,34 +128,34 @@ virtual_keyboard = true           # input-remapper-managed; see coexistence belo
 ```
 
 `keyboards` is a string or a list of strings — case-insensitive substrings
-matched against device names (`kb-kill detect` shows the names). Use
+matched against device names (`kb-kill-daemon detect` shows the names). Use
 `keyboards = "*"` to match **every** keyboard.
 
-The config is **hot-reloaded**: edit the file and the running service picks it up
-within ~2 s (or send it `SIGHUP`). A group that is currently killed keeps that
-state across the reload (so a reload never surprise-enables a disabled keyboard),
-and if the new file fails to parse the error is logged and the previous config is
-kept. The tray updates its menu automatically when groups change.
+The config is **applied live**: edit the file and `kb-kill-push` re-pushes it within
+~1 s. A group that is currently killed keeps that state across an edit (so a re-push
+never surprise-enables a disabled keyboard), and if the new file fails to parse the
+error is logged and the previous config is kept. (Switching to a *different* user,
+however, always starts that user's config **awake** — see
+[Multiple users](#multiple-users).) The tray updates its menu automatically.
 
 `virtual_keyboard` (default `false`): set `true` when the keyboard is fronted by
 an input-remapper "forwarded" virtual device — kb-kill then targets that virtual
 device and never the physical one. Leave it `false` for an ordinary keyboard,
 which kb-kill grabs directly.
 
-### Control socket (for the tray)
+### Multiple users
 
-Two top-level keys gate the tray's control channel:
+The root daemon is shared, but only the config of the user **currently controlling
+the seat** governs the keyboard (logind's active session, graphical or TTY). Other
+logged-in users' configs are held but dormant. On a user switch the daemon swaps to
+the now-active user's config and starts it **awake** — a kill is never inherited
+across the switch, so you can never land on a pre-disabled keyboard (or disable the
+login greeter). When no active user has a config (e.g. the login screen), the daemon
+is idle and every keyboard works normally.
 
-```toml
-control_socket = true          # default false: no control socket / no inbound surface
-control_user   = "your-name"   # who may command the daemon; default = config-file owner
-```
-
-`control_socket` must be `true` for the tray to show state and toggle groups. The
-socket carries only group state — **never keystrokes** — and the daemon
-authenticates each connection by the kernel-verified peer uid (`SO_PEERCRED`):
-only `control_user` (or root) is accepted, others are dropped. See
-[Security model](#security-model).
+The old `control_socket` / `control_user` / `control_uid` keys are **obsolete** and
+ignored: the control socket is always on, and the user pushing the active config is
+automatically the one authorized to command the daemon.
 
 ### Groups: per-keyboard hotkeys
 
@@ -192,24 +206,26 @@ every group has at least one key held.
 ## Commands
 
 ```sh
-kb-kill                       # run the service (same as `kb-kill run`); systemd does this as root
-sudo kb-kill detect           # list keyboards + which are targets + parsed combos
-sudo kb-kill monitor          # print raw key events (debugging)
-kb-kill -c PATH <cmd>         # use a specific config file
+kb-kill-daemon                # run the service (same as `... run`); systemd does this as root, config-less
+sudo kb-kill-daemon detect    # list keyboards + which are targets + parsed combos
+sudo kb-kill-daemon monitor   # print raw key events (debugging)
+kb-kill-daemon -c PATH run    # run with a specific config pinned live (ad-hoc testing, no pusher needed)
 ```
 
 `detect` is the place to start. It needs `sudo` because reading input devices is
-now restricted to root (you're no longer in the `input` group).
+now restricted to root (you're no longer in the `input` group). The service itself
+(`kb-kill-daemon run` with no `-c`) starts config-less and waits for `kb-kill-push`.
 
 ## Tray icon
 
 `kb-kill-tray` is an optional tray icon (StatusNotifierItem) that shows whether
 any group is **disabled** (⛔) or **active** (⌨) and lets you toggle a group by
-clicking its menu entry. It is the **only** user-level piece: an unprivileged
-**user** service that never sees keystrokes and just talks to the root daemon
-over the control socket (`/run/kb-kill/control.sock`). The daemon itself is a
-**root system service** (`systemctl … kb-kill`, no `--user`). Requires
-`control_socket = true`.
+clicking its menu entry. It is an unprivileged **user** service that never sees
+keystrokes and just talks to the root daemon over the control socket
+(`/run/kb-kill/control.sock`) — the same socket `kb-kill-push` uses. The daemon
+itself is a **root system service** (`systemctl … kb-kill-daemon`, no `--user`). No
+config flag is needed (the socket is always on); the tray can only command the
+daemon while you are the active user.
 
 ```sh
 systemctl --user enable --now kb-kill-tray   # tray only; install.sh already does this
@@ -224,8 +240,10 @@ systemctl --user enable --now kb-kill-tray   # tray only; install.sh already doe
   from your config, so multiple groups each get their own toggle entry.
 
 The control socket is also a small JSON line protocol if you want to script it:
-send `{"cmd":"toggle","group":"<name>"}` (or `kill`/`wake`/`status`); the
-service replies/broadcasts `{"type":"state","groups":[{"name","killed","targets"}]}`.
+send `{"cmd":"toggle","group":"<name>"}` (or `kill`/`wake`/`status`) — accepted only
+while you are the active user; the service replies/broadcasts
+`{"type":"state","groups":[{"name","killed","targets"}]}`. (Config is delivered the
+same way: `{"cmd":"set_config","toml":"<text>"}`, which is what `kb-kill-push` sends.)
 
 ## input-remapper coexistence
 
@@ -269,26 +287,34 @@ minimizes and contains that:
 * **No keystrokes are ever stored or transmitted.** The daemon keeps only the set
   of keys *currently held* (for combo matching) and discards them on key-up —
   there is no history, no log, no file, no network. The control socket carries
-  only group state (`{name, killed, targets}`), never key data. (`kb-kill monitor`
-  is a manual debug tool that prints to the terminal; the service never does.)
+  config text + group state (`{name, killed, targets}`), **never key data**.
+  (`kb-kill-daemon monitor` is a manual debug tool that prints to the terminal; the
+  service never does.)
 * **Runs as a hardened root daemon, so you can leave the `input` group.** That
   group is the real exposure — it lets *any* user process read every keyboard.
   With the root daemon you remove yourself from it
   (`sudo gpasswd -d "$USER" input`), so only the one audited, sandboxed process
   can read input.
-* **The daemon binary is root-owned** (`/usr/local/bin/kb-kill`), never your
+* **The daemon binary is root-owned** (`/usr/local/bin/kb-kill-daemon`), never your
   user-writable working tree — a root service running a user-writable script
-  would be a privilege-escalation hole. (Config may live in your home: it has no
-  executable content.)
-* **systemd sandbox** (`/etc/systemd/system/kb-kill.service`): no network
+  would be a privilege-escalation hole. (Config never executes — it is parsed as
+  TOML, and arrives over the socket rather than being read from disk.)
+* **systemd sandbox** (`/etc/systemd/system/kb-kill-daemon.service`): no network
   (`RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`), only input devices
-  (`DevicePolicy=closed` + `DeviceAllow=char-input`), all capabilities dropped,
-  `SystemCallFilter`, `MemoryDenyWriteExecute`, `ProtectSystem=strict`, etc. — so
-  even a hypothetical code-injection can't exfiltrate or touch other devices.
-* **Control socket is optional and authenticated.** Off unless
-  `control_socket = true`; the daemon checks the connecting peer's kernel-verified
-  uid (`SO_PEERCRED`) and accepts only `control_user`/root; it bounds per-client
-  buffering and connection count against DoS.
+  (`DevicePolicy=closed` + `DeviceAllow=char-input`), `SystemCallFilter`,
+  `MemoryDenyWriteExecute`, `ProtectSystem=strict`, etc. The push model makes the
+  sandbox **tighter** than before: config never touches the filesystem, so **all
+  capabilities are dropped** (`CapabilityBoundingSet=` empty) and home is invisible
+  (`ProtectHome=true`). Even a hypothetical code-injection can't exfiltrate or touch
+  other devices.
+* **Control socket: always on, per-command authenticated.** It is how config is
+  delivered, so it accepts connections from any local user (mode 0666) — but the
+  kernel-verified peer uid (`SO_PEERCRED`) gates every command: a pushed config only
+  governs the keyboard while that user is the **active** seat user, and only that
+  user may kill/wake/toggle. It bounds per-client buffering, total connections, and
+  connections per user against DoS, and drops idle connections. Scope is a single
+  seat (`seat0`); any process of the active user (not only `kb-kill-push`) can
+  command the daemon, which is within that user's own trust boundary.
 
 ## Files
 
@@ -296,11 +322,13 @@ All in the self-contained project dir `scripts/kb-kill/`:
 
 | Path | Purpose |
 |---|---|
-| `kb-kill` | the daemon (Python) — installed to `/usr/local/bin/kb-kill` (root) |
+| `kb-kill-daemon` | the daemon (Python) — installed to `/usr/local/bin/kb-kill-daemon` (root) |
+| `kb-kill-push` | mandatory per-user config pusher (Python, stdlib) — user process |
 | `kb-kill-tray` | optional tray icon (Python / AppIndicator) — user process |
 | `install.sh` | installer (user side + sudo root side) |
 | `uninstall.sh` | reverses the install (keeps your config + project files) |
-| `kb-kill.service` | hardened **system** unit → `/etc/systemd/system/` |
+| `kb-kill-daemon.service` | hardened **system** unit → `/etc/systemd/system/` |
+| `kb-kill-push.service` | pusher **user** unit → `~/.config/systemd/user/` |
 | `kb-kill-tray.service` | tray **user** unit → `~/.config/systemd/user/` |
 | `kb-kill.toml` | example/default config |
 | `icons/` | tray icons (awake / killed) |
@@ -310,12 +338,16 @@ Your personal config is kept in the dotfiles at
 
 ## Troubleshooting
 
-* **Nothing happens on the hotkey** — `sudo kb-kill detect`; confirm a target is
-  found. If a key in your combo is remapped by input-remapper, use its remapped
-  form.
+* **Nothing happens on the hotkey** — first check the daemon actually has your
+  config: `journalctl -u kb-kill-daemon -e` should show a `live config: uid <you>`
+  line. If it says `idle`, your `kb-kill-push` isn't running or you aren't the active
+  seat user — `systemctl --user status kb-kill-push`. Then `sudo kb-kill-daemon
+  detect` to confirm a target is found. If a key in your combo is remapped by
+  input-remapper, use its remapped form.
 * **A keyboard can't kill/wake itself** — restart the daemon after a code
-  redeploy: `sudo systemctl restart kb-kill`.
-* **Tray shows "connecting…"** — the daemon isn't running or `control_socket` is
-  `false`; check `systemctl status kb-kill` and the config.
+  redeploy: `sudo systemctl restart kb-kill-daemon`.
+* **Tray shows "connecting…"** — the daemon isn't running; check
+  `systemctl status kb-kill-daemon`. If the tray connects but shows no groups, you
+  may not be the active seat user (state is only sent to the live user).
 * **Stuck modifier after killing from the target** — shouldn't happen: kb-kill
   defers the grab until the target has no keys held. Report if it does.

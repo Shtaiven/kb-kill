@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""kb-kill-push - hand the kb-kill daemon this user's config.
+
+The kb-kill daemon (`kb-kill-daemon`) starts config-less and is *told* what to do
+over its control socket, like input-remapper's daemon. This tiny unprivileged
+service - one per logged-in user - reads the user's config file and pushes its
+contents to the daemon, re-pushing whenever the file changes and reconnecting if
+the socket drops. The daemon only acts on the config of whoever currently
+controls the seat, so simply running this in every session makes the daemon
+follow the active user automatically.
+
+It is deliberately separate from the optional tray (`kb-kill-tray`) so config
+push works with no GUI. Stdlib only - no third-party deps.
+
+Security: the config TEXT crosses the socket (never any keystroke). The daemon
+binds the config to this process's kernel-verified uid (SO_PEERCRED) and only
+lets it govern the keyboard while this uid is the active seat user.
+"""
+
+import json
+import os
+import socket
+import sys
+import time
+from pathlib import Path
+
+POLL_SECONDS = 1.0          # how often to check the config file for edits
+RECONNECT_SECONDS = 2.0     # backoff between connection attempts
+
+
+def log(msg):
+    sys.stderr.write(f"kb-kill-push: {msg}\n")
+    sys.stderr.flush()
+
+
+def config_path():
+    """First existing config for this user (mirrors the daemon's search order).
+
+    Runs as the user, so Path.home() / the environment are authoritative - no
+    sudo/SUDO_USER recovery needed. Returns None if nothing exists yet (we keep
+    retrying so a config created later is picked up)."""
+    env = os.environ.get("KB_KILL_CONFIG")
+    if env:
+        return Path(env).expanduser()
+    home = Path.home()
+    candidates = [
+        home / ".config" / "kb-kill" / "kb-kill.toml",
+        home / ".config" / "kb-kill" / "kb-kill.conf",
+        home / ".kb-kill" / "kb-kill.toml",
+        home / ".kb-kill",
+        Path("/etc/kb-kill/kb-kill.toml"),
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p
+    return None
+
+
+def socket_path():
+    """Where the daemon's control socket lives (root service -> /run/kb-kill;
+    an unprivileged dev daemon -> the user runtime dir)."""
+    run = "/run/kb-kill/control.sock"
+    if os.path.exists(run):
+        return run
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if base and os.path.exists(os.path.join(base, "kb-kill.sock")):
+        return os.path.join(base, "kb-kill.sock")
+    return run  # default to the system path; connect() will retry until it exists
+
+
+def read_config():
+    """Return (text, mtime) for the current config, or (None, None) if absent."""
+    p = config_path()
+    if p is None:
+        return None, None
+    try:
+        return p.read_text(), p.stat().st_mtime
+    except OSError as e:
+        log(f"cannot read {p}: {e}")
+        return None, None
+
+
+def push(sock, text):
+    sock.sendall((json.dumps({"cmd": "set_config", "toml": text}) + "\n").encode())
+
+
+def serve_once():
+    """One connection lifetime: connect, push, then re-push on every edit until
+    the socket drops. Returns when the connection is lost."""
+    path = socket_path()
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(path)
+    except OSError:
+        sock.close()
+        return  # daemon not up yet; caller backs off and retries
+
+    log(f"connected to {path}")
+    text, mtime = read_config()
+    if text is None:
+        log("no config file found yet; will push when one appears")
+    else:
+        try:
+            push(sock, text)
+            log("pushed config")
+        except OSError:
+            sock.close()
+            return
+
+    sock.settimeout(POLL_SECONDS)
+    try:
+        while True:
+            # Detect a dropped socket and drain any state the daemon sends
+            # (we don't need it, but EOF/error tells us to reconnect).
+            try:
+                data = sock.recv(65536)
+                if not data:
+                    log("daemon closed the connection")
+                    return
+            except socket.timeout:
+                pass
+            except OSError:
+                log("connection error")
+                return
+
+            new_text, new_mtime = read_config()
+            if new_text is not None and (new_mtime != mtime or text is None):
+                try:
+                    push(sock, new_text)
+                    log("config changed; re-pushed")
+                except OSError:
+                    return
+                text, mtime = new_text, new_mtime
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def main():
+    log("starting; following this user's config")
+    while True:
+        serve_once()
+        time.sleep(RECONNECT_SECONDS)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)

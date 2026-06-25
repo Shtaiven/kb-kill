@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""kb-kill - disable/enable a target keyboard on a global hotkey.
+"""kb-kill-daemon - disable/enable a target keyboard on a global hotkey.
 
-Runs as a long-lived service. Any keyboard can press the configured *kill*
+Runs as a long-lived root service. Any keyboard can press the configured *kill*
 hotkey to disable (grab + eat all events from) the target keyboard(s). While
 killed, every key from the target is swallowed EXCEPT the *wake* hotkey, so the
 target keyboard can always wake itself - there is no way to lock yourself out.
+
+Config arrives by PUSH, not from a file path: the daemon starts config-less and
+each logged-in user's `kb-kill-push` sends their config (TOML text) over the
+control socket. The daemon honours only the config of the user who currently
+controls a seat (logind's ACTIVE_UID, graphical or TTY), and switches when the
+active user switches - so it always follows whoever is actually at the machine.
+`-c PATH` pins a file config live for ad-hoc testing; detect/monitor read a file.
 
 Design notes
 ------------
@@ -26,6 +33,7 @@ of the `input` group is enough - root is not required).
 """
 
 import argparse
+import ctypes
 import errno
 import json
 import os
@@ -134,16 +142,38 @@ CONFIG_SEARCH = [
 DEFAULT_KILL = "ctrl+alt+shift+k"
 DEFAULT_WAKE = "ctrl+alt+shift+u"
 
-# How often (seconds) to rescan for hotplugged / recreated devices.
+# How often (seconds) to rescan for hotplugged / recreated devices. Also the
+# backstop interval for re-checking the active seat user (the inotify watch on
+# the seats dir makes switches near-instant; this only covers a missed event).
 RESCAN_INTERVAL = 2.0
 
-# Control-socket DoS bounds.
-MAX_CLIENTS = 8           # concurrent control connections
-MAX_LINE = 4096           # bytes buffered per client before a newline; drop if exceeded
+# Control-socket DoS bounds. The socket is connectable by any local user (the
+# SO_PEERCRED uid is the real gate), so the bounds are per-uid as well as global.
+MAX_CLIENTS = 16          # concurrent control connections (global)
+MAX_CONNS_PER_UID = 2     # so one user cannot starve the global pool
+MAX_LINE = 65536          # bytes buffered per client before a newline; drop if exceeded
+                          # (a full set_config TOML payload, JSON-escaped, must fit)
+HANDSHAKE_SECONDS = 10    # drop a connection that sends no valid command in this long
+
+# logind exposes the foreground session's user per seat here, as ACTIVE_UID=.
+# We read this file (systemd marks it "do not parse", so we parse defensively and
+# tolerate any field being absent) rather than dlopen libsystemd for
+# sd_seat_get_active(), which would risk tripping MemoryDenyWriteExecute.
+SEATS_DIR = "/run/systemd/seats"
+
+# inotify event masks (we only need "something in the seats dir changed").
+_IN_MODIFY = 0x00000002
+_IN_CLOSE_WRITE = 0x00000008
+_IN_MOVED_TO = 0x00000080
+_IN_CREATE = 0x00000100
+_IN_DELETE = 0x00000200
+_SEAT_MASK = _IN_MODIFY | _IN_CLOSE_WRITE | _IN_MOVED_TO | _IN_CREATE | _IN_DELETE
 
 # Selector tag for the control socket's listening fd (devices use their path
-# string as the tag; clients use ("client", conn)).
+# string as the tag; clients use ("client", conn); the seat inotify fd uses
+# _SEATWATCH).
 _LISTEN = object()
+_SEATWATCH = object()
 
 
 def control_socket_path():
@@ -164,6 +194,82 @@ def control_socket_path():
 def log(msg):
     sys.stderr.write(f"kb-kill: {msg}\n")
     sys.stderr.flush()
+
+
+# --------------------------------------------------------------------------- #
+# Active seat user (logind)
+# --------------------------------------------------------------------------- #
+def active_uids():
+    """Set of uids that own a *foreground* session, one per seat.
+
+    Read from /run/systemd/seats/* (ACTIVE_UID=). This is how we decide whose
+    pushed config governs the keyboard: only the user currently in control of a
+    seat (graphical or TTY) is "live". Returns an empty set when logind exposes
+    no seats (headless / container) - callers then fall back to idle.
+    """
+    uids = set()
+    try:
+        names = os.listdir(SEATS_DIR)
+    except OSError:
+        return uids
+    for name in names:
+        try:
+            with open(os.path.join(SEATS_DIR, name)) as fh:
+                for line in fh:
+                    if line.startswith("ACTIVE_UID="):
+                        val = line.strip().split("=", 1)[1]
+                        if val.isdigit():
+                            uids.add(int(val))
+                        break
+        except OSError:
+            continue
+    return uids
+
+
+class SeatWatch:
+    """inotify watch on the seats dir so active-user switches are near-instant.
+
+    Pure-ctypes over libc (no extra shared object is dlopen'd, so this stays
+    clear of MemoryDenyWriteExecute; inotify_init1/add_watch/read are all in the
+    unit's @system-service syscall set). Best-effort: if inotify is unavailable
+    the daemon still re-checks the active user every RESCAN_INTERVAL.
+    """
+
+    def __init__(self):
+        self.fd = -1
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+            if fd < 0:
+                raise OSError(ctypes.get_errno(), "inotify_init1")
+            wd = libc.inotify_add_watch(fd, SEATS_DIR.encode(), _SEAT_MASK)
+            if wd < 0:
+                os.close(fd)
+                raise OSError(ctypes.get_errno(), "inotify_add_watch")
+            self.fd = fd
+        except (OSError, AttributeError) as e:
+            log(f"seat inotify unavailable ({e}); polling active user every "
+                f"{RESCAN_INTERVAL:g}s instead")
+
+    def drain(self):
+        """Consume pending events; their content is irrelevant (we just re-read
+        the seat files afterwards)."""
+        if self.fd < 0:
+            return
+        try:
+            while True:
+                if not os.read(self.fd, 4096):
+                    break
+        except OSError:
+            pass
+
+    def close(self):
+        if self.fd >= 0:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = -1
 
 
 class ConfigError(Exception):
@@ -191,11 +297,9 @@ class Group:
 
 
 class Config:
-    def __init__(self, groups, source, control_socket, control_uid):
+    def __init__(self, groups, source):
         self.groups = groups                  # list[Group]
-        self.source = source                  # Path it was loaded from
-        self.control_socket = control_socket  # bool: expose the tray control socket
-        self.control_uid = control_uid        # int|None: uid allowed to command us
+        self.source = source                  # str: where it came from (path or "uid N")
 
 
 def _parse_token(token):
@@ -298,44 +402,29 @@ def _build_group(name, table, defaults, where):
     return Group(name, kbs, kill_combo, wake_combo, virtual, kill_raw, wake_raw)
 
 
-def load_config(explicit=None):
-    path = find_config(explicit)
-    try:
-        with open(path, "rb") as fh:
-            doc = tomllib.load(fh)
-    except tomllib.TOMLDecodeError as e:
-        raise ConfigError(f"{path}: invalid TOML: {e}")
-    except OSError as e:
-        raise ConfigError(f"{path}: {e}")
+def parse_config(doc, source):
+    """Build a Config from an already-parsed TOML document.
+
+    Shared by load_config (a file, for detect/monitor and `-c` dev runs) and
+    load_config_text (the TOML pushed over the control socket). Authorization is
+    no longer carried in the config: the daemon binds each pushed config to the
+    SO_PEERCRED uid that pushed it, so the old control_socket/control_user/
+    control_uid keys are gone (warned about, then ignored, for old configs).
+    """
+    if not isinstance(doc, dict):
+        raise ConfigError(f"{source}: top level must be a table")
 
     # Top-level keys form the default group (if they include `keyboards`) and
     # supply defaults inherited by [groups.*].
     sections = doc.pop("groups", {})
     if not isinstance(sections, dict):
-        raise ConfigError(f"{path}: 'groups' must be a table ([groups.<name>])")
+        raise ConfigError(f"{source}: 'groups' must be a table ([groups.<name>])")
 
-    # Global (non-group) control-socket options. Pop them out before building
-    # groups so they don't trip the per-group "unknown key" warning.
-    control_socket = doc.pop("control_socket", False)
-    control_user = doc.pop("control_user", None)
-    control_uid = doc.pop("control_uid", None)
-    if not isinstance(control_socket, bool):
-        raise ConfigError(f"{path}: 'control_socket' must be true or false")
-    if control_uid is not None and not isinstance(control_uid, int):
-        raise ConfigError(f"{path}: 'control_uid' must be an integer uid")
-    if control_user is not None:
-        if not isinstance(control_user, str):
-            raise ConfigError(f"{path}: 'control_user' must be a string")
-        try:
-            control_uid = pwd.getpwnam(control_user).pw_uid
-        except KeyError:
-            raise ConfigError(f"{path}: control_user {control_user!r} not found")
-    if control_uid is None:
-        # Default: whoever owns the config file may command the daemon.
-        try:
-            control_uid = os.stat(path).st_uid
-        except OSError:
-            control_uid = None
+    for legacy in ("control_socket", "control_user", "control_uid"):
+        if doc.pop(legacy, None) is not None:
+            log(f"warning: {source}: {legacy!r} is obsolete and ignored "
+                "(the control socket is always on; the pushing user is the "
+                "authorized controller)")
 
     defaults = {
         "kill_combo": doc.get("kill_combo", DEFAULT_KILL),
@@ -344,26 +433,50 @@ def load_config(explicit=None):
 
     groups = []
     if "keyboards" in doc:
-        groups.append(_build_group("default", doc, defaults, f"{path} [top-level]"))
+        groups.append(_build_group("default", doc, defaults, f"{source} [top-level]"))
     else:
         # No top-level group: validate stray top-level keys are known defaults.
         for key in doc:
             if key not in _GROUP_KEYS:
-                log(f"warning: {path}: unknown top-level key {key!r} (ignored)")
+                log(f"warning: {source}: unknown top-level key {key!r} (ignored)")
 
     for name, table in sections.items():
         if not isinstance(table, dict):
-            raise ConfigError(f"{path}: [groups.{name}] must be a table")
+            raise ConfigError(f"{source}: [groups.{name}] must be a table")
         if "keyboards" not in table:
-            raise ConfigError(f"{path}: [groups.{name}] is missing 'keyboards'")
-        groups.append(_build_group(name, table, defaults, f"{path} [groups.{name}]"))
+            raise ConfigError(f"{source}: [groups.{name}] is missing 'keyboards'")
+        groups.append(_build_group(name, table, defaults, f"{source} [groups.{name}]"))
 
     if not groups:
         raise ConfigError(
-            f"{path}: no group defined. Add top-level 'keyboards = ...' and/or a "
+            f"{source}: no group defined. Add top-level 'keyboards = ...' and/or a "
             "[groups.<name>] table with its own 'keyboards'."
         )
-    return Config(groups, path, control_socket, control_uid)
+    return Config(groups, source)
+
+
+def load_config(explicit=None):
+    """Load a config from a file (detect/monitor and `-c` dev runs)."""
+    path = find_config(explicit)
+    try:
+        with open(path, "rb") as fh:
+            doc = tomllib.load(fh)
+    except tomllib.TOMLDecodeError as e:
+        raise ConfigError(f"{path}: invalid TOML: {e}")
+    except OSError as e:
+        raise ConfigError(f"{path}: {e}")
+    return parse_config(doc, str(path))
+
+
+def load_config_text(text, source):
+    """Load a config from TOML text pushed over the control socket."""
+    try:
+        doc = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        raise ConfigError(f"{source}: invalid TOML: {e}")
+    except (TypeError, ValueError) as e:
+        raise ConfigError(f"{source}: {e}")
+    return parse_config(doc, source)
 
 
 # --------------------------------------------------------------------------- #
@@ -407,24 +520,39 @@ def combo_held(combo, pressed):
 # Service
 # --------------------------------------------------------------------------- #
 class KbKill:
-    def __init__(self, config):
-        self.config = config
-        self.groups = config.groups   # list[Group], each with its own state
+    def __init__(self, config=None):
         self.sel = selectors.DefaultSelector()
         self.devices = {}       # path -> InputDevice (monitored)
         self.pressed = {}       # path -> set[int]
         self.grabbed = set()    # paths currently EVIOCGRAB'd by us
         self.running = True
         self.need_rescan = False
-        # config hot-reload
-        self._config_path = config.source
-        self._config_mtime = self._mtime(config.source) if config.source else None
-        self._reload_requested = False
-        # control socket (for the tray): optional, never fatal
+
+        # Pure-push model: the daemon starts with no config and is told what to
+        # do over the control socket. `pushed[uid]` holds the Config most
+        # recently pushed by each uid; only the config of the uid that currently
+        # controls a seat (active_uids()) is *live* and governs the keyboard.
+        self.pushed = {}        # uid -> Config (one per uid; dropped on disconnect)
+        self.live_uid = None    # uid whose config is currently governing, or None
+        self.groups = []        # the live config's groups (empty when idle)
+
+        # `-c PATH` dev mode: a file config forced live, bypassing seat
+        # arbitration (so the daemon is usable for ad-hoc testing without a
+        # pusher). Treated as if the invoking user pushed it and is always active.
+        self.forced = config is not None
+        if self.forced:
+            self.pushed[os.getuid()] = config
+            self.live_uid = os.getuid()
+            self.groups = config.groups
+
+        # control socket (now mandatory: it is how config arrives)
         self._listen = None
         self._sock_path = None
-        self.clients = {}       # conn -> recv buffer bytes
+        # conn -> {"buf": bytes, "uid": int, "born": monotonic, "hello": bool}
+        self.clients = {}
         self._last_sig = None
+        # seats inotify watch (best-effort; falls back to periodic polling)
+        self._seatwatch = None
 
     # -- device name matching ------------------------------------------------ #
     @staticmethod
@@ -492,42 +620,69 @@ class KbKill:
             group.targets = self._resolve_targets(group)
         self._reconcile_grabs()
 
-    # -- config hot-reload --------------------------------------------------- #
-    @staticmethod
-    def _mtime(path):
-        try:
-            return os.stat(path).st_mtime
-        except OSError:
-            return None
+    # -- live config (which pushed config governs the keyboard) -------------- #
+    def _install_groups(self, groups, preserve):
+        """Make `groups` the live set, releasing any prior grab first.
 
-    def _maybe_reload(self):
-        """Reload the config if its file changed on disk."""
-        if self._config_path is None:
-            return
-        m = self._mtime(self._config_path)
-        if m is not None and m != self._config_mtime:
-            self._config_mtime = m
-            self._reload()
-
-    def _reload(self):
-        try:
-            new = load_config(self._config_path)
-        except ConfigError as e:
-            log(f"config reload failed, keeping current config: {e}")
-            return
-        # Preserve each surviving group's killed state by name, so a reload never
-        # surprise-enables a disabled keyboard.
-        prev = {g.name: g.killed for g in self.groups}
-        for g in new.groups:
-            g.killed = prev.get(g.name, False)
-        self.config = new
-        self.groups = new.groups
+        We unconditionally ungrab everything before switching so a grab can never
+        outlive the config that asked for it (the core no-lockout invariant). New
+        groups start with killed taken from `preserve` (name -> killed), default
+        False -- so a session switch (preserve={}) always lands AWAKE: a
+        backgrounded user can never pre-arm a kill that fires on the incoming
+        user or the login greeter. A re-push from the live uid passes its current
+        killed map so a config edit doesn't surprise-enable/disable a keyboard.
+        """
+        for path in list(self.grabbed):
+            self._ungrab(path)
+        for g in groups:
+            g.killed = preserve.get(g.name, False)
+        self.groups = groups
         for g in self.groups:
             g.targets = self._resolve_targets(g)
         self._reconcile_grabs()
-        self._last_sig = None       # force a fresh state broadcast to the tray
-        log(f"config reloaded: {len(self.groups)} group(s) "
-            f"[{', '.join(g.name for g in self.groups)}]")
+        self._last_sig = None       # force a fresh state broadcast
+
+    def _set_live(self, uid):
+        """Switch which uid's pushed config governs the keyboard (starts awake)."""
+        self.live_uid = uid
+        cfg = self.pushed.get(uid)
+        self._install_groups(cfg.groups if cfg else [], preserve={})
+        if cfg:
+            log(f"live config: uid {uid} -> {len(self.groups)} group(s) "
+                f"[{', '.join(g.name for g in self.groups)}]")
+        else:
+            log("live config: none (idle) - no active user has pushed a config")
+
+    def _reevaluate_live(self):
+        """Pick the live uid from the active seat user(s) and swap if it changed.
+
+        Live uid = an active-seat uid that has pushed a config (deterministic by
+        lowest uid when several seats are active). None -> idle. `-c` dev mode is
+        pinned live and never re-evaluated.
+        """
+        if self.forced:
+            return
+        active = active_uids()
+        desired = next((uid for uid in sorted(active) if uid in self.pushed), None)
+        if desired != self.live_uid:
+            self._set_live(desired)
+
+    def _on_set_config(self, uid, text):
+        """Handle a set_config push from `uid`: store it, apply if it's live."""
+        try:
+            cfg = load_config_text(text, f"uid {uid}")
+        except ConfigError as e:
+            log(f"rejected config from uid {uid}: {e}")
+            return
+        self.pushed[uid] = cfg
+        if uid == self.live_uid:
+            # The live user edited their config: re-apply, preserving killed state.
+            preserve = {g.name: g.killed for g in self.groups}
+            self._install_groups(cfg.groups, preserve)
+            log(f"live config updated by uid {uid}: {len(self.groups)} group(s)")
+        else:
+            # A (possibly newly-active) user pushed: maybe it should go live now.
+            self._reevaluate_live()
 
     # -- grab / ungrab ------------------------------------------------------- #
     def _grab(self, path):
@@ -648,36 +803,30 @@ class KbKill:
             elif e.errno != errno.EAGAIN:
                 log(f"read error on {path}: {e}")
 
-    # -- control socket (tray) ----------------------------------------------- #
+    # -- control socket (config push + tray) --------------------------------- #
     def _open_control_socket(self):
-        if not self.config.control_socket:
-            log("control socket: disabled (control_socket = false)")
-            return
+        """Open the control socket. MANDATORY now - it is how config arrives, so
+        a failure to open is fatal (caller exits, systemd restarts us).
+
+        The socket is connectable by any local user (mode 0666): a pusher must be
+        able to bootstrap the daemon before any config (and therefore any allowed
+        uid) exists. SO_PEERCRED is the real gate - see _accept_client /
+        _apply_command - so this is not a weakening; it just moves the check from
+        connect-time to per-command. No chown is needed (hence no CAP_CHOWN)."""
         path = control_socket_path()
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            if os.path.exists(path):
-                os.unlink(path)
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.bind(path)
-            # Defense-in-depth on top of the SO_PEERCRED check: let the allowed
-            # user's group reach the socket, nobody else.
-            os.chmod(path, 0o660)
-            if self.config.control_uid is not None:
-                try:
-                    gid = pwd.getpwuid(self.config.control_uid).pw_gid
-                    os.chown(path, 0, gid)
-                except (KeyError, OSError):
-                    pass
-            s.listen(MAX_CLIENTS)
-            s.setblocking(False)
-        except OSError as e:
-            log(f"control socket disabled: {e}")
-            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path):
+            os.unlink(path)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind(path)
+        os.chmod(path, 0o666)
+        s.listen(MAX_CLIENTS)
+        s.setblocking(False)
         self._listen = s
         self._sock_path = path
         self.sel.register(s, selectors.EVENT_READ, _LISTEN)
-        log(f"control socket: {path} (allowed uid: {self.config.control_uid})")
+        log(f"control socket: {path} (any local user may connect; "
+            "SO_PEERCRED gates every command)")
 
     def _state_dict(self):
         return {
@@ -694,22 +843,28 @@ class KbKill:
         except OSError:
             self._drop_client(conn)
 
+    def _peer_uid(self, conn):
+        try:
+            creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                    struct.calcsize("3i"))
+            _pid, uid, _gid = struct.unpack("3i", creds)
+            return uid
+        except OSError:
+            return None
+
     def _accept_client(self):
         try:
             conn, _ = self._listen.accept()
         except OSError:
             return
-        # Authenticate the peer by kernel-verified credentials (SO_PEERCRED):
-        # only the allowed uid (or root) may command the daemon.
-        try:
-            creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
-                                    struct.calcsize("3i"))
-            _pid, uid, _gid = struct.unpack("3i", creds)
-        except OSError:
+        uid = self._peer_uid(conn)
+        if uid is None:
             conn.close()
             return
-        if uid not in (0, self.config.control_uid):
-            log(f"control: rejected connection from uid {uid}")
+        # Per-uid cap so one user can't starve the global pool; then the global cap.
+        if uid != 0 and sum(1 for c in self.clients.values()
+                            if c["uid"] == uid) >= MAX_CONNS_PER_UID:
+            log(f"control: per-uid connection cap reached for uid {uid}, refusing")
             conn.close()
             return
         if len(self.clients) >= MAX_CLIENTS:
@@ -717,51 +872,96 @@ class KbKill:
             conn.close()
             return
         conn.setblocking(False)
-        self.clients[conn] = b""
+        self.clients[conn] = {"buf": b"", "uid": uid,
+                              "born": time.monotonic(), "hello": False}
         self.sel.register(conn, selectors.EVENT_READ, ("client", conn))
-        self._send(conn, self._state_dict())
+        # Send current state only to someone allowed to see it (the live user/root).
+        if uid in (0, self.live_uid):
+            self._send(conn, self._state_dict())
 
     def _drop_client(self, conn):
         try:
             self.sel.unregister(conn)
         except (KeyError, ValueError):
             pass
-        self.clients.pop(conn, None)
+        info = self.clients.pop(conn, None)
         try:
             conn.close()
         except OSError:
             pass
+        # If the disconnecting client was a pushing user's only remaining
+        # connection, drop their pushed config and revert (idle or next active).
+        # In forced (-c) dev mode the config is pinned and never dropped.
+        if info is not None and not self.forced:
+            uid = info["uid"]
+            if uid != 0 and not any(c["uid"] == uid for c in self.clients.values()):
+                if self.pushed.pop(uid, None) is not None:
+                    log(f"uid {uid} disconnected; dropping its pushed config")
+                    if uid == self.live_uid:
+                        self._reevaluate_live()
+
+    def _sweep_handshake(self):
+        """Drop connections that never sent a valid command in time (anti-DoS)."""
+        now = time.monotonic()
+        for conn, info in list(self.clients.items()):
+            if not info["hello"] and (now - info["born"]) > HANDSHAKE_SECONDS:
+                log(f"control: dropping idle connection from uid {info['uid']} "
+                    "(no command within handshake window)")
+                self._drop_client(conn)
 
     def _read_client(self, conn):
+        info = self.clients.get(conn)
+        if info is None:
+            return
         try:
-            data = conn.recv(4096)
+            data = conn.recv(65536)
         except OSError:
             self._drop_client(conn)
             return
         if not data:
             self._drop_client(conn)
             return
-        buf = self.clients.get(conn, b"") + data
+        buf = info["buf"] + data
         *lines, rest = buf.split(b"\n")
         # DoS bound: drop a client that floods bytes without a newline.
         if len(rest) > MAX_LINE:
             log("control: dropping client (over-long line)")
             self._drop_client(conn)
             return
-        self.clients[conn] = rest
+        info["buf"] = rest
         for line in lines:
             line = line.strip()
             if not line:
                 continue
             try:
-                self._apply_command(json.loads(line), conn)
+                obj = json.loads(line)
             except ValueError:
-                pass
+                continue
+            if not isinstance(obj, dict):
+                continue
+            info["hello"] = True
+            self._apply_command(obj, conn, info["uid"])
 
-    def _apply_command(self, obj, conn):
+    def _apply_command(self, obj, conn, uid):
         cmd = obj.get("cmd")
+
+        # set_config: accepted from ANY uid, stored under that uid; it only
+        # governs the keyboard while that uid is the active seat user.
+        if cmd == "set_config":
+            text = obj.get("toml")
+            if isinstance(text, str):
+                self._on_set_config(uid, text)
+            return
+
+        # status: only the live user (or root) may read live state.
         if cmd == "status":
-            self._send(conn, self._state_dict())
+            if uid in (0, self.live_uid):
+                self._send(conn, self._state_dict())
+            return
+
+        # kill/wake/toggle: only the user whose config is currently live (or root).
+        if uid not in (0, self.live_uid):
+            log(f"control: rejected {cmd!r} from uid {uid} (not the live user)")
             return
         group = next((g for g in self.groups if g.name == obj.get("group")), None)
         if group is None:
@@ -774,7 +974,7 @@ class KbKill:
             group.killed = not group.killed
         else:
             return
-        log(f"[{group.name}] {'KILLED' if group.killed else 'WOKEN'} (via tray)")
+        log(f"[{group.name}] {'KILLED' if group.killed else 'WOKEN'} (via control)")
         self._reconcile_grabs()
 
     def _maybe_broadcast(self):
@@ -783,26 +983,37 @@ class KbKill:
             return
         self._last_sig = sig
         state = self._state_dict()
-        for conn in list(self.clients):
-            self._send(conn, state)
+        for conn, info in list(self.clients.items()):
+            if info["uid"] in (0, self.live_uid):
+                self._send(conn, state)
 
     # -- main loop ----------------------------------------------------------- #
     def run(self):
         def _stop(signum, frame):
             raise KeyboardInterrupt
 
-        def _hup(signum, frame):
-            self._reload_requested = True
-
         signal.signal(signal.SIGTERM, _stop)
-        signal.signal(signal.SIGHUP, _hup)
 
-        log(f"config: {self.config.source}")
-        for g in self.groups:
-            log(f"[{g.name}] keyboards={g.keyboards} "
-                f"kill={g.kill_raw!r} wake={g.wake_raw!r}")
-        self._open_control_socket()
+        # Mandatory: without the socket the daemon can never receive a config.
+        try:
+            self._open_control_socket()
+        except OSError as e:
+            log(f"FATAL: cannot open control socket: {e}")
+            return 1
+
+        if self.forced:
+            log(f"forced config (-c): {self.pushed[self.live_uid].source}")
+        else:
+            log("waiting for a config push from the active user's kb-kill-push")
+
+        # Watch the seats dir so active-user switches apply near-instantly; the
+        # periodic rescan re-checks as a backstop if inotify is unavailable.
+        self._seatwatch = SeatWatch()
+        if self._seatwatch.fd >= 0:
+            self.sel.register(self._seatwatch.fd, selectors.EVENT_READ, _SEATWATCH)
+
         self.rescan()
+        self._reevaluate_live()
         # Seed the broadcast signature so newly-connected clients get state only
         # via the initial send, not a spurious startup broadcast.
         self._last_sig = tuple((g.killed, len(g.targets)) for g in self.groups)
@@ -815,24 +1026,25 @@ class KbKill:
                     tag = key.data
                     if tag is _LISTEN:
                         self._accept_client()
+                    elif tag is _SEATWATCH:
+                        self._seatwatch.drain()
+                        self._reevaluate_live()
                     elif isinstance(tag, tuple) and tag[0] == "client":
                         self._read_client(tag[1])
                     else:
                         self._read_device(key.fileobj, tag)
-                if self._reload_requested:
-                    self._reload_requested = False
-                    self._config_mtime = self._mtime(self._config_path)
-                    self._reload()
                 now = time.monotonic()
                 if self.need_rescan or (now - last_scan) >= RESCAN_INTERVAL:
-                    self._maybe_reload()
                     self.rescan()
+                    self._reevaluate_live()   # backstop for a missed inotify event
+                    self._sweep_handshake()
                     last_scan = now
                 self._maybe_broadcast()
         except KeyboardInterrupt:
             pass
         finally:
             self.cleanup()
+        return 0
 
     def cleanup(self):
         for path in list(self.grabbed):
@@ -841,6 +1053,12 @@ class KbKill:
             self._remove_device(path)
         for conn in list(self.clients):
             self._drop_client(conn)
+        if self._seatwatch is not None:
+            try:
+                self.sel.unregister(self._seatwatch.fd)
+            except (KeyError, ValueError):
+                pass
+            self._seatwatch.close()
         if self._listen is not None:
             try:
                 self.sel.unregister(self._listen)
@@ -862,8 +1080,9 @@ class KbKill:
 # Commands
 # --------------------------------------------------------------------------- #
 def cmd_run(config):
-    KbKill(config).run()
-    return 0
+    # config is None for the normal service (config arrives via push); a file
+    # config from `-c` is pinned live for ad-hoc dev testing.
+    return KbKill(config).run()
 
 
 def cmd_detect(config):
@@ -988,14 +1207,22 @@ def cmd_monitor(config):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        prog="kb-kill",
+        prog="kb-kill-daemon",
         description="Disable/enable a target keyboard on a global hotkey.")
     parser.add_argument("command", nargs="?", default="run",
                         choices=["run", "detect", "monitor"],
                         help="run the service (default), detect keyboards, "
                              "or monitor raw key events for debugging")
-    parser.add_argument("-c", "--config", help="path to kb-kill.conf")
+    parser.add_argument("-c", "--config",
+                        help="path to a config file. detect/monitor read it to "
+                             "show your setup; for `run` it pins that config live "
+                             "for ad-hoc testing (the service instead receives "
+                             "config from the active user via kb-kill-push).")
     args = parser.parse_args(argv)
+
+    # The service (`run` without -c) starts config-less and is fed by kb-kill-push.
+    if args.command == "run" and not args.config:
+        return cmd_run(None)
 
     try:
         config = load_config(args.config)

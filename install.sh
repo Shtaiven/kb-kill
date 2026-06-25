@@ -36,12 +36,15 @@ warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
 say "Installing user-side components for $USER_NAME"
 
 mkdir -p "$USER_HOME/.local/bin"
-# kb-kill itself isn't symlinked here: the root install puts it at
-# /usr/local/bin/kb-kill (already on PATH), so `sudo kb-kill detect` finds it.
-# Remove any stale link a previous installer left, which would shadow it.
-rm -f "$USER_HOME/.local/bin/kb-kill"
+# The daemon isn't symlinked here: the root install puts it at
+# /usr/local/bin/kb-kill-daemon (already on PATH), so `sudo kb-kill-daemon detect`
+# finds it. Remove any stale links a previous installer left, which would shadow it.
+rm -f "$USER_HOME/.local/bin/kb-kill" "$USER_HOME/.local/bin/kb-kill-daemon"
 # -n (no-dereference): replace an existing symlink itself rather than following
 # it (e.g. an old link pointing at the project dir).
+# kb-kill-push (mandatory): feeds the daemon this user's config.
+ln -sfn "$PROJECT_DIR/kb-kill-push" "$USER_HOME/.local/bin/kb-kill-push"
+# kb-kill-tray (optional UI).
 ln -sfn "$PROJECT_DIR/kb-kill-tray" "$USER_HOME/.local/bin/kb-kill-tray"
 
 # Config: install the example only if absent; otherwise ask before overwriting.
@@ -63,10 +66,15 @@ else
   fi
 fi
 
-# Tray user service.
+# User services: kb-kill-push (mandatory — pushes config) + kb-kill-tray (optional UI).
 mkdir -p "$USER_HOME/.config/systemd/user"
+ln -sfn "$PROJECT_DIR/kb-kill-push.service" \
+        "$USER_HOME/.config/systemd/user/kb-kill-push.service"
 ln -sfn "$PROJECT_DIR/kb-kill-tray.service" \
         "$USER_HOME/.config/systemd/user/kb-kill-tray.service"
+systemctl --user daemon-reload 2>/dev/null || true
+systemctl --user enable --now kb-kill-push.service 2>/dev/null \
+  || warn "Could not enable kb-kill-push (no user session bus here?). Enable later: systemctl --user enable --now kb-kill-push"
 systemctl --user enable --now kb-kill-tray.service 2>/dev/null \
   || warn "Could not enable kb-kill-tray (no user session bus here?). Enable later: systemctl --user enable --now kb-kill-tray"
 
@@ -75,25 +83,29 @@ systemctl --user enable --now kb-kill-tray.service 2>/dev/null \
 # --------------------------------------------------------------------------- #
 say "Installing the root daemon (sudo)"
 
-sudo install -D -m0755 -o root -g root "$PROJECT_DIR/kb-kill" /usr/local/bin/kb-kill
+# Migration: stop + remove the pre-rename daemon (kb-kill.service / kb-kill) so we
+# don't end up with two grabbers fighting over the keyboard.
+sudo systemctl disable --now kb-kill.service 2>/dev/null || true
+sudo rm -f /etc/systemd/system/kb-kill.service /usr/local/bin/kb-kill
+
+sudo install -D -m0755 -o root -g root "$PROJECT_DIR/kb-kill-daemon" /usr/local/bin/kb-kill-daemon
 sudo install -d -m0755 /usr/local/share/kb-kill/icons
 sudo install -m0644 "$PROJECT_DIR"/icons/*.svg /usr/local/share/kb-kill/icons/
 
-# Render the system unit with this user's config path, then install it.
-TMP_UNIT="$(mktemp)"
-sed "s#@CONFIG@#$CONFIG#g" "$PROJECT_DIR/kb-kill.service" > "$TMP_UNIT"
-sudo install -m0644 -o root -g root "$TMP_UNIT" /etc/systemd/system/kb-kill.service
-rm -f "$TMP_UNIT"
+# The system unit no longer embeds a config path (config is pushed at runtime),
+# so it installs verbatim.
+sudo install -m0644 -o root -g root "$PROJECT_DIR/kb-kill-daemon.service" \
+  /etc/systemd/system/kb-kill-daemon.service
 
-# Replace any old per-user kb-kill service to avoid two grabbers (and clean up
-# the stale unit symlink left by the previous stow-managed install).
+# Replace any old per-user kb-kill daemon unit to avoid two grabbers (and clean up
+# the stale unit symlink left by a previous stow-managed install).
 systemctl --user disable --now kb-kill.service 2>/dev/null || true
 rm -f "$USER_HOME/.config/systemd/user/kb-kill.service"
 systemctl --user daemon-reload 2>/dev/null || true
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now kb-kill.service
-say "kb-kill system service: $(systemctl is-active kb-kill.service)"
+sudo systemctl enable --now kb-kill-daemon.service
+say "kb-kill system service: $(systemctl is-active kb-kill-daemon.service)"
 
 # --------------------------------------------------------------------------- #
 # Follow-ups
@@ -110,5 +122,5 @@ Done. Two manual follow-ups for the full security benefit:
   2) After editing the daemon code, re-run this installer to redeploy:
          sudo true && $PROJECT_DIR/install.sh
 
-Note: 'kb-kill detect' / 'monitor' now need sudo (you've left the input group).
+Note: 'kb-kill-daemon detect' / 'monitor' now need sudo (you've left the input group).
 EOF

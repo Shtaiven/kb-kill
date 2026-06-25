@@ -3,7 +3,7 @@
 
 Shows whether each kb-kill group is disabled (killed) or active, and lets you
 toggle a group by clicking its menu entry. Talks to the kb-kill service over its
-Unix control socket (see `control_socket_path` in `kb-kill`).
+Unix control socket (see `control_socket_path` in `kb-kill-daemon`).
 
 Runs as its own process so a GUI hiccup can never affect keyboard handling. Uses
 the AppIndicator / StatusNotifierItem D-Bus protocol, which works on COSMIC and

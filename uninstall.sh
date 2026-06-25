@@ -36,6 +36,8 @@ warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
 # --------------------------------------------------------------------------- #
 say "Removing user-side components for $USER_NAME"
 
+systemctl --user disable --now kb-kill-push.service 2>/dev/null || true
+rm -f "$USER_HOME/.config/systemd/user/kb-kill-push.service"
 systemctl --user disable --now kb-kill-tray.service 2>/dev/null || true
 rm -f "$USER_HOME/.config/systemd/user/kb-kill-tray.service"
 # also clear any stale old per-user daemon unit symlink
@@ -43,7 +45,7 @@ systemctl --user disable --now kb-kill.service 2>/dev/null || true
 rm -f "$USER_HOME/.config/systemd/user/kb-kill.service"
 systemctl --user daemon-reload 2>/dev/null || true
 
-for b in kb-kill kb-kill-tray; do
+for b in kb-kill kb-kill-daemon kb-kill-push kb-kill-tray; do
   link="$USER_HOME/.local/bin/$b"
   [ -L "$link" ] && rm -f "$link" && say "Removed ~/.local/bin/$b"
 done
@@ -53,10 +55,12 @@ done
 # --------------------------------------------------------------------------- #
 say "Removing the root daemon (sudo)"
 
+# Current names plus the pre-rename ones (migration cleanup).
+sudo systemctl disable --now kb-kill-daemon.service 2>/dev/null || true
 sudo systemctl disable --now kb-kill.service 2>/dev/null || true
-sudo rm -f /etc/systemd/system/kb-kill.service
+sudo rm -f /etc/systemd/system/kb-kill-daemon.service /etc/systemd/system/kb-kill.service
 sudo systemctl daemon-reload
-sudo rm -f /usr/local/bin/kb-kill
+sudo rm -f /usr/local/bin/kb-kill-daemon /usr/local/bin/kb-kill
 sudo rm -rf /usr/local/share/kb-kill
 
 # --------------------------------------------------------------------------- #

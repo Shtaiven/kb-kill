@@ -11,49 +11,69 @@ them. There is **no virtual device and no event re-injection**: kb-kill grabs *o
 while killed*; when awake it merely monitors (reads, never grabs), so a crash can never
 break your keyboard, and the kernel auto-releases grabs if the process dies.
 
-The whole project is two Python scripts plus shell/systemd glue — no build system, no
+**Config is pushed, not read from a path (pure-push model).** The daemon starts
+config-less and is *told* what to do over its control socket, like input-remapper's
+daemon. Each logged-in user runs `kb-kill-push`, which sends that user's config (TOML
+text) to the daemon. The daemon honours only the config of whoever currently controls
+the seat — logind's `ACTIVE_UID`, graphical **or** TTY — and swaps when the active user
+switches. So it always follows the person actually at the machine, with no per-installer
+config baked in.
+
+The whole project is a few Python scripts plus shell/systemd glue — no build system, no
 dependency manifest, no test suite. Read `README.md` for the full user-facing manual.
 
 ## Files
 
 | Path | Role |
 |---|---|
-| `kb-kill` | the daemon (Python, ~1000 lines, the bulk of the logic) → deployed to `/usr/local/bin/kb-kill` (root-owned) |
+| `kb-kill-daemon` | the daemon (Python, the bulk of the logic) → deployed to `/usr/local/bin/kb-kill-daemon` (root-owned) |
+| `kb-kill-push` | **mandatory** per-user pusher (stdlib only): feeds the daemon this user's config. An **unprivileged user** process |
 | `kb-kill-tray` | optional tray icon (Python / GTK3 / AppIndicator), an **unprivileged user** process |
-| `kb-kill.service` | hardened **system** unit (`@CONFIG@` placeholder filled in at install) |
+| `kb-kill-daemon.service` | hardened **system** unit (no config path; config arrives by push) |
+| `kb-kill-push.service` | pusher **user** unit (`WantedBy=default.target` — runs for TTY too) |
 | `kb-kill-tray.service` | tray **user** unit |
 | `install.sh` / `uninstall.sh` | deploy / reverse |
 | `kb-kill.toml` | example/default config (TOML) |
 | `icons/` | tray SVGs |
 
+The suite name / runtime paths stay `kb-kill` (`/run/kb-kill/control.sock`,
+`/usr/local/share/kb-kill/`); only the daemon binary and its unit carry the `-daemon`
+suffix, to disambiguate from the sibling user processes.
+
 ## Commands
 
 ```sh
-./install.sh                  # deploy (and REDEPLOY) — see redeploy note below
-sudo kb-kill detect           # list keyboards, which are targets, parsed combos — START HERE when debugging
-sudo kb-kill monitor          # print raw key events + per-device/global combo matches
-sudo systemctl restart kb-kill
-journalctl -u kb-kill -f      # watch KILLED / WOKEN live (daemon logs only to stderr/journal)
-systemctl --user restart kb-kill-tray
+./install.sh                       # deploy (and REDEPLOY) — see redeploy note below
+sudo kb-kill-daemon detect         # list keyboards, which are targets, parsed combos — START HERE when debugging
+sudo kb-kill-daemon monitor        # print raw key events + per-device/global combo matches
+sudo systemctl restart kb-kill-daemon
+journalctl -u kb-kill-daemon -f    # watch live: "live config", KILLED / WOKEN (daemon logs only to stderr/journal)
+systemctl --user restart kb-kill-push    # the mandatory config pusher
+systemctl --user restart kb-kill-tray    # optional UI
 ```
 
 There is no lint/test/build step. To run the daemon unprivileged for ad-hoc testing,
-run `./kb-kill run -c some.toml` directly (it falls back to a user runtime dir for the
-control socket and warns that grabbing needs root / the `input` group).
+run `./kb-kill-daemon run -c some.toml` directly: `-c` pins that file live (bypassing
+seat arbitration, so you don't need a pusher), falls back to a user runtime dir for the
+control socket, and warns that grabbing needs root / the `input` group. Plain
+`./kb-kill-daemon run` starts config-less and waits for a push.
 
 ### Redeploying after a code edit (critical)
 
-The daemon runs from the **root-owned copy** at `/usr/local/bin/kb-kill`, not your
-working tree. Editing `./kb-kill` does nothing until you **re-run `./install.sh`**
-(idempotent) — that reinstalls the binary and restarts the service. `detect`/`monitor`
-also run the installed copy. Forgetting this is the #1 "my change had no effect" trap.
+The daemon runs from the **root-owned copy** at `/usr/local/bin/kb-kill-daemon`, not your
+working tree. Editing `./kb-kill-daemon` does nothing until you **re-run `./install.sh`**
+(idempotent) — that reinstalls the binary and restarts the service. Editing `kb-kill-push`
+likewise needs a reinstall (it is symlinked into `~/.local/bin`, but restart the user
+service). `detect`/`monitor` run the installed copy. Forgetting this is the #1 "my change
+had no effect" trap.
 
 ## Architecture
 
-**Single-threaded `selectors` event loop** in `KbKill.run()` (`kb-kill`). One loop
+**Single-threaded `selectors` event loop** in `KbKill.run()` (`kb-kill-daemon`). One loop
 multiplexes: every monitored keyboard fd, the control socket's listen fd (`_LISTEN`
-tag), and per-client connection fds (`("client", conn)` tags). Loop timeout =
-`RESCAN_INTERVAL` (2s), which drives device hotplug rescans and config hot-reload.
+tag), per-client connection fds (`("client", conn)` tags), and the seats-dir inotify fd
+(`_SEATWATCH` tag). Loop timeout = `RESCAN_INTERVAL` (2s), which drives device hotplug
+rescans and is the backstop for re-checking the active seat user.
 
 **Groups are the core abstraction.** A `Group` = a set of target keyboards + its own
 kill/wake combo + a `killed` flag + `virtual_keyboard` flag. Config produces a list of
@@ -78,21 +98,41 @@ their key-ups and leave them stuck down at the OS. So `_reconcile_grabs()` defer
 grabbing a device until it is idle; each key-up re-runs reconciliation, which is what
 eventually performs a deferred grab. Don't break this.
 
-**Config hot-reload:** the loop watches the config file's mtime (and `SIGHUP`). On
-reload, each surviving group's `killed` state is preserved by name so a reload never
-surprise-enables a disabled keyboard; a parse failure logs and keeps the old config.
+**Pure-push config + active-session arbitration** (replaces file hot-reload): the daemon
+keeps `pushed[uid] -> Config` (one per uid, set by `set_config`, dropped on disconnect)
+and reads logind's `/run/systemd/seats/*` `ACTIVE_UID` via `active_uids()`. The **live**
+config is `pushed[active_uid]` (or none → idle). `_reevaluate_live()` swaps the live
+config when the active uid changes; a `SeatWatch` inotify on the seats dir makes that
+near-instant (the 2s tick is a backstop). Two invariants matter:
+- **A grab never outlives its config.** `_install_groups()` ungrabs everything before
+  switching, and a pusher disconnect reverts to idle — so you can never be left grabbed
+  by a config that is no longer live (the kernel also auto-releases on death).
+- **Kills are never inherited across a session switch.** A config that becomes live via a
+  user switch starts **awake** (all `killed=False`), so a backgrounded user can't pre-arm
+  a kill that fires on the incoming user or the login greeter. A re-push from the *live*
+  uid (a config edit) does preserve killed state by name. A parse failure is rejected and
+  the live config is untouched.
 
-### Control socket (daemon ↔ tray)
+`-c PATH` (dev only) pins a file config live via `forced`, bypassing arbitration.
 
-Optional (`control_socket = true`), off by default. Unix socket carrying a newline-
-delimited JSON protocol — **group state only, never keystrokes**. Commands:
-`{"cmd":"kill|wake|toggle|status","group":"<name>"}`; the daemon replies/broadcasts
-`{"type":"state","groups":[{"name","killed","targets"}]}`. The daemon authenticates each
-connection by kernel-verified peer uid (`SO_PEERCRED`) — only `control_uid`
-(`control_user`, default = config-file owner) or root is accepted — and bounds clients
-(`MAX_CLIENTS`) and per-line buffering (`MAX_LINE`) against DoS. The tray
-(`kb-kill-tray`) is a thin GTK client that reconnects on drop and renders one menu entry
-per group.
+### Control socket (config push + tray)
+
+**Mandatory** now — it is how config arrives. Unix socket at `/run/kb-kill/control.sock`,
+**mode 0666** (any local user may connect: a pusher must bootstrap the daemon before any
+config/allowed-uid exists). Newline-delimited JSON — **config text + group state, never
+keystrokes**. Commands:
+- `{"cmd":"set_config","toml":"<text>"}` — accepted from any uid, stored under that uid;
+  governs the keyboard only while that uid is the active seat user.
+- `{"cmd":"kill|wake|toggle|status","group":"<name>"}` — only from the **live** uid (or
+  root). The daemon replies/broadcasts `{"type":"state","groups":[…]}` only to the live
+  uid/root.
+
+Authorization is per-command by kernel-verified peer uid (`SO_PEERCRED`), moved from
+connect-time to command-time. DoS bounds: `MAX_CLIENTS` (global) + `MAX_CONNS_PER_UID`
+(so one user can't starve the pool) + `HANDSHAKE_SECONDS` idle-drop + `MAX_LINE` (64 KiB,
+sized for a TOML payload). `kb-kill-push` (mandatory, stdlib) pushes config and re-pushes
+on file change; `kb-kill-tray` (optional GTK) renders/toggles groups. Both reconnect on
+drop.
 
 ## Security model — treat as a hard constraint
 
@@ -101,16 +141,29 @@ anything, preserve these invariants (see README "Security model" and the systemd
 
 - **No keystroke ever persists or leaves the process.** Only the set of *currently
   held* keys is kept (for combo matching), discarded on key-up. No history, file, or
-  network. The control socket must never carry key data. (`monitor` printing to a
-  terminal is a manual debug tool; the *service* never does.)
+  network. The control socket carries config text + group state only, **never key data**
+  (config TOML is not key data). (`monitor` printing to a terminal is a manual debug
+  tool; the *service* never does.)
 - **The deployed daemon binary must stay root-owned and not user-writable** — a root
   service executing a user-writable script is a privesc hole. That's why `install.sh`
   copies to `/usr/local/bin` rather than symlinking the working tree.
 - **The systemd sandbox is load-bearing**, not decoration: no network
   (`RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`), only input devices
   (`DevicePolicy=closed` + `DeviceAllow=char-input`), `SystemCallFilter`,
-  `MemoryDenyWriteExecute`, `ProtectSystem=strict`, etc. New daemon behavior that needs
-  a syscall/capability/path outside this set means widening the sandbox — do that
-  deliberately and minimally (e.g. the `CAP_DAC_READ_SEARCH`/`CAP_CHOWN` +
-  `SystemCallFilter=@chown` carve-outs already there exist for specific, documented
-  reasons).
+  `MemoryDenyWriteExecute`, `ProtectSystem=strict`, etc. The pure-push model lets the
+  sandbox be **smaller** than before: config no longer touches the filesystem, so there
+  are **no capabilities** (`CapabilityBoundingSet=`/`AmbientCapabilities=` empty — the old
+  `CAP_DAC_READ_SEARCH`/`CAP_CHOWN` + `SystemCallFilter=@chown` are gone) and
+  `ProtectHome=true`. The only new reads are `/run/systemd/seats/*` and `inotify_*` (both
+  inside the existing `@system-service` set / readable `/run`). Reading `ACTIVE_UID` is a
+  **defensive file parse** — do **not** switch to `sd_seat_get_active` via ctypes/dlopen
+  (risks tripping `MemoryDenyWriteExecute`). Any new behavior needing a syscall/capability/
+  path outside this set means widening the sandbox — do that deliberately and minimally.
+- **The 0666 socket is gated by `SO_PEERCRED`, not file permissions.** A non-active user
+  can push a config but it never governs the keyboard (only the active seat uid's does),
+  and only the live uid may kill/wake/toggle. Treat "a grab never outlives its live
+  config" and "no killed-state inherited across a session switch" as hard invariants
+  (see the live-config notes above) — they are what keep the no-lockout / self-wake
+  guarantee across user-switching. Scope is **seat0 / single-seat**; any process of the
+  active uid (not only `kb-kill-push`) can command the daemon — within that user's own
+  trust boundary.
