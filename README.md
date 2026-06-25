@@ -10,6 +10,10 @@ wake itself. There is no way to lock yourself out.
 Typical use: you're docked with an external keyboard and want the laptop's
 built-in keyboard to stop registering stray presses.
 
+## A note on AI usage
+
+This program is written mostly by agentic AI (Claude using Opus 4.8). Read the scripts before installing this on your system! This has been tested and reviewed, but never run scripts that you don't trust!
+
 ## How it works
 
 * "Disable" means an exclusive `EVIOCGRAB` on the target device: the kernel
