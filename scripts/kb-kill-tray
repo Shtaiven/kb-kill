@@ -44,10 +44,12 @@ RECONNECT_SECONDS = 2
 
 
 def icon_dir():
-    """Locate the tray icons. Prefer icons shipped alongside this script (the
-    self-contained project layout), then a system install, then the user config."""
+    """Locate the tray icons. Prefer icons shipped in the project tree (this
+    script lives in scripts/, the icons in the project root's icons/), then a
+    system install, then the user config."""
     here = os.path.dirname(os.path.realpath(__file__))
     for candidate in (os.path.join(here, "icons"),
+                      os.path.join(here, os.pardir, "icons"),  # scripts/ -> ../icons
                       "/usr/local/share/kb-kill/icons",
                       os.path.expanduser("~/.config/kb-kill/icons")):
         if os.path.isdir(candidate):

@@ -43,9 +43,9 @@ rm -f "$USER_HOME/.local/bin/kb-kill" "$USER_HOME/.local/bin/kb-kill-daemon"
 # -n (no-dereference): replace an existing symlink itself rather than following
 # it (e.g. an old link pointing at the project dir).
 # kb-kill-push (mandatory): feeds the daemon this user's config.
-ln -sfn "$PROJECT_DIR/kb-kill-push" "$USER_HOME/.local/bin/kb-kill-push"
+ln -sfn "$PROJECT_DIR/scripts/kb-kill-push" "$USER_HOME/.local/bin/kb-kill-push"
 # kb-kill-tray (optional UI).
-ln -sfn "$PROJECT_DIR/kb-kill-tray" "$USER_HOME/.local/bin/kb-kill-tray"
+ln -sfn "$PROJECT_DIR/scripts/kb-kill-tray" "$USER_HOME/.local/bin/kb-kill-tray"
 
 # Config: install the example only if absent; otherwise ask before overwriting.
 mkdir -p "$USER_HOME/.config/kb-kill"
@@ -68,15 +68,18 @@ fi
 
 # User services: kb-kill-push (mandatory — pushes config) + kb-kill-tray (optional UI).
 mkdir -p "$USER_HOME/.config/systemd/user"
-ln -sfn "$PROJECT_DIR/kb-kill-push.service" \
+ln -sfn "$PROJECT_DIR/services/kb-kill-push.service" \
         "$USER_HOME/.config/systemd/user/kb-kill-push.service"
-ln -sfn "$PROJECT_DIR/kb-kill-tray.service" \
+ln -sfn "$PROJECT_DIR/services/kb-kill-tray.service" \
         "$USER_HOME/.config/systemd/user/kb-kill-tray.service"
 systemctl --user daemon-reload 2>/dev/null || true
-systemctl --user enable --now kb-kill-push.service 2>/dev/null \
-  || warn "Could not enable kb-kill-push (no user session bus here?). Enable later: systemctl --user enable --now kb-kill-push"
-systemctl --user enable --now kb-kill-tray.service 2>/dev/null \
-  || warn "Could not enable kb-kill-tray (no user session bus here?). Enable later: systemctl --user enable --now kb-kill-tray"
+# enable (on boot) + restart so a redeploy actually picks up new code / repointed
+# symlinks (enable --now would NOT restart an already-running unit).
+for svc in kb-kill-push kb-kill-tray; do
+  systemctl --user enable "$svc.service" 2>/dev/null || true
+  systemctl --user restart "$svc.service" 2>/dev/null \
+    || warn "Could not start $svc (no user session bus here?). Start later: systemctl --user enable --now $svc"
+done
 
 # --------------------------------------------------------------------------- #
 # Root side (sudo): daemon binary, icons, hardened system unit
@@ -88,13 +91,13 @@ say "Installing the root daemon (sudo)"
 sudo systemctl disable --now kb-kill.service 2>/dev/null || true
 sudo rm -f /etc/systemd/system/kb-kill.service /usr/local/bin/kb-kill
 
-sudo install -D -m0755 -o root -g root "$PROJECT_DIR/kb-kill-daemon" /usr/local/bin/kb-kill-daemon
+sudo install -D -m0755 -o root -g root "$PROJECT_DIR/scripts/kb-kill-daemon" /usr/local/bin/kb-kill-daemon
 sudo install -d -m0755 /usr/local/share/kb-kill/icons
 sudo install -m0644 "$PROJECT_DIR"/icons/*.svg /usr/local/share/kb-kill/icons/
 
 # The system unit no longer embeds a config path (config is pushed at runtime),
 # so it installs verbatim.
-sudo install -m0644 -o root -g root "$PROJECT_DIR/kb-kill-daemon.service" \
+sudo install -m0644 -o root -g root "$PROJECT_DIR/services/kb-kill-daemon.service" \
   /etc/systemd/system/kb-kill-daemon.service
 
 # Replace any old per-user kb-kill daemon unit to avoid two grabbers (and clean up
@@ -104,7 +107,10 @@ rm -f "$USER_HOME/.config/systemd/user/kb-kill.service"
 systemctl --user daemon-reload 2>/dev/null || true
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now kb-kill-daemon.service
+sudo systemctl enable kb-kill-daemon.service
+# restart (not just enable --now) so a redeploy replaces a running daemon with the
+# freshly-installed binary, and any duplicate process is cleared with the cgroup.
+sudo systemctl restart kb-kill-daemon.service
 say "kb-kill system service: $(systemctl is-active kb-kill-daemon.service)"
 
 # --------------------------------------------------------------------------- #

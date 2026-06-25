@@ -318,18 +318,19 @@ minimizes and contains that:
 
 ## Files
 
-All in the self-contained project dir `scripts/kb-kill/`:
+Self-contained project: the executables live in `scripts/`, the systemd units in
+`services/`, and `install.sh`/`uninstall.sh` at the root.
 
 | Path | Purpose |
 |---|---|
-| `kb-kill-daemon` | the daemon (Python) — installed to `/usr/local/bin/kb-kill-daemon` (root) |
-| `kb-kill-push` | mandatory per-user config pusher (Python, stdlib) — user process |
-| `kb-kill-tray` | optional tray icon (Python / AppIndicator) — user process |
+| `scripts/kb-kill-daemon` | the daemon (Python) — installed to `/usr/local/bin/kb-kill-daemon` (root) |
+| `scripts/kb-kill-push` | mandatory per-user config pusher (Python, stdlib) — user process |
+| `scripts/kb-kill-tray` | optional tray icon (Python / AppIndicator) — user process |
 | `install.sh` | installer (user side + sudo root side) |
 | `uninstall.sh` | reverses the install (keeps your config + project files) |
-| `kb-kill-daemon.service` | hardened **system** unit → `/etc/systemd/system/` |
-| `kb-kill-push.service` | pusher **user** unit → `~/.config/systemd/user/` |
-| `kb-kill-tray.service` | tray **user** unit → `~/.config/systemd/user/` |
+| `services/kb-kill-daemon.service` | hardened **system** unit → `/etc/systemd/system/` |
+| `services/kb-kill-push.service` | pusher **user** unit → `~/.config/systemd/user/` |
+| `services/kb-kill-tray.service` | tray **user** unit → `~/.config/systemd/user/` |
 | `kb-kill.toml` | example/default config |
 | `icons/` | tray icons (awake / killed) |
 
