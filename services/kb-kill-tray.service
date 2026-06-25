@@ -8,7 +8,7 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/kb-kill-tray
+ExecStart=/usr/local/bin/kb-kill-tray
 Restart=on-failure
 RestartSec=3
 

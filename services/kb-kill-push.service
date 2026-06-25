@@ -6,7 +6,7 @@ Documentation=https://github.com/seisinger/dotfiles
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/kb-kill-push
+ExecStart=/usr/local/bin/kb-kill-push
 Restart=on-failure
 RestartSec=2
 

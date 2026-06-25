@@ -32,17 +32,16 @@ say()  { printf '\033[0;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
 
 # --------------------------------------------------------------------------- #
-# User side
+# Your session: stop the user services now
 # --------------------------------------------------------------------------- #
-say "Removing user-side components for $USER_NAME"
+say "Stopping user services in your session"
 
-systemctl --user disable --now kb-kill-push.service 2>/dev/null || true
-rm -f "$USER_HOME/.config/systemd/user/kb-kill-push.service"
-systemctl --user disable --now kb-kill-tray.service 2>/dev/null || true
-rm -f "$USER_HOME/.config/systemd/user/kb-kill-tray.service"
-# also clear any stale old per-user daemon unit symlink
-systemctl --user disable --now kb-kill.service 2>/dev/null || true
-rm -f "$USER_HOME/.config/systemd/user/kb-kill.service"
+systemctl --user stop kb-kill-push.service kb-kill-tray.service 2>/dev/null || true
+# Clear any stale per-user enablement / symlinks from an older (pre-global) install.
+for u in kb-kill kb-kill-push kb-kill-tray; do
+  systemctl --user disable --now "$u.service" 2>/dev/null || true
+  rm -f "$USER_HOME/.config/systemd/user/$u.service"
+done
 systemctl --user daemon-reload 2>/dev/null || true
 
 for b in kb-kill kb-kill-daemon kb-kill-push kb-kill-tray; do
@@ -51,16 +50,20 @@ for b in kb-kill kb-kill-daemon kb-kill-push kb-kill-tray; do
 done
 
 # --------------------------------------------------------------------------- #
-# Root side (sudo): stop + remove the daemon, unit, icons
+# System-wide removal (sudo): units, binaries, icons
 # --------------------------------------------------------------------------- #
-say "Removing the root daemon (sudo)"
+say "Removing the system-wide install (sudo)"
 
-# Current names plus the pre-rename ones (migration cleanup).
+# Disable the global user units for all users, then the system daemon (current
+# names plus the pre-rename ones, for migration).
+sudo systemctl --global disable kb-kill-push.service kb-kill-tray.service 2>/dev/null || true
 sudo systemctl disable --now kb-kill-daemon.service 2>/dev/null || true
 sudo systemctl disable --now kb-kill.service 2>/dev/null || true
-sudo rm -f /etc/systemd/system/kb-kill-daemon.service /etc/systemd/system/kb-kill.service
+sudo rm -f /etc/systemd/system/kb-kill-daemon.service /etc/systemd/system/kb-kill.service \
+           /etc/systemd/user/kb-kill-push.service /etc/systemd/user/kb-kill-tray.service
 sudo systemctl daemon-reload
-sudo rm -f /usr/local/bin/kb-kill-daemon /usr/local/bin/kb-kill
+sudo rm -f /usr/local/bin/kb-kill-daemon /usr/local/bin/kb-kill \
+           /usr/local/bin/kb-kill-push /usr/local/bin/kb-kill-tray
 sudo rm -rf /usr/local/share/kb-kill
 
 # --------------------------------------------------------------------------- #
@@ -78,6 +81,9 @@ elif [ -e "$CONFIG" ]; then
     say "Kept config: $CONFIG"
   fi
 fi
+# The system-wide default and any other users' personal configs are left untouched.
+[ -e /etc/kb-kill/kb-kill.toml ] && \
+  say "Left the system default config: /etc/kb-kill/kb-kill.toml (remove with: sudo rm -rf /etc/kb-kill)"
 
 cat <<EOF
 

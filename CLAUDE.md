@@ -26,21 +26,25 @@ dependency manifest, no test suite. Read `README.md` for the full user-facing ma
 
 | Path | Role |
 |---|---|
-| `scripts/kb-kill-daemon` | the daemon (Python, the bulk of the logic) → deployed to `/usr/local/bin/kb-kill-daemon` (root-owned) |
-| `scripts/kb-kill-push` | **mandatory** per-user pusher (stdlib only): feeds the daemon this user's config. An **unprivileged user** process |
-| `scripts/kb-kill-tray` | optional tray icon (Python / GTK3 / AppIndicator), an **unprivileged user** process |
-| `services/kb-kill-daemon.service` | hardened **system** unit (no config path; config arrives by push) |
-| `services/kb-kill-push.service` | pusher **user** unit (`WantedBy=default.target` — runs for TTY too) |
-| `services/kb-kill-tray.service` | tray **user** unit |
+| `scripts/kb-kill-daemon` | the daemon (Python, the bulk of the logic) → `/usr/local/bin/kb-kill-daemon` (root-owned) |
+| `scripts/kb-kill-push` | **mandatory** per-user pusher (stdlib only): feeds the daemon this user's config. Unprivileged **user** process → `/usr/local/bin/kb-kill-push` |
+| `scripts/kb-kill-tray` | optional tray icon (Python / GTK3 / AppIndicator), unprivileged **user** process → `/usr/local/bin/kb-kill-tray` |
+| `services/kb-kill-daemon.service` | hardened **system** unit → `/etc/systemd/system/` (no config path; config arrives by push) |
+| `services/kb-kill-push.service` | pusher **global user** unit → `/etc/systemd/user/` (`WantedBy=default.target` — runs for TTY too) |
+| `services/kb-kill-tray.service` | tray **global user** unit → `/etc/systemd/user/` |
 | `install.sh` / `uninstall.sh` | deploy / reverse (project root) |
-| `kb-kill.toml` | example/default config (TOML) |
-| `icons/` | tray SVGs |
+| `kb-kill.toml` | example/default config (TOML) → installed as the `/etc/kb-kill/kb-kill.toml` system default |
+| `icons/` | tray SVGs → `/usr/local/share/kb-kill/icons/` |
 
 The three executables live in `scripts/`, the three systemd units in `services/`;
-`install.sh`/`uninstall.sh` stay at the project root. The suite name / runtime paths
-stay `kb-kill` (`/run/kb-kill/control.sock`, `/usr/local/share/kb-kill/`); only the
-daemon binary and its unit carry the `-daemon` suffix, to disambiguate from the sibling
-user processes.
+`install.sh`/`uninstall.sh` stay at the project root. **Everything installs system-wide**
+so all users share it: binaries (incl. the unprivileged push/tray) are root-owned copies
+in `/usr/local/bin`, and push/tray are **global user units** in `/etc/systemd/user`
+enabled for every user via `systemctl --global enable` (a `~/.local/bin` symlink into one
+user's home would be unreadable by others). Config is per-user (`~/.config/kb-kill/`) with
+a system default at `/etc/kb-kill/kb-kill.toml`. The suite name / runtime paths stay
+`kb-kill` (`/run/kb-kill/control.sock`, `/usr/local/share/kb-kill/`); only the daemon
+binary and its unit carry the `-daemon` suffix.
 
 ## Commands
 
@@ -62,12 +66,11 @@ dir for the control socket, and warns that grabbing needs root / the `input` gro
 
 ### Redeploying after a code edit (critical)
 
-The daemon runs from the **root-owned copy** at `/usr/local/bin/kb-kill-daemon`, not your
-working tree. Editing `scripts/kb-kill-daemon` does nothing until you **re-run
-`./install.sh`** (idempotent) — that reinstalls the binary and restarts the service.
-Editing `scripts/kb-kill-push` likewise needs a reinstall (it is symlinked into
-`~/.local/bin`, but restart the user service). `detect`/`monitor` run the installed copy.
-Forgetting this is the #1 "my change had no effect" trap.
+All three binaries run from **root-owned copies** in `/usr/local/bin`, not your working
+tree. Editing anything under `scripts/` does nothing until you **re-run `./install.sh`**
+(idempotent) — that reinstalls all three binaries, restarts the system daemon, and
+restarts push/tray in your session. `detect`/`monitor` run the installed copy. Forgetting
+this is the #1 "my change had no effect" trap.
 
 ## Architecture
 

@@ -75,17 +75,24 @@ kb-kill is self-contained — run its installer (it uses `sudo` for the root par
 ./install.sh
 ```
 
-This: symlinks `kb-kill-push`/`kb-kill-tray` into `~/.local/bin`; installs the
-default config to `~/.config/kb-kill/kb-kill.toml` (asks before overwriting an
-existing one); installs + enables the **push** user service (mandatory — it feeds
-your config to the daemon) and the **tray** user service (optional UI); copies the
-daemon to `/usr/local/bin/kb-kill-daemon` (root-owned) and the hardened unit to
-`/etc/systemd/system/kb-kill-daemon.service`; and enables the system service. (It
-also cleans up the pre-rename `kb-kill.service` / `/usr/local/bin/kb-kill` if present.)
+Everything installs **system-wide**, so every user on the machine gets it. The
+installer:
+
+* copies all three binaries to `/usr/local/bin` (root-owned): `kb-kill-daemon`,
+  plus the unprivileged `kb-kill-push` and `kb-kill-tray`;
+* installs the hardened **system** unit to `/etc/systemd/system/kb-kill-daemon.service`
+  and the **global user** units to `/etc/systemd/user/` (so every user's
+  `systemd --user` sees push/tray), enabling them for all users with
+  `systemctl --global enable`;
+* installs a **system default** config to `/etc/kb-kill/kb-kill.toml`, and a personal
+  copy to your `~/.config/kb-kill/kb-kill.toml` you can edit without sudo;
+* enables + starts the daemon, and starts push/tray in your current session;
+* cleans up any pre-rename / per-user install (`kb-kill.service`, `~/.local/bin`
+  symlinks) from earlier versions.
 
 ```sh
-systemctl status kb-kill-daemon          # the root daemon
-systemctl --user status kb-kill-push     # the per-user config pusher (mandatory)
+systemctl status kb-kill-daemon          # the shared root daemon
+systemctl --user status kb-kill-push     # your config pusher (mandatory)
 journalctl -u kb-kill-daemon -f          # watch "live config", KILLED / WOKEN live
 ```
 
@@ -96,12 +103,13 @@ ordinary process can read keyboards (only the sandboxed daemon):
 sudo gpasswd -d "$USER" input            # then log out and back in
 ```
 
-Re-run `./install.sh` to redeploy after editing the daemon code (the daemon runs
-from the root-owned copy, not your working tree).
+Re-run `./install.sh` to redeploy after editing the code (the binaries run from the
+root-owned copies, not your working tree).
 
-On a multi-user machine, every user who wants kb-kill enables their own
-`kb-kill-push` (the installer does it for the user who runs it). The root daemon
-is shared and always uses the config of whoever is **currently** at the seat.
+**Multi-user:** push and tray are enabled for every user and start automatically on
+each user's next login — no per-user install needed. The root daemon is shared and
+always uses the config of whoever is **currently** at the seat; each user keeps their
+own `~/.config/kb-kill/kb-kill.toml` (falling back to the `/etc` default).
 
 To remove everything (binaries, units, icons; stops the services) while keeping
 your config and the project files:
@@ -145,13 +153,16 @@ which kb-kill grabs directly.
 
 ### Multiple users
 
-The root daemon is shared, but only the config of the user **currently controlling
-the seat** governs the keyboard (logind's active session, graphical or TTY). Other
-logged-in users' configs are held but dormant. On a user switch the daemon swaps to
-the now-active user's config and starts it **awake** — a kill is never inherited
-across the switch, so you can never land on a pre-disabled keyboard (or disable the
-login greeter). When no active user has a config (e.g. the login screen), the daemon
-is idle and every keyboard works normally.
+push and tray are installed system-wide and enabled for **every** user, so each
+user's session feeds the shared daemon its own config automatically (no per-user
+setup). Only the config of the user **currently controlling the seat** governs the
+keyboard (logind's active session, graphical or TTY); other logged-in users' configs
+are held but dormant. On a user switch the daemon swaps to the now-active user's
+config and starts it **awake** — a kill is never inherited across the switch, so you
+can never land on a pre-disabled keyboard (or disable the login greeter). When no
+active user has a config (e.g. the login screen), the daemon is idle and every
+keyboard works normally. Each user's config is `~/.config/kb-kill/kb-kill.toml`,
+falling back to the system default `/etc/kb-kill/kb-kill.toml`.
 
 The old `control_socket` / `control_user` / `control_uid` keys are **obsolete** and
 ignored: the control socket is always on, and the user pushing the active config is
@@ -227,8 +238,12 @@ itself is a **root system service** (`systemctl … kb-kill-daemon`, no `--user`
 config flag is needed (the socket is always on); the tray can only command the
 daemon while you are the active user.
 
+It's installed system-wide and enabled for all users by `install.sh`. To toggle it
+just for your session:
+
 ```sh
-systemctl --user enable --now kb-kill-tray   # tray only; install.sh already does this
+systemctl --user start kb-kill-tray    # start now in this session
+systemctl --user stop  kb-kill-tray    # or stop it; it returns on next login
 ```
 
 * Works natively on **COSMIC** and **KDE Plasma**. On **GNOME** it needs the
@@ -323,19 +338,19 @@ Self-contained project: the executables live in `scripts/`, the systemd units in
 
 | Path | Purpose |
 |---|---|
-| `scripts/kb-kill-daemon` | the daemon (Python) — installed to `/usr/local/bin/kb-kill-daemon` (root) |
-| `scripts/kb-kill-push` | mandatory per-user config pusher (Python, stdlib) — user process |
-| `scripts/kb-kill-tray` | optional tray icon (Python / AppIndicator) — user process |
-| `install.sh` | installer (user side + sudo root side) |
+| `scripts/kb-kill-daemon` | the daemon (Python) → `/usr/local/bin/kb-kill-daemon` (root) |
+| `scripts/kb-kill-push` | mandatory per-user config pusher (Python, stdlib) — user process → `/usr/local/bin/kb-kill-push` |
+| `scripts/kb-kill-tray` | optional tray icon (Python / AppIndicator) — user process → `/usr/local/bin/kb-kill-tray` |
+| `install.sh` | installer (system-wide; self-elevates with sudo) |
 | `uninstall.sh` | reverses the install (keeps your config + project files) |
 | `services/kb-kill-daemon.service` | hardened **system** unit → `/etc/systemd/system/` |
-| `services/kb-kill-push.service` | pusher **user** unit → `~/.config/systemd/user/` |
-| `services/kb-kill-tray.service` | tray **user** unit → `~/.config/systemd/user/` |
-| `kb-kill.toml` | example/default config |
-| `icons/` | tray icons (awake / killed) |
+| `services/kb-kill-push.service` | pusher **global user** unit → `/etc/systemd/user/` |
+| `services/kb-kill-tray.service` | tray **global user** unit → `/etc/systemd/user/` |
+| `kb-kill.toml` | example config → `/etc/kb-kill/kb-kill.toml` (system default) + your `~/.config/kb-kill/` |
+| `icons/` | tray icons (awake / killed) → `/usr/local/share/kb-kill/icons/` |
 
-Your personal config is kept in the dotfiles at
-`stow/kb-kill/.config/kb-kill/kb-kill.toml` (stow → `~/.config/kb-kill/`).
+Per-user config lives in `~/.config/kb-kill/kb-kill.toml` (the installing user's is
+seeded from the example; you may also stow it from your dotfiles).
 
 ## Troubleshooting
 
