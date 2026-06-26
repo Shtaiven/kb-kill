@@ -47,8 +47,13 @@ This program is written mostly by agentic AI (Claude using Opus 4.8). Read the s
 - The tray (optional) additionally needs PyGObject + GTK 3 +
   `AyatanaAppIndicator3` — see [Tray icon](#tray-icon).
 
-Install the dependencies for your distro — the **daemon** line is required, the
-**tray** line is only needed if you want the [tray icon](#tray-icon):
+Install the dependencies from **your distro's packages** — the **daemon** line is
+required, the **tray** line is only needed if you want the
+[tray icon](#tray-icon). `pip` is **not** a supported install method: the daemon
+runs as a root system service against the system Python interpreter, so it needs
+the packages where that interpreter looks (and `sudo pip` into the system
+environment risks clobbering distro-managed packages / is refused by PEP 668 on
+recent distros).
 
 **Ubuntu / Debian / Pop!\_OS** (`apt`) — needs Python ≥ 3.11 for `tomllib`
 (Ubuntu 24.04+; on 22.04 install a newer Python):
@@ -124,12 +129,19 @@ first of: `$KB_KILL_CONFIG`, `~/.config/kb-kill/kb-kill.toml`, `~/.kb-kill`,
 the file itself; `kb-kill-daemon detect`/`monitor` and `-c PATH` use the same search
 for the invoking user.)
 
+The **shipped default** (`/etc/kb-kill/kb-kill.toml`, and the copy placed in your
+`~/.config`) is **empty** — it defines no group, so kb-kill does nothing until you
+add one: it only monitors and can never disable a keyboard. There is **no
+built-in hotkey** — a keyboard can be killed only by a combo you set yourself, and
+both `kill_combo` and `wake_combo` are **required** for any group (a group with a
+target keyboard but no combo is a config error).
+
 A simple single-keyboard config:
 
 ```toml
 keyboards  = "AT Translated Set 2 keyboard"
-kill_combo = "ctrl+alt+shift+k"
-wake_combo = "ctrl+alt+shift+u"   # always honored on the killed keyboard
+kill_combo = "ctrl+alt+shift+k"   # required — no default hotkey exists
+wake_combo = "ctrl+alt+shift+u"   # required; always honored on the killed keyboard
 virtual_keyboard = true           # input-remapper-managed; see coexistence below
 ```
 
@@ -170,8 +182,10 @@ keyboards and its own kill/wake hotkeys:
 - The **top-level** keys (above) are the **default group** (when they include
   `keyboards`) and also supply **defaults** that every `[groups.*]` inherits.
 - Each **`[groups.<name>]`** table adds a group; it inherits `kill_combo` and
-  `wake_combo` unless it sets its own. `virtual_keyboard` is per-group (default
-  `false`) and is **not** inherited.
+  `wake_combo` from the top-level unless it sets its own — but there is **no
+  built-in default**, so each combo must be set *somewhere* (top-level or the
+  group itself), else the group is rejected. `virtual_keyboard` is per-group
+  (default `false`) and is **not** inherited.
 - TOML rule: top-level keys must come **before** any `[groups.*]` table.
 - Give each group a **distinct** combo — a shared combo simply kills both.
 

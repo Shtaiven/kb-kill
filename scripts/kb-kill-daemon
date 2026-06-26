@@ -55,10 +55,12 @@ try:
     )
 except ImportError:
     sys.stderr.write(
-        "kb-kill: python-evdev is required.\n"
+        "kb-kill: python-evdev is required. Install it from your distro's\n"
+        "packages (pip is NOT the supported install method — the daemon runs as\n"
+        "a root system service against the system interpreter):\n"
         "  Debian/Ubuntu : sudo apt install python3-evdev\n"
+        "  Fedora        : sudo dnf install python3-evdev\n"
         "  Arch          : sudo pacman -S python-evdev\n"
-        "  pip           : pip install --user evdev\n"
     )
     sys.exit(1)
 
@@ -143,8 +145,11 @@ CONFIG_SEARCH = [
     Path("/etc/kb-kill/kb-kill.toml"),
 ]
 
-DEFAULT_KILL = "ctrl+alt+shift+k"
-DEFAULT_WAKE = "ctrl+alt+shift+u"
+# No built-in default hotkey on purpose: a keyboard can only ever be disabled by
+# a combo the user explicitly set, so a fresh/empty config has no shortcut that
+# can kill a keyboard. Combos are still inherited top-level -> [groups.*]; what's
+# gone is a module-level fallback when nobody set one (that would be a hidden
+# shortcut). A group with a target but no resolvable combo is a config error.
 
 # How often (seconds) to rescan for hotplugged / recreated devices. Also the
 # backstop interval for re-checking the active seat user (the inotify watch on
@@ -394,7 +399,10 @@ def _as_keyboards(value: object, where: str) -> list[str]:
 
 
 def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
-    """Build a Group from a TOML table, inheriting unset combos/fallback."""
+    """Build a Group from a TOML table, inheriting unset combos from the
+    top-level defaults. There is no built-in fallback: a group with a target
+    keyboard but no kill_combo/wake_combo (here or inherited) is an error, so no
+    keyboard can ever be disabled by a hotkey the user didn't explicitly set."""
     for key in table:
         if key not in _GROUP_KEYS:
             log(f"warning: {where}: unknown key {key!r} (ignored)")
@@ -407,6 +415,12 @@ def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
     virtual = table.get("virtual_keyboard", False)
     if not isinstance(virtual, bool):
         raise ConfigError(f"{where}: 'virtual_keyboard' must be true or false")
+    for label, val in (("kill_combo", kill_raw), ("wake_combo", wake_raw)):
+        if val is None:
+            raise ConfigError(
+                f"{where}: '{label}' is required (no built-in default) — a "
+                "keyboard can only be disabled by a combo you set explicitly."
+            )
     if not isinstance(kill_raw, str) or not isinstance(wake_raw, str):
         raise ConfigError(f"{where}: 'kill_combo'/'wake_combo' must be strings")
     try:
@@ -434,9 +448,12 @@ def parse_config(doc: dict, source: str) -> Config:
     if not isinstance(sections, dict):
         raise ConfigError(f"{source}: 'groups' must be a table ([groups.<name>])")
 
+    # No module-level fallback: an unset combo stays None and is inherited by
+    # [groups.*]; if nothing sets it, _build_group rejects the group rather than
+    # conjuring a hidden default hotkey.
     defaults = {
-        "kill_combo": doc.get("kill_combo", DEFAULT_KILL),
-        "wake_combo": doc.get("wake_combo", DEFAULT_WAKE),
+        "kill_combo": doc.get("kill_combo"),
+        "wake_combo": doc.get("wake_combo"),
     }
 
     groups = []
@@ -456,9 +473,13 @@ def parse_config(doc: dict, source: str) -> Config:
         groups.append(_build_group(name, table, defaults, f"{source} [groups.{name}]"))
 
     if not groups:
-        raise ConfigError(
-            f"{source}: no group defined. Add top-level 'keyboards = ...' and/or a "
-            "[groups.<name>] table with its own 'keyboards'."
+        # An empty config is VALID and INERT: with no group there is no target
+        # and no kill/wake combo, so the daemon only monitors and can never grab
+        # a keyboard. This is the shipped default — a user must explicitly add a
+        # group (top-level 'keyboards = ...' and/or a [groups.<name>] table)
+        # before any hotkey can disable a keyboard.
+        log(
+            f"{source}: no groups defined — inert (monitor only, nothing can be killed)"
         )
     return Config(groups, source)
 
@@ -1120,6 +1141,10 @@ def cmd_detect(config: Config) -> int:
     print(f"config  : {config.source}")
     print()
     print("Groups:")
+    if not config.groups:
+        print("  (none) - config is INERT: kb-kill only monitors and can never")
+        print("          disable a keyboard. Add a group (with kill/wake combos)")
+        print("          to enable it; see the comments in kb-kill.toml.")
     for g in config.groups:
         print(f"  [{g.name}]  keyboards={g.keyboards}")
         print(
@@ -1163,7 +1188,7 @@ def cmd_detect(config: Config) -> int:
         print(f"  {path:24} [{kind}] {dev.name}")
         print(f"  {'':24}   {mark}")
 
-    if not any_target:
+    if config.groups and not any_target:
         print()
         print(
             "No target will be grabbed. A virtual_keyboard group needs its "
