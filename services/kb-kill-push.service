@@ -1,6 +1,5 @@
 [Unit]
 Description=kb-kill-push - feed this user's config to the kb-kill daemon
-Documentation=https://github.com/seisinger/dotfiles
 # Pushes config over the daemon's control socket and reconnects on its own, so
 # no ordering dependency on the system daemon is needed.
 

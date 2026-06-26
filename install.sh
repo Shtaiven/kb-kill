@@ -36,11 +36,6 @@ warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
 # --------------------------------------------------------------------------- #
 say "Installing kb-kill system-wide (sudo)"
 
-# Migration: stop + remove the pre-rename daemon (kb-kill.service / kb-kill) so we
-# don't end up with two grabbers fighting over the keyboard.
-sudo systemctl disable --now kb-kill.service 2>/dev/null || true
-sudo rm -f /etc/systemd/system/kb-kill.service /usr/local/bin/kb-kill
-
 # Binaries: root-owned copies on the global PATH, so EVERY user can run push/tray
 # (a ~/.local/bin symlink into one user's home is unreadable by others). The
 # daemon stays root-owned for the security model; push/tray run unprivileged.
@@ -86,15 +81,6 @@ sudo systemctl --global enable kb-kill-push.service kb-kill-tray.service
 # --------------------------------------------------------------------------- #
 say "Configuring your session"
 
-# Migration: drop the old per-user install (symlinks + ~/.config user units) from
-# before kb-kill went system-wide, so they don't shadow the global copies.
-rm -f "$USER_HOME/.local/bin/kb-kill" "$USER_HOME/.local/bin/kb-kill-daemon" \
-      "$USER_HOME/.local/bin/kb-kill-push" "$USER_HOME/.local/bin/kb-kill-tray"
-for u in kb-kill kb-kill-push kb-kill-tray; do
-  systemctl --user disable "$u.service" 2>/dev/null || true
-  rm -f "$USER_HOME/.config/systemd/user/$u.service"
-done
-
 # A personal config you can edit without sudo (overrides the /etc default). Other
 # users get the /etc default until they create their own here.
 mkdir -p "$USER_HOME/.config/kb-kill"
@@ -129,15 +115,8 @@ cat <<EOF
 
 Done — installed system-wide. Other users get push/tray on their next login.
 
-Manual follow-ups for the full security benefit:
+After editing the code, re-run this installer to redeploy:
+    $PROJECT_DIR/install.sh
 
-  1) Remove yourself from the 'input' group so no ordinary user process can read
-     keyboards anymore (only the sandboxed root daemon):
-         sudo gpasswd -d $USER_NAME input
-     Then log out and back in. (Verify nothing else you use needs it first.)
-
-  2) After editing the code, re-run this installer to redeploy:
-         sudo true && $PROJECT_DIR/install.sh
-
-Note: 'kb-kill-daemon detect' / 'monitor' now need sudo (you've left the input group).
+Note: 'kb-kill-daemon detect' / 'monitor' need sudo (they read input devices).
 EOF

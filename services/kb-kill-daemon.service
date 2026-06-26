@@ -1,6 +1,5 @@
 [Unit]
 Description=kb-kill - disable/enable a target keyboard on a global hotkey
-Documentation=https://github.com/seisinger/dotfiles
 After=multi-user.target
 
 [Service]

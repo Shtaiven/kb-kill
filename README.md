@@ -96,13 +96,6 @@ systemctl --user status kb-kill-push     # your config pusher (mandatory)
 journalctl -u kb-kill-daemon -f          # watch "live config", KILLED / WOKEN live
 ```
 
-Then, for the full security benefit, remove yourself from the `input` group so no
-ordinary process can read keyboards (only the sandboxed daemon):
-
-```sh
-sudo gpasswd -d "$USER" input            # then log out and back in
-```
-
 Re-run `./install.sh` to redeploy after editing the code (the binaries run from the
 root-owned copies, not your working tree).
 
@@ -164,10 +157,6 @@ active user has a config (e.g. the login screen), the daemon is idle and every
 keyboard works normally. Each user's config is `~/.config/kb-kill/kb-kill.toml`,
 falling back to the system default `/etc/kb-kill/kb-kill.toml`.
 
-The old `control_socket` / `control_user` / `control_uid` keys are **obsolete** and
-ignored: the control socket is always on, and the user pushing the active config is
-automatically the one authorized to command the daemon.
-
 ### Groups: per-keyboard hotkeys
 
 You can define several independent **groups**, each with its own target
@@ -223,9 +212,9 @@ sudo kb-kill-daemon monitor   # print raw key events (debugging)
 kb-kill-daemon -c PATH run    # run with a specific config pinned live (ad-hoc testing, no pusher needed)
 ```
 
-`detect` is the place to start. It needs `sudo` because reading input devices is
-now restricted to root (you're no longer in the `input` group). The service itself
-(`kb-kill-daemon run` with no `-c`) starts config-less and waits for `kb-kill-push`.
+`detect` is the place to start. It needs `sudo` because reading input devices
+requires root. The service itself (`kb-kill-daemon run` with no `-c`) starts
+config-less and waits for `kb-kill-push`.
 
 ## Tray icon
 
@@ -251,8 +240,8 @@ systemctl --user stop  kb-kill-tray    # or stop it; it returns on next login
   (GNOME has no native tray).
 * Requires PyGObject with `Gtk 3.0` and `AyatanaAppIndicator3` — install the
   "tray" line for your distro in [Requirements](#requirements).
-* The icons live in `~/.config/kb-kill/icons/` and the menu lists every group
-  from your config, so multiple groups each get their own toggle entry.
+* The icons are installed to `/usr/local/share/kb-kill/icons/` and the menu lists
+  every group from your config, so multiple groups each get their own toggle entry.
 
 The control socket is also a small JSON line protocol if you want to script it:
 send `{"cmd":"toggle","group":"<name>"}` (or `kill`/`wake`/`status`) — accepted only
@@ -305,11 +294,9 @@ minimizes and contains that:
   config text + group state (`{name, killed, targets}`), **never key data**.
   (`kb-kill-daemon monitor` is a manual debug tool that prints to the terminal; the
   service never does.)
-* **Runs as a hardened root daemon, so you can leave the `input` group.** That
-  group is the real exposure — it lets *any* user process read every keyboard.
-  With the root daemon you remove yourself from it
-  (`sudo gpasswd -d "$USER" input`), so only the one audited, sandboxed process
-  can read input.
+* **Reading input is confined to one process.** Keyboard access lives entirely in
+  this single audited, sandboxed root daemon — no ordinary user process needs (or
+  is granted) access to your keyboards.
 * **The daemon binary is root-owned** (`/usr/local/bin/kb-kill-daemon`), never your
   user-writable working tree — a root service running a user-writable script
   would be a privilege-escalation hole. (Config never executes — it is parsed as

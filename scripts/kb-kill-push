@@ -24,8 +24,8 @@ import sys
 import time
 from pathlib import Path
 
-POLL_SECONDS = 1.0          # how often to check the config file for edits
-RECONNECT_SECONDS = 2.0     # backoff between connection attempts
+POLL_SECONDS = 1.0  # how often to check the config file for edits
+RECONNECT_SECONDS = 2.0  # backoff between connection attempts
 
 
 def log(msg):
@@ -45,7 +45,6 @@ def config_path():
     home = Path.home()
     candidates = [
         home / ".config" / "kb-kill" / "kb-kill.toml",
-        home / ".config" / "kb-kill" / "kb-kill.conf",
         home / ".kb-kill" / "kb-kill.toml",
         home / ".kb-kill",
         Path("/etc/kb-kill/kb-kill.toml"),
@@ -57,15 +56,21 @@ def config_path():
 
 
 def socket_path():
-    """Where the daemon's control socket lives (root service -> /run/kb-kill;
-    an unprivileged dev daemon -> the user runtime dir)."""
-    run = "/run/kb-kill/control.sock"
-    if os.path.exists(run):
-        return run
+    """Where the daemon's control socket lives (root service -> /run/kb-kill; an
+    unprivileged dev daemon -> the user runtime dir, or /tmp as a last resort).
+
+    Must stay in sync with the daemon's control_socket_path() and the tray's
+    socket_path() - the same candidate set in the same order."""
+    candidates = ["/run/kb-kill/control.sock"]
     base = os.environ.get("XDG_RUNTIME_DIR")
-    if base and os.path.exists(os.path.join(base, "kb-kill.sock")):
-        return os.path.join(base, "kb-kill.sock")
-    return run  # default to the system path; connect() will retry until it exists
+    if base:
+        candidates.append(os.path.join(base, "kb-kill.sock"))
+    candidates.append(f"/tmp/kb-kill-{os.getuid()}.sock")
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    # default to the system path; connect() retries until it exists
+    return candidates[0]
 
 
 def read_config():
@@ -99,6 +104,13 @@ def serve_once():
     text, mtime = read_config()
     if text is None:
         log("no config file found yet; will push when one appears")
+        # Send a no-op command so the daemon marks the handshake complete and its
+        # idle-connection sweep keeps us open while we wait for a config to appear.
+        try:
+            sock.sendall((json.dumps({"cmd": "status"}) + "\n").encode())
+        except OSError:
+            sock.close()
+            return
     else:
         try:
             push(sock, text)

@@ -60,9 +60,10 @@ systemctl --user restart kb-kill-tray    # optional UI
 
 There is no lint/test/build step. To run the daemon unprivileged for ad-hoc testing,
 run `./scripts/kb-kill-daemon run -c some.toml` directly: `-c` pins that file live
-(bypassing seat arbitration, so you don't need a pusher), falls back to a user runtime
-dir for the control socket, and warns that grabbing needs root / the `input` group. Plain
-`./scripts/kb-kill-daemon run` starts config-less and waits for a push.
+(bypassing seat arbitration, so you don't need a pusher) and falls back to a user
+runtime dir for the control socket; run unprivileged it can monitor but grabbing
+fails until run as root. Plain `./scripts/kb-kill-daemon run` starts config-less and
+waits for a push.
 
 ### Redeploying after a code edit (critical)
 

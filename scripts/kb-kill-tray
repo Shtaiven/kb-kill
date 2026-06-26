@@ -48,29 +48,38 @@ def icon_dir():
     script lives in scripts/, the icons in the project root's icons/), then a
     system install, then the user config."""
     here = os.path.dirname(os.path.realpath(__file__))
-    for candidate in (os.path.join(here, "icons"),
-                      os.path.join(here, os.pardir, "icons"),  # scripts/ -> ../icons
-                      "/usr/local/share/kb-kill/icons",
-                      os.path.expanduser("~/.config/kb-kill/icons")):
+    for candidate in (
+        os.path.join(here, "icons"),
+        os.path.join(here, os.pardir, "icons"),  # scripts/ -> ../icons
+        "/usr/local/share/kb-kill/icons",
+        os.path.expanduser("~/.config/kb-kill/icons"),
+    ):
         if os.path.isdir(candidate):
             return candidate
     return None
 
 
 def socket_path():
-    for candidate in ("/run/kb-kill/control.sock",
-                      os.path.join(os.environ.get("XDG_RUNTIME_DIR", ""),
-                                   "kb-kill.sock")):
-        if candidate and os.path.exists(candidate):
-            return candidate
+    """Where the daemon's control socket lives. Must stay in sync with the
+    daemon's control_socket_path() and kb-kill-push's socket_path() - the same
+    candidate set in the same order."""
+    candidates = ["/run/kb-kill/control.sock"]
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if base:
+        candidates.append(os.path.join(base, "kb-kill.sock"))
+    candidates.append(f"/tmp/kb-kill-{os.getuid()}.sock")
+    for c in candidates:
+        if os.path.exists(c):
+            return c
     # default to the system path even if not yet present (reconnect will retry)
-    return "/run/kb-kill/control.sock"
+    return candidates[0]
 
 
 class Tray:
     def __init__(self):
         self.ind = AppIndicator3.Indicator.new(
-            APP_ID, ICON_AWAKE, AppIndicator3.IndicatorCategory.HARDWARE)
+            APP_ID, ICON_AWAKE, AppIndicator3.IndicatorCategory.HARDWARE
+        )
         icons = icon_dir()
         if icons:
             self.ind.set_icon_theme_path(icons)
@@ -80,7 +89,7 @@ class Tray:
         self.buf = b""
         self.groups = []
         self.connected = False
-        self._render()                       # initial "connecting" menu/icon
+        self._render()  # initial "connecting" menu/icon
         self._connect()
 
     # -- connection ---------------------------------------------------------- #
@@ -99,15 +108,16 @@ class Tray:
         self.sock = s
         self.buf = b""
         self.connected = True
-        GLib.io_add_watch(s.fileno(), GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR,
-                          self._on_readable)
+        GLib.io_add_watch(
+            s.fileno(), GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self._on_readable
+        )
         self._send({"cmd": "status"})
         return True
 
     def _reconnect(self):
         if not self.connected:
             self._connect()
-        return False                          # one-shot timer
+        return False  # one-shot timer
 
     def _drop(self):
         if self.sock is not None:
@@ -158,8 +168,7 @@ class Tray:
     # -- UI ------------------------------------------------------------------ #
     def _render(self):
         any_killed = any(g.get("killed") for g in self.groups)
-        self.ind.set_icon_full(ICON_KILLED if any_killed else ICON_AWAKE,
-                               "kb-kill")
+        self.ind.set_icon_full(ICON_KILLED if any_killed else ICON_AWAKE, "kb-kill")
         if not self.connected:
             self.ind.set_title("kb-kill: connecting…")
         elif any_killed:

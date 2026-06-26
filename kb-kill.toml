@@ -39,14 +39,6 @@ wake_combo = "ctrl+alt+shift+u"
 # (the default) for an ordinary keyboard, which kb-kill grabs directly.
 virtual_keyboard = false
 
-# ─── Control socket ────────────────────────────────────────────────────────────
-# The daemon's control socket is always on (it is how config is delivered, and how
-# the optional tray shows state / toggles groups). It carries config + group state
-# only — never keystrokes — and the kernel (SO_PEERCRED) authenticates every
-# command: only the user who currently controls the seat may command the daemon.
-# The old control_socket / control_user / control_uid keys are obsolete and
-# ignored (you are authorized automatically as the pushing, active user).
-
 # Example of a second group (uncomment + edit). Inherits wake_combo unless set.
 #
 # [groups.externals]
