@@ -39,6 +39,11 @@ This program is written mostly by agentic AI (Claude using Opus 4.8). Read the s
 - Python 3.11+ (for `tomllib`) and
   [`python-evdev`](https://python-evdev.readthedocs.io/).
 - `systemd` and `sudo` (the daemon is a root system service).
+- **`systemd-logind`** with at least one seat (the normal desktop/TTY case). The
+  daemon reads `/run/systemd/seats/*` (`ACTIVE_UID`) to follow whoever currently
+  controls the seat and apply only that user's pushed config. Without an active
+  seat — e.g. headless or a container with no logind — the daemon still runs but
+  stays **idle** (it never grabs the keyboard), since no user is ever "live".
 - The tray (optional) additionally needs PyGObject + GTK 3 +
   `AyatanaAppIndicator3` — see [Tray icon](#tray-icon).
 
