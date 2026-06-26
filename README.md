@@ -16,19 +16,19 @@ This program is written mostly by agentic AI (Claude using Opus 4.8). Read the s
 
 ## How it works
 
-* "Disable" means an exclusive `EVIOCGRAB` on the target device: the kernel
+- "Disable" means an exclusive `EVIOCGRAB` on the target device: the kernel
   routes its events only to kb-kill, which drops them.
-* The grab happens **only while killed**. When awake, kb-kill merely *monitors*
+- The grab happens **only while killed**. When awake, kb-kill merely *monitors*
   keyboards (reads, never grabs, never re-injects), so normal typing is 100%
   native and a crash of the service cannot break your keyboard. The kernel also
   releases every grab automatically if the process dies.
-* Hotkeys are matched **globally** (across the union of all keyboards), not
+- Hotkeys are matched **globally** (across the union of all keyboards), not
   per-device — see [input-remapper](#input-remapper-coexistence) for why that
   matters.
-* No virtual device. kb-kill runs as a **hardened root system daemon** so that no
+- No virtual device. kb-kill runs as a **hardened root system daemon** so that no
   ordinary user process needs access to your keyboards — see
   [Security model](#security-model).
-* **It follows whoever is logged in.** The daemon has no config of its own: a tiny
+- **It follows whoever is logged in.** The daemon has no config of its own: a tiny
   per-user service (`kb-kill-push`) hands it your config, and the daemon uses the
   config of whoever currently controls the seat — graphical desktop **or** TTY —
   switching automatically on fast-user-switch / VT change. Nothing is tied to the
@@ -36,10 +36,10 @@ This program is written mostly by agentic AI (Claude using Opus 4.8). Read the s
 
 ## Requirements
 
-* Python 3.11+ (for `tomllib`) and
+- Python 3.11+ (for `tomllib`) and
   [`python-evdev`](https://python-evdev.readthedocs.io/).
-* `systemd` and `sudo` (the daemon is a root system service).
-* The tray (optional) additionally needs PyGObject + GTK 3 +
+- `systemd` and `sudo` (the daemon is a root system service).
+- The tray (optional) additionally needs PyGObject + GTK 3 +
   `AyatanaAppIndicator3` — see [Tray icon](#tray-icon).
 
 Install the dependencies for your distro — the **daemon** line is required, the
@@ -78,16 +78,16 @@ kb-kill is self-contained — run its installer (it uses `sudo` for the root par
 Everything installs **system-wide**, so every user on the machine gets it. The
 installer:
 
-* copies all three binaries to `/usr/local/bin` (root-owned): `kb-kill-daemon`,
+- copies all three binaries to `/usr/local/bin` (root-owned): `kb-kill-daemon`,
   plus the unprivileged `kb-kill-push` and `kb-kill-tray`;
-* installs the hardened **system** unit to `/etc/systemd/system/kb-kill-daemon.service`
+- installs the hardened **system** unit to `/etc/systemd/system/kb-kill-daemon.service`
   and the **global user** units to `/etc/systemd/user/` (so every user's
   `systemd --user` sees push/tray), enabling them for all users with
   `systemctl --global enable`;
-* installs a **system default** config to `/etc/kb-kill/kb-kill.toml`, and a personal
+- installs a **system default** config to `/etc/kb-kill/kb-kill.toml`, and a personal
   copy to your `~/.config/kb-kill/kb-kill.toml` you can edit without sudo;
-* enables + starts the daemon, and starts push/tray in your current session;
-* cleans up any pre-rename / per-user install (`kb-kill.service`, `~/.local/bin`
+- enables + starts the daemon, and starts push/tray in your current session;
+- cleans up any pre-rename / per-user install (`kb-kill.service`, `~/.local/bin`
   symlinks) from earlier versions.
 
 ```sh
@@ -162,13 +162,13 @@ falling back to the system default `/etc/kb-kill/kb-kill.toml`.
 You can define several independent **groups**, each with its own target
 keyboards and its own kill/wake hotkeys:
 
-* The **top-level** keys (above) are the **default group** (when they include
+- The **top-level** keys (above) are the **default group** (when they include
   `keyboards`) and also supply **defaults** that every `[groups.*]` inherits.
-* Each **`[groups.<name>]`** table adds a group; it inherits `kill_combo` and
+- Each **`[groups.<name>]`** table adds a group; it inherits `kill_combo` and
   `wake_combo` unless it sets its own. `virtual_keyboard` is per-group (default
   `false`) and is **not** inherited.
-* TOML rule: top-level keys must come **before** any `[groups.*]` table.
-* Give each group a **distinct** combo — a shared combo simply kills both.
+- TOML rule: top-level keys must come **before** any `[groups.*]` table.
+- Give each group a **distinct** combo — a shared combo simply kills both.
 
 ```toml
 wake_combo = "ctrl+alt+shift+u"               # default, inherited below
@@ -193,15 +193,15 @@ device stays disabled while *any* group targeting it is killed.
 Tokens joined by `+`. Each token is an "any-of" group; the combo fires when
 every group has at least one key held.
 
-| token | matches |
-|---|---|
-| `ctrl` / `control` | either Ctrl |
-| `lctrl` / `rctrl` | left / right Ctrl only |
-| `alt` | either Alt (`ralt` = AltGr) |
-| `shift` | either Shift |
-| `super` / `meta` / `win` / `cmd` | either Super |
-| `lalt`/`ralt`, `lshift`/`rshift`, `lsuper`/`rsuper` | pin a side |
-| `a`–`z`, a raw `KEY_*` name, or a numeric code | that single key |
+| token                                               | matches                     |
+| --------------------------------------------------- | --------------------------- |
+| `ctrl` / `control`                                  | either Ctrl                 |
+| `lctrl` / `rctrl`                                   | left / right Ctrl only      |
+| `alt`                                               | either Alt (`ralt` = AltGr) |
+| `shift`                                             | either Shift                |
+| `super` / `meta` / `win` / `cmd`                    | either Super                |
+| `lalt`/`ralt`, `lshift`/`rshift`, `lsuper`/`rsuper` | pin a side                  |
+| `a`–`z`, a raw `KEY_*` name, or a numeric code      | that single key             |
 
 ## Commands
 
@@ -235,12 +235,12 @@ systemctl --user start kb-kill-tray    # start now in this session
 systemctl --user stop  kb-kill-tray    # or stop it; it returns on next login
 ```
 
-* Works natively on **COSMIC** and **KDE Plasma**. On **GNOME** it needs the
+- Works natively on **COSMIC** and **KDE Plasma**. On **GNOME** it needs the
   [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/)
   (GNOME has no native tray).
-* Requires PyGObject with `Gtk 3.0` and `AyatanaAppIndicator3` — install the
+- Requires PyGObject with `Gtk 3.0` and `AyatanaAppIndicator3` — install the
   "tray" line for your distro in [Requirements](#requirements).
-* The icons are installed to `/usr/local/share/kb-kill/icons/` and the menu lists
+- The icons are installed to `/usr/local/share/kb-kill/icons/` and the menu lists
   every group from your config, so multiple groups each get their own toggle entry.
 
 The control socket is also a small JSON line protocol if you want to script it:
@@ -256,8 +256,8 @@ kb-kill is built to run alongside [input-remapper](https://github.com/sezanzeb/i
 When input-remapper manages a keyboard it grabs the **physical** device (e.g.
 `/dev/input/event3`) and re-emits its events through **virtual** devices:
 
-* a per-keyboard `…forwarded` device for **un-remapped** (passthrough) keys, and
-* the shared `input-remapper keyboard` device for the **output of mappings**.
+- a per-keyboard `…forwarded` device for **un-remapped** (passthrough) keys, and
+- the shared `input-remapper keyboard` device for the **output of mappings**.
 
 Mark such a group **`virtual_keyboard = true`** and kb-kill targets the
 **forwarded** (virtual) device and **never the physical one**, so input-remapper
@@ -272,7 +272,7 @@ Two consequences worth knowing:
    can be split across two virtual devices (a remapped modifier on
    `input-remapper keyboard`, the rest on the `…forwarded` device). Per-device
    matching would never see the whole combo.
-2. **Remapped keys are not eaten while killed.** kb-kill grabs only the
+1. **Remapped keys are not eaten while killed.** kb-kill grabs only the
    forwarded device, not input-remapper's *shared* output device (grabbing that
    would also suppress remapped output from every other device — e.g. mice doing
    workspace switching). So while killed, ordinary typing is eaten but anything
@@ -288,20 +288,20 @@ at its default (`false`) and kb-kill grabs the physical keyboard directly.
 kb-kill reads all keyboard input, so it is keylogger-*capable*. The design
 minimizes and contains that:
 
-* **No keystrokes are ever stored or transmitted.** The daemon keeps only the set
+- **No keystrokes are ever stored or transmitted.** The daemon keeps only the set
   of keys *currently held* (for combo matching) and discards them on key-up —
   there is no history, no log, no file, no network. The control socket carries
   config text + group state (`{name, killed, targets}`), **never key data**.
   (`kb-kill-daemon monitor` is a manual debug tool that prints to the terminal; the
   service never does.)
-* **Reading input is confined to one process.** Keyboard access lives entirely in
+- **Reading input is confined to one process.** Keyboard access lives entirely in
   this single audited, sandboxed root daemon — no ordinary user process needs (or
   is granted) access to your keyboards.
-* **The daemon binary is root-owned** (`/usr/local/bin/kb-kill-daemon`), never your
+- **The daemon binary is root-owned** (`/usr/local/bin/kb-kill-daemon`), never your
   user-writable working tree — a root service running a user-writable script
   would be a privilege-escalation hole. (Config never executes — it is parsed as
   TOML, and arrives over the socket rather than being read from disk.)
-* **systemd sandbox** (`/etc/systemd/system/kb-kill-daemon.service`): no network
+- **systemd sandbox** (`/etc/systemd/system/kb-kill-daemon.service`): no network
   (`RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`), only input devices
   (`DevicePolicy=closed` + `DeviceAllow=char-input`), `SystemCallFilter`,
   `MemoryDenyWriteExecute`, `ProtectSystem=strict`, etc. The push model makes the
@@ -309,7 +309,7 @@ minimizes and contains that:
   capabilities are dropped** (`CapabilityBoundingSet=` empty) and home is invisible
   (`ProtectHome=true`). Even a hypothetical code-injection can't exfiltrate or touch
   other devices.
-* **Control socket: always on, per-command authenticated.** It is how config is
+- **Control socket: always on, per-command authenticated.** It is how config is
   delivered, so it accepts connections from any local user (mode 0666) — but the
   kernel-verified peer uid (`SO_PEERCRED`) gates every command: a pushed config only
   governs the keyboard while that user is the **active** seat user, and only that
@@ -323,34 +323,33 @@ minimizes and contains that:
 Self-contained project: the executables live in `scripts/`, the systemd units in
 `services/`, and `install.sh`/`uninstall.sh` at the root.
 
-| Path | Purpose |
-|---|---|
-| `scripts/kb-kill-daemon` | the daemon (Python) → `/usr/local/bin/kb-kill-daemon` (root) |
-| `scripts/kb-kill-push` | mandatory per-user config pusher (Python, stdlib) — user process → `/usr/local/bin/kb-kill-push` |
-| `scripts/kb-kill-tray` | optional tray icon (Python / AppIndicator) — user process → `/usr/local/bin/kb-kill-tray` |
-| `install.sh` | installer (system-wide; self-elevates with sudo) |
-| `uninstall.sh` | reverses the install (keeps your config + project files) |
-| `services/kb-kill-daemon.service` | hardened **system** unit → `/etc/systemd/system/` |
-| `services/kb-kill-push.service` | pusher **global user** unit → `/etc/systemd/user/` |
-| `services/kb-kill-tray.service` | tray **global user** unit → `/etc/systemd/user/` |
-| `kb-kill.toml` | example config → `/etc/kb-kill/kb-kill.toml` (system default) + your `~/.config/kb-kill/` |
-| `icons/` | tray icons (awake / killed) → `/usr/local/share/kb-kill/icons/` |
+| Path                              | Purpose                                                                                          |
+| --------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `scripts/kb-kill-daemon`          | the daemon (Python) → `/usr/local/bin/kb-kill-daemon` (root)                                     |
+| `scripts/kb-kill-push`            | mandatory per-user config pusher (Python, stdlib) — user process → `/usr/local/bin/kb-kill-push` |
+| `scripts/kb-kill-tray`            | optional tray icon (Python / AppIndicator) — user process → `/usr/local/bin/kb-kill-tray`        |
+| `install.sh`                      | installer (system-wide; self-elevates with sudo)                                                 |
+| `uninstall.sh`                    | reverses the install (keeps your config + project files)                                         |
+| `services/kb-kill-daemon.service` | hardened **system** unit → `/etc/systemd/system/`                                                |
+| `services/kb-kill-push.service`   | pusher **global user** unit → `/etc/systemd/user/`                                               |
+| `services/kb-kill-tray.service`   | tray **global user** unit → `/etc/systemd/user/`                                                 |
+| `kb-kill.toml`                    | example config → `/etc/kb-kill/kb-kill.toml` (system default) + your `~/.config/kb-kill/`        |
+| `icons/`                          | tray icons (awake / killed) → `/usr/local/share/kb-kill/icons/`                                  |
 
 Per-user config lives in `~/.config/kb-kill/kb-kill.toml` (the installing user's is
 seeded from the example; you may also stow it from your dotfiles).
 
 ## Troubleshooting
 
-* **Nothing happens on the hotkey** — first check the daemon actually has your
+- **Nothing happens on the hotkey** — first check the daemon actually has your
   config: `journalctl -u kb-kill-daemon -e` should show a `live config: uid <you>`
   line. If it says `idle`, your `kb-kill-push` isn't running or you aren't the active
-  seat user — `systemctl --user status kb-kill-push`. Then `sudo kb-kill-daemon
-  detect` to confirm a target is found. If a key in your combo is remapped by
+  seat user — `systemctl --user status kb-kill-push`. Then `sudo kb-kill-daemon detect` to confirm a target is found. If a key in your combo is remapped by
   input-remapper, use its remapped form.
-* **A keyboard can't kill/wake itself** — restart the daemon after a code
+- **A keyboard can't kill/wake itself** — restart the daemon after a code
   redeploy: `sudo systemctl restart kb-kill-daemon`.
-* **Tray shows "connecting…"** — the daemon isn't running; check
+- **Tray shows "connecting…"** — the daemon isn't running; check
   `systemctl status kb-kill-daemon`. If the tray connects but shows no groups, you
   may not be the active seat user (state is only sent to the live user).
-* **Stuck modifier after killing from the target** — shouldn't happen: kb-kill
+- **Stuck modifier after killing from the target** — shouldn't happen: kb-kill
   defers the grab until the target has no keys held. Report if it does.

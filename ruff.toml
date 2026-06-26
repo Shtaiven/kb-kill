@@ -1,0 +1,9 @@
+# Ruff config. Target 3.11 (the minimum the code supports — tomllib lands in
+# 3.11), so pyupgrade never rewrites to syntax newer than that.
+target-version = "py311"
+
+[lint]
+extend-select = [
+  "UP", # pyupgrade — flag/rewrite outdated syntax for the target version
+  "I",  # isort — keep imports ordered
+]

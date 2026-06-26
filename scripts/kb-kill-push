@@ -28,12 +28,12 @@ POLL_SECONDS = 1.0  # how often to check the config file for edits
 RECONNECT_SECONDS = 2.0  # backoff between connection attempts
 
 
-def log(msg):
+def log(msg: str) -> None:
     sys.stderr.write(f"kb-kill-push: {msg}\n")
     sys.stderr.flush()
 
 
-def config_path():
+def config_path() -> Path | None:
     """First existing config for this user (mirrors the daemon's search order).
 
     Runs as the user, so Path.home() / the environment are authoritative - no
@@ -55,7 +55,7 @@ def config_path():
     return None
 
 
-def socket_path():
+def socket_path() -> str:
     """Where the daemon's control socket lives (root service -> /run/kb-kill; an
     unprivileged dev daemon -> the user runtime dir, or /tmp as a last resort).
 
@@ -73,7 +73,7 @@ def socket_path():
     return candidates[0]
 
 
-def read_config():
+def read_config() -> tuple[str | None, float | None]:
     """Return (text, mtime) for the current config, or (None, None) if absent."""
     p = config_path()
     if p is None:
@@ -85,11 +85,11 @@ def read_config():
         return None, None
 
 
-def push(sock, text):
+def push(sock: socket.socket, text: str) -> None:
     sock.sendall((json.dumps({"cmd": "set_config", "toml": text}) + "\n").encode())
 
 
-def serve_once():
+def serve_once() -> None:
     """One connection lifetime: connect, push, then re-push on every edit until
     the socket drops. Returns when the connection is lost."""
     path = socket_path()
@@ -129,7 +129,7 @@ def serve_once():
                 if not data:
                     log("daemon closed the connection")
                     return
-            except socket.timeout:
+            except TimeoutError:
                 pass
             except OSError:
                 log("connection error")
@@ -150,7 +150,7 @@ def serve_once():
             pass
 
 
-def main():
+def main() -> int:
     log("starting; following this user's config")
     while True:
         serve_once()

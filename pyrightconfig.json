@@ -1,0 +1,11 @@
+{
+  "include": [
+    "scripts/kb-kill-daemon",
+    "scripts/kb-kill-push",
+    "scripts/kb-kill-tray"
+  ],
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Linux",
+  "typeCheckingMode": "standard",
+  "reportMissingModuleSource": false
+}

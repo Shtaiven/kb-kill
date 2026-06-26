@@ -24,17 +24,17 @@ dependency manifest, no test suite. Read `README.md` for the full user-facing ma
 
 ## Files
 
-| Path | Role |
-|---|---|
-| `scripts/kb-kill-daemon` | the daemon (Python, the bulk of the logic) → `/usr/local/bin/kb-kill-daemon` (root-owned) |
-| `scripts/kb-kill-push` | **mandatory** per-user pusher (stdlib only): feeds the daemon this user's config. Unprivileged **user** process → `/usr/local/bin/kb-kill-push` |
-| `scripts/kb-kill-tray` | optional tray icon (Python / GTK3 / AppIndicator), unprivileged **user** process → `/usr/local/bin/kb-kill-tray` |
-| `services/kb-kill-daemon.service` | hardened **system** unit → `/etc/systemd/system/` (no config path; config arrives by push) |
-| `services/kb-kill-push.service` | pusher **global user** unit → `/etc/systemd/user/` (`WantedBy=default.target` — runs for TTY too) |
-| `services/kb-kill-tray.service` | tray **global user** unit → `/etc/systemd/user/` |
-| `install.sh` / `uninstall.sh` | deploy / reverse (project root) |
-| `kb-kill.toml` | example/default config (TOML) → installed as the `/etc/kb-kill/kb-kill.toml` system default |
-| `icons/` | tray SVGs → `/usr/local/share/kb-kill/icons/` |
+| Path                              | Role                                                                                                                                            |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `scripts/kb-kill-daemon`          | the daemon (Python, the bulk of the logic) → `/usr/local/bin/kb-kill-daemon` (root-owned)                                                       |
+| `scripts/kb-kill-push`            | **mandatory** per-user pusher (stdlib only): feeds the daemon this user's config. Unprivileged **user** process → `/usr/local/bin/kb-kill-push` |
+| `scripts/kb-kill-tray`            | optional tray icon (Python / GTK3 / AppIndicator), unprivileged **user** process → `/usr/local/bin/kb-kill-tray`                                |
+| `services/kb-kill-daemon.service` | hardened **system** unit → `/etc/systemd/system/` (no config path; config arrives by push)                                                      |
+| `services/kb-kill-push.service`   | pusher **global user** unit → `/etc/systemd/user/` (`WantedBy=default.target` — runs for TTY too)                                               |
+| `services/kb-kill-tray.service`   | tray **global user** unit → `/etc/systemd/user/`                                                                                                |
+| `install.sh` / `uninstall.sh`     | deploy / reverse (project root)                                                                                                                 |
+| `kb-kill.toml`                    | example/default config (TOML) → installed as the `/etc/kb-kill/kb-kill.toml` system default                                                     |
+| `icons/`                          | tray SVGs → `/usr/local/share/kb-kill/icons/`                                                                                                   |
 
 The three executables live in `scripts/`, the three systemd units in `services/`;
 `install.sh`/`uninstall.sh` stay at the project root. **Everything installs system-wide**
@@ -110,6 +110,7 @@ and reads logind's `/run/systemd/seats/*` `ACTIVE_UID` via `active_uids()`. The 
 config is `pushed[active_uid]` (or none → idle). `_reevaluate_live()` swaps the live
 config when the active uid changes; a `SeatWatch` inotify on the seats dir makes that
 near-instant (the 2s tick is a backstop). Two invariants matter:
+
 - **A grab never outlives its config.** `_install_groups()` ungrabs everything before
   switching, and a pusher disconnect reverts to idle — so you can never be left grabbed
   by a config that is no longer live (the kernel also auto-releases on death).
@@ -127,6 +128,7 @@ near-instant (the 2s tick is a backstop). Two invariants matter:
 **mode 0666** (any local user may connect: a pusher must bootstrap the daemon before any
 config/allowed-uid exists). Newline-delimited JSON — **config text + group state, never
 keystrokes**. Commands:
+
 - `{"cmd":"set_config","toml":"<text>"}` — accepted from any uid, stored under that uid;
   governs the keyboard only while that uid is the active seat user.
 - `{"cmd":"kill|wake|toggle|status","group":"<name>"}` — only from the **live** uid (or

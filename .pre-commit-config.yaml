@@ -6,6 +6,8 @@ repos:
       - id: end-of-file-fixer
       - id: check-added-large-files
       - id: check-toml
+      - id: check-yaml
+      - id: check-json
       - id: check-executables-have-shebangs
       - id: check-shebang-scripts-are-executable
       # Python-specific (the scripts/ executables have python3 shebangs, so
@@ -13,7 +15,7 @@ repos:
       - id: check-ast
       - id: debug-statements
 
-  # Python linter + formatter.
+  # Python linter + formatter
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.20
     hooks:
@@ -21,6 +23,16 @@ repos:
         args: [--fix]
       - id: ruff-format
 
+  # Python type checking. pass_filenames is off because the scripts/ executables
+  # have no .py extension, so pyright would skip them if handed the paths; run
+  # project-wide instead and let it pick them up via pyrightconfig.json's include.
+  - repo: https://github.com/RobertCraigie/pyright-python
+    rev: v1.1.411
+    hooks:
+      - id: pyright
+        pass_filenames: false
+
+  # Shell formatter + syntax checking
   - repo: https://github.com/shellcheck-py/shellcheck-py
     rev: v0.11.0.1
     hooks:
@@ -34,3 +46,14 @@ repos:
       - id: shfmt
         args: [-i, "2", -ci]
         types: [shell]
+
+  # Markdown formatter
+  - repo: https://github.com/hukkin/mdformat
+    rev: 1.0.0
+    hooks:
+      - id: mdformat
+        additional_dependencies:
+          - mdformat-gfm          # GitHub-Flavored Markdown support
+          - mdformat-ruff         # Python code formatting
+          - mdformat-frontmatter  # YAML frontmatter support
+          - ruff                  # Required for mdformat-ruff

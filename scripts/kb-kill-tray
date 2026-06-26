@@ -12,6 +12,10 @@ KDE natively, and on GNOME with the AppIndicator shell extension installed.
 Requires: PyGObject (`gi`) with Gtk 3.0 and AyatanaAppIndicator3.
 """
 
+# gi (PyGObject) ships no type stubs, so pyright cannot resolve it or the dynamic
+# gi.repository imports; turn off the missing-import check for this file.
+# pyright: reportMissingImports=false
+
 import json
 import os
 import socket
@@ -43,7 +47,7 @@ ICON_KILLED = "kb-kill-killed"
 RECONNECT_SECONDS = 2
 
 
-def icon_dir():
+def icon_dir() -> str | None:
     """Locate the tray icons. Prefer icons shipped in the project tree (this
     script lives in scripts/, the icons in the project root's icons/), then a
     system install, then the user config."""
@@ -59,7 +63,7 @@ def icon_dir():
     return None
 
 
-def socket_path():
+def socket_path() -> str:
     """Where the daemon's control socket lives. Must stay in sync with the
     daemon's control_socket_path() and kb-kill-push's socket_path() - the same
     candidate set in the same order."""
@@ -76,7 +80,7 @@ def socket_path():
 
 
 class Tray:
-    def __init__(self):
+    def __init__(self) -> None:
         self.ind = AppIndicator3.Indicator.new(
             APP_ID, ICON_AWAKE, AppIndicator3.IndicatorCategory.HARDWARE
         )
@@ -85,15 +89,15 @@ class Tray:
             self.ind.set_icon_theme_path(icons)
         self.ind.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
         self.ind.set_title("kb-kill")
-        self.sock = None
+        self.sock: socket.socket | None = None
         self.buf = b""
-        self.groups = []
+        self.groups: list[dict] = []
         self.connected = False
         self._render()  # initial "connecting" menu/icon
         self._connect()
 
     # -- connection ---------------------------------------------------------- #
-    def _connect(self):
+    def _connect(self) -> bool:
         path = socket_path()
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -114,12 +118,12 @@ class Tray:
         self._send({"cmd": "status"})
         return True
 
-    def _reconnect(self):
+    def _reconnect(self) -> bool:
         if not self.connected:
             self._connect()
         return False  # one-shot timer
 
-    def _drop(self):
+    def _drop(self) -> None:
         if self.sock is not None:
             try:
                 self.sock.close()
@@ -130,9 +134,11 @@ class Tray:
         self._render()
         GLib.timeout_add_seconds(RECONNECT_SECONDS, self._reconnect)
 
-    def _on_readable(self, fd, condition):
+    def _on_readable(self, fd: int, condition: int) -> bool:
         if condition & (GLib.IO_HUP | GLib.IO_ERR):
             self._drop()
+            return False
+        if self.sock is None:
             return False
         try:
             data = self.sock.recv(4096)
@@ -157,7 +163,7 @@ class Tray:
                 self._render()
         return True
 
-    def _send(self, obj):
+    def _send(self, obj: dict[str, str]) -> None:
         if self.sock is None:
             return
         try:
@@ -166,7 +172,7 @@ class Tray:
             self._drop()
 
     # -- UI ------------------------------------------------------------------ #
-    def _render(self):
+    def _render(self) -> None:
         any_killed = any(g.get("killed") for g in self.groups)
         self.ind.set_icon_full(ICON_KILLED if any_killed else ICON_AWAKE, "kb-kill")
         if not self.connected:
@@ -178,7 +184,7 @@ class Tray:
             self.ind.set_title("kb-kill: all active")
         self.ind.set_menu(self._build_menu())
 
-    def _build_menu(self):
+    def _build_menu(self) -> Gtk.Menu:
         menu = Gtk.Menu()
         if not self.connected:
             item = Gtk.MenuItem(label="Connecting to kb-kill service…")
@@ -204,11 +210,11 @@ class Tray:
         menu.show_all()
         return menu
 
-    def _on_toggle(self, _item, name):
+    def _on_toggle(self, _item: object, name: str) -> None:
         self._send({"cmd": "toggle", "group": name})
 
 
-def main():
+def main() -> int:
     Tray()
     try:
         Gtk.main()
