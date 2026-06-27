@@ -18,7 +18,9 @@ Requires: PyGObject (`gi`) with Gtk 3.0 and AyatanaAppIndicator3.
 
 import json
 import os
+import shutil
 import socket
+import subprocess
 import sys
 
 import gi
@@ -197,13 +199,21 @@ class Tray:
         else:
             for g in self.groups:
                 killed = g.get("killed")
-                state = "disabled" if killed else "active"
-                action = "enable" if killed else "disable"
-                label = f"{'⛔' if killed else '⌨'}  {g['name']}: {state}"
-                item = Gtk.MenuItem(label=f"{label}  →  {action}")
-                item.connect("activate", self._on_toggle, g["name"])
+                # A tray menu is exported over the dbusmenu D-Bus protocol and
+                # re-rendered by the shell, so it can't host arbitrary widgets
+                # (a Gtk.Switch is dropped). A CheckMenuItem maps to dbusmenu's
+                # checkmark toggle: it renders, and clicking anywhere on the row
+                # toggles it. The check (on = keyboard active/awake) is the
+                # switch. set_active() runs before connect(), so rebuilding the
+                # menu from the daemon's broadcast never re-fires the handler.
+                item = Gtk.CheckMenuItem(label=g["name"])
+                item.set_active(not killed)
+                item.connect("toggled", self._on_toggle, g["name"])
                 menu.append(item)
         menu.append(Gtk.SeparatorMenuItem())
+        open_item = Gtk.MenuItem(label="Open config…")
+        open_item.connect("activate", self._on_open_config)
+        menu.append(open_item)
         quit_item = Gtk.MenuItem(label="Quit tray")
         quit_item.connect("activate", lambda _i: Gtk.main_quit())
         menu.append(quit_item)
@@ -212,6 +222,73 @@ class Tray:
 
     def _on_toggle(self, _item: object, name: str) -> None:
         self._send({"cmd": "toggle", "group": name})
+
+    # -- config --------------------------------------------------------------- #
+    def _user_config_path(self) -> str:
+        """This user's config file. Mirrors kb-kill-push's preferred location
+        (KB_KILL_CONFIG override, else ~/.config/kb-kill/kb-kill.toml). We run
+        as the user, so the environment / home are authoritative."""
+        env = os.environ.get("KB_KILL_CONFIG")
+        if env:
+            return os.path.expanduser(env)
+        return os.path.expanduser("~/.config/kb-kill/kb-kill.toml")
+
+    def _default_config_source(self) -> str | None:
+        """Where to seed a new user config from: the system default, then the
+        example in the project tree (dev runs)."""
+        here = os.path.dirname(os.path.realpath(__file__))
+        for candidate in (
+            "/etc/kb-kill/kb-kill.toml",
+            os.path.join(here, os.pardir, "kb-kill.toml"),  # scripts/ -> ../
+            os.path.join(here, "kb-kill.toml"),
+        ):
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    def _on_open_config(self, _item: object) -> None:
+        """Open the user's config in their default editor, creating it from the
+        system default first if it does not exist yet. kb-kill-push notices the
+        new/edited file and pushes it to the daemon on its own."""
+        path = self._user_config_path()
+        if not os.path.exists(path):
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                src = self._default_config_source()
+                if src:
+                    shutil.copyfile(src, path)
+                else:
+                    open(path, "a").close()  # nothing to seed from; empty file
+            except OSError as e:
+                sys.stderr.write(f"kb-kill-tray: cannot create {path}: {e}\n")
+                return
+        self._launch_editor(path)
+
+    def _launch_editor(self, path: str) -> None:
+        """Open path in the user's text editor. We resolve the handler ourselves
+        rather than trust xdg-open: a .toml is application/toml, which usually
+        has no association, and xdg-open's fallback can spuriously open the web
+        browser (and sometimes the editor too). Prefer the toml handler, then
+        the text/plain editor, and only fall back to xdg-open if neither is set.
+        gtk-launch ships with the GTK3 this tray already requires."""
+        desktop = ""
+        for mime in ("application/toml", "text/plain"):
+            try:
+                out = subprocess.run(
+                    ["xdg-mime", "query", "default", mime],
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+            except OSError:
+                out = ""
+            if out:
+                desktop = out
+                break
+        cmd = ["gtk-launch", desktop, path] if desktop else ["xdg-open", path]
+        try:
+            subprocess.Popen(cmd, start_new_session=True)
+        except OSError as e:
+            sys.stderr.write(f"kb-kill-tray: could not open {path}: {e}\n")
 
 
 def main() -> int:
