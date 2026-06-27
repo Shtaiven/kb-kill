@@ -159,7 +159,16 @@ RESCAN_INTERVAL = 2.0
 # Control-socket DoS bounds. The socket is connectable by any local user (the
 # SO_PEERCRED uid is the real gate), so the bounds are per-uid as well as global.
 MAX_CLIENTS = 16  # concurrent control connections (global)
-MAX_CONNS_PER_UID = 2  # so one user cannot starve the global pool
+# Per-uid cap, so one user cannot starve the global pool. A single active user's
+# NORMAL footprint is already 2 persistent connections (kb-kill-push + kb-kill-tray
+# each hold one for their whole lifetime), so this must sit comfortably above 2:
+# during a redeploy/login both restart, and the daemon still holds each dying
+# client's connection until it reaps the EOF on its next loop iteration, so uid N
+# can transiently need old-push + old-tray + new-push + new-tray = 4 at once. Set
+# to 8 (push+tray, plus restart overlap, plus a stray/dev pusher) — still half the
+# global pool. A cap of 2 here left zero headroom and wedged the reconnecting
+# client in a refusal loop ("tray fails to connect" on install).
+MAX_CONNS_PER_UID = 8
 MAX_LINE = 65536  # bytes buffered per client before a newline; drop if exceeded
 # (a full set_config TOML payload, JSON-escaped, must fit)
 HANDSHAKE_SECONDS = 10  # drop a connection that sends no valid command in this long
