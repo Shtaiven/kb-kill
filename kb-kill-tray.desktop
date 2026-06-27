@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=kb-kill Tray
+GenericName=Keyboard Disabler Tray
+Comment=Tray icon to disable/enable the target keyboard via kb-kill
+Exec=/usr/local/bin/kb-kill-tray
+Icon=/usr/local/share/kb-kill/icons/kb-kill-awake.svg
+Terminal=false
+Categories=Utility;System;
+Keywords=keyboard;disable;lock;kb-kill;
+StartupNotify=false

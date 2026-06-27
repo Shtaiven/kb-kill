@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=kb-kill Push
+GenericName=Keyboard Disabler Config Pusher
+Comment=Push this user's kb-kill config to the daemon (re-pushes on change)
+Exec=/usr/local/bin/kb-kill-push
+Icon=/usr/local/share/kb-kill/icons/kb-kill-awake.svg
+Terminal=false
+Categories=Utility;System;
+Keywords=keyboard;disable;lock;kb-kill;config;
+StartupNotify=false

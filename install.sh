@@ -182,10 +182,11 @@ if [ "$INSTALL_DAEMON" -eq 1 ]; then
   sudo install -D -m0755 -o root -g root "$PROJECT_DIR/scripts/kb-kill-push"   /usr/local/bin/kb-kill-push
   if [ "$INSTALL_TRAY" -eq 1 ]; then
     sudo install -D -m0755 -o root -g root "$PROJECT_DIR/scripts/kb-kill-tray" /usr/local/bin/kb-kill-tray
-    # Icons (global; the tray finds them under /usr/local/share for any user).
-    sudo install -d -m0755 /usr/local/share/kb-kill/icons
-    sudo install -m0644 "$PROJECT_DIR"/icons/*.svg /usr/local/share/kb-kill/icons/
   fi
+  # Icons (global; the tray finds them under /usr/local/share for any user, and
+  # both app-menu launchers reference them — so install unconditionally).
+  sudo install -d -m0755 /usr/local/share/kb-kill/icons
+  sudo install -m0644 "$PROJECT_DIR"/icons/*.svg /usr/local/share/kb-kill/icons/
 
   # The system daemon unit. (It no longer embeds a config path — config is
   # pushed at runtime — so it installs verbatim.)
@@ -217,10 +218,17 @@ if [ "$USER_SCOPE" = global ]; then
   # instance sees push/tray; enabled for ALL users (takes effect at next login).
   sudo install -D -m0644 -o root -g root "$PROJECT_DIR/services/kb-kill-push.service" \
     /etc/systemd/user/kb-kill-push.service
+  # App-menu launcher for the push pusher, system-wide so every user's menu sees it.
+  sudo install -D -m0644 -o root -g root "$PROJECT_DIR/kb-kill-push.desktop" \
+    /usr/share/applications/kb-kill-push.desktop
   if [ "$INSTALL_TRAY" -eq 1 ]; then
     sudo install -D -m0644 -o root -g root "$PROJECT_DIR/services/kb-kill-tray.service" \
       /etc/systemd/user/kb-kill-tray.service
+    # App-menu launcher for the tray, system-wide so every user's menu sees it.
+    sudo install -D -m0644 -o root -g root "$PROJECT_DIR/kb-kill-tray.desktop" \
+      /usr/share/applications/kb-kill-tray.desktop
   fi
+  sudo update-desktop-database /usr/share/applications 2>/dev/null || true
   sudo systemctl --global enable "${USER_SVCS[@]/%/.service}"
   say "Enabled push/tray for all users (each user's next login)."
 else
@@ -229,10 +237,17 @@ else
   say "Setting up push/tray for $USER_NAME only (~/.config/systemd/user)"
   install -D -m0644 "$PROJECT_DIR/services/kb-kill-push.service" \
     "$USER_HOME/.config/systemd/user/kb-kill-push.service"
+  # App-menu launcher for the push pusher, for this user only (no sudo).
+  install -D -m0644 "$PROJECT_DIR/kb-kill-push.desktop" \
+    "$USER_HOME/.local/share/applications/kb-kill-push.desktop"
   if [ "$INSTALL_TRAY" -eq 1 ]; then
     install -D -m0644 "$PROJECT_DIR/services/kb-kill-tray.service" \
       "$USER_HOME/.config/systemd/user/kb-kill-tray.service"
+    # App-menu launcher for the tray, for this user only (no sudo).
+    install -D -m0644 "$PROJECT_DIR/kb-kill-tray.desktop" \
+      "$USER_HOME/.local/share/applications/kb-kill-tray.desktop"
   fi
+  update-desktop-database "$USER_HOME/.local/share/applications" 2>/dev/null || true
   if systemctl --user show-environment >/dev/null 2>&1; then
     systemctl --user daemon-reload || true
     systemctl --user enable "${USER_SVCS[@]/%/.service}"

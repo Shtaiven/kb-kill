@@ -71,6 +71,11 @@ rm -f "$USER_HOME/.config/systemd/user/kb-kill-push.service" \
       "$USER_HOME/.config/systemd/user/kb-kill-tray.service"
 systemctl --user daemon-reload 2>/dev/null || true
 
+# The push/tray per-user app-menu launchers (from a --current-user/--user-only install).
+rm -f "$USER_HOME/.local/share/applications/kb-kill-push.desktop" \
+      "$USER_HOME/.local/share/applications/kb-kill-tray.desktop"
+update-desktop-database "$USER_HOME/.local/share/applications" 2>/dev/null || true
+
 # --------------------------------------------------------------------------- #
 # System-wide removal (sudo) — skipped under --user-only
 # --------------------------------------------------------------------------- #
@@ -86,6 +91,10 @@ if [ "$REMOVE_SYSTEM" -eq 1 ]; then
   sudo rm -f /usr/local/bin/kb-kill-daemon \
              /usr/local/bin/kb-kill-push /usr/local/bin/kb-kill-tray
   sudo rm -rf /usr/local/share/kb-kill
+  # The system-wide app-menu launchers (from a global install).
+  sudo rm -f /usr/share/applications/kb-kill-push.desktop \
+             /usr/share/applications/kb-kill-tray.desktop
+  sudo update-desktop-database /usr/share/applications 2>/dev/null || true
 else
   say "User-only uninstall — left the shared system daemon/binaries in place (no sudo)"
 fi
