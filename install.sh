@@ -219,13 +219,13 @@ if [ "$USER_SCOPE" = global ]; then
   sudo install -D -m0644 -o root -g root "$PROJECT_DIR/services/kb-kill-push.service" \
     /etc/systemd/user/kb-kill-push.service
   # App-menu launcher for the push pusher, system-wide so every user's menu sees it.
-  sudo install -D -m0644 -o root -g root "$PROJECT_DIR/kb-kill-push.desktop" \
+  sudo install -D -m0644 -o root -g root "$PROJECT_DIR/desktop/kb-kill-push.desktop" \
     /usr/share/applications/kb-kill-push.desktop
   if [ "$INSTALL_TRAY" -eq 1 ]; then
     sudo install -D -m0644 -o root -g root "$PROJECT_DIR/services/kb-kill-tray.service" \
       /etc/systemd/user/kb-kill-tray.service
     # App-menu launcher for the tray, system-wide so every user's menu sees it.
-    sudo install -D -m0644 -o root -g root "$PROJECT_DIR/kb-kill-tray.desktop" \
+    sudo install -D -m0644 -o root -g root "$PROJECT_DIR/desktop/kb-kill-tray.desktop" \
       /usr/share/applications/kb-kill-tray.desktop
   fi
   sudo update-desktop-database /usr/share/applications 2>/dev/null || true
@@ -238,13 +238,13 @@ else
   install -D -m0644 "$PROJECT_DIR/services/kb-kill-push.service" \
     "$USER_HOME/.config/systemd/user/kb-kill-push.service"
   # App-menu launcher for the push pusher, for this user only (no sudo).
-  install -D -m0644 "$PROJECT_DIR/kb-kill-push.desktop" \
+  install -D -m0644 "$PROJECT_DIR/desktop/kb-kill-push.desktop" \
     "$USER_HOME/.local/share/applications/kb-kill-push.desktop"
   if [ "$INSTALL_TRAY" -eq 1 ]; then
     install -D -m0644 "$PROJECT_DIR/services/kb-kill-tray.service" \
       "$USER_HOME/.config/systemd/user/kb-kill-tray.service"
     # App-menu launcher for the tray, for this user only (no sudo).
-    install -D -m0644 "$PROJECT_DIR/kb-kill-tray.desktop" \
+    install -D -m0644 "$PROJECT_DIR/desktop/kb-kill-tray.desktop" \
       "$USER_HOME/.local/share/applications/kb-kill-tray.desktop"
   fi
   update-desktop-database "$USER_HOME/.local/share/applications" 2>/dev/null || true
