@@ -16,12 +16,15 @@ systemctl --global enable kb-kill-push.service kb-kill-tray.service >/dev/null 2
 # tray stuck "connecting") until the user logs out and back in. Best-effort:
 # runuser/loginctl may be absent on a build host, hence the `|| true` guards.
 if command -v loginctl >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then
-  for uid in $(loginctl list-users --no-legend 2>/dev/null | awk '$1>=1000{print $1}'); do
+  # list-users columns: UID USER ... — runuser needs the NAME (it has no #uid
+  # form; that's a sudo-ism), env needs the numeric uid for XDG_RUNTIME_DIR.
+  loginctl list-users --no-legend 2>/dev/null | awk '$1>=1000{print $1, $2}' |
+  while read -r uid user; do
     run="/run/user/$uid"
     [ -d "$run" ] || continue
-    runuser -u "#$uid" -- env XDG_RUNTIME_DIR="$run" \
+    runuser -u "$user" -- env XDG_RUNTIME_DIR="$run" \
       systemctl --user daemon-reload >/dev/null 2>&1 || true
-    runuser -u "#$uid" -- env XDG_RUNTIME_DIR="$run" \
+    runuser -u "$user" -- env XDG_RUNTIME_DIR="$run" \
       systemctl --user restart kb-kill-push.service kb-kill-tray.service >/dev/null 2>&1 || true
   done
 fi

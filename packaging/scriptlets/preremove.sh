@@ -12,10 +12,12 @@ case "${1:-}" in
     # sessions of already-logged-in users too, so they don't linger after the
     # binaries are deleted. Best-effort (mirrors postinstall's per-session start).
     if command -v loginctl >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then
-      for uid in $(loginctl list-users --no-legend 2>/dev/null | awk '$1>=1000{print $1}'); do
+      # runuser needs the username (no #uid form); env needs the numeric uid.
+      loginctl list-users --no-legend 2>/dev/null | awk '$1>=1000{print $1, $2}' |
+      while read -r uid user; do
         run="/run/user/$uid"
         [ -d "$run" ] || continue
-        runuser -u "#$uid" -- env XDG_RUNTIME_DIR="$run" \
+        runuser -u "$user" -- env XDG_RUNTIME_DIR="$run" \
           systemctl --user stop kb-kill-push.service kb-kill-tray.service >/dev/null 2>&1 || true
       done
     fi
