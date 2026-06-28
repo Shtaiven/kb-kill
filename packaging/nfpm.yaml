@@ -1,0 +1,100 @@
+# nfpm spec for kb-kill — produces .deb and .rpm from one definition.
+#   https://nfpm.goreleaser.com/
+#
+# Built via packaging/build-packages.sh, which stages systemd-unit and .desktop
+# copies with their /usr/local paths rewritten to /usr (packages own /usr, not
+# /usr/local) and exports KB_KILL_VERSION. Don't run nfpm against this file
+# directly — the `packaging/build/...` sources below won't exist yet.
+name: kb-kill
+arch: all                       # noarch: pure Python + shell + units + SVGs
+platform: linux
+version: ${KB_KILL_VERSION}
+section: utils
+priority: optional
+maintainer: Steven Eisinger <steven.a.eisinger@gmail.com>
+description: |
+  Disable/enable a target keyboard on a global hotkey via a hardened root daemon.
+  "Disable" is an exclusive EVIOCGRAB on the device (no virtual device, no event
+  re-injection); config is pushed per-user over a control socket and follows the
+  active seat user.
+vendor: kb-kill
+homepage: https://github.com/Shtaiven/kb-kill
+license: MIT
+
+# Base deps (the daemon). Per-format names/operators differ — see overrides.
+depends:
+  - python3
+  - python3-evdev
+
+contents:
+  # --- executables (root-owned, on the global PATH) ---
+  - src: scripts/kb-kill-daemon
+    dst: /usr/bin/kb-kill-daemon
+    file_info: { mode: 0755 }
+  - src: scripts/kb-kill-push
+    dst: /usr/bin/kb-kill-push
+    file_info: { mode: 0755 }
+  - src: scripts/kb-kill-tray
+    dst: /usr/bin/kb-kill-tray
+    file_info: { mode: 0755 }
+
+  # --- systemd units (paths rewritten to /usr by build-packages.sh) ---
+  - src: packaging/build/services/kb-kill-daemon.service
+    dst: /usr/lib/systemd/system/kb-kill-daemon.service
+    file_info: { mode: 0644 }
+  - src: packaging/build/services/kb-kill-push.service
+    dst: /usr/lib/systemd/user/kb-kill-push.service
+    file_info: { mode: 0644 }
+  - src: packaging/build/services/kb-kill-tray.service
+    dst: /usr/lib/systemd/user/kb-kill-tray.service
+    file_info: { mode: 0644 }
+
+  # --- app-menu launchers (paths rewritten to /usr) ---
+  - src: packaging/build/desktop/kb-kill-push.desktop
+    dst: /usr/share/applications/kb-kill-push.desktop
+    file_info: { mode: 0644 }
+  - src: packaging/build/desktop/kb-kill-tray.desktop
+    dst: /usr/share/applications/kb-kill-tray.desktop
+    file_info: { mode: 0644 }
+
+  # --- icons ---
+  - src: icons/kb-kill-awake.svg
+    dst: /usr/share/kb-kill/icons/kb-kill-awake.svg
+    file_info: { mode: 0644 }
+  - src: icons/kb-kill-killed.svg
+    dst: /usr/share/kb-kill/icons/kb-kill-killed.svg
+    file_info: { mode: 0644 }
+
+  # --- default config: a conffile, never clobbered on upgrade ---
+  - src: kb-kill.toml
+    dst: /etc/kb-kill/kb-kill.toml
+    type: "config|noreplace"
+    file_info: { mode: 0644 }
+
+  # --- license ---
+  - src: LICENSE
+    dst: /usr/share/licenses/kb-kill/LICENSE
+    file_info: { mode: 0644 }
+
+scripts:
+  postinstall: packaging/scriptlets/postinstall.sh
+  preremove: packaging/scriptlets/preremove.sh
+  postremove: packaging/scriptlets/postremove.sh
+
+overrides:
+  deb:
+    depends:
+      - python3 (>= 3.11)
+      - python3-evdev
+    recommends:
+      - python3-gi
+      - gir1.2-gtk-3.0
+      - gir1.2-ayatanaappindicator3-0.1
+  rpm:
+    depends:
+      - "python3 >= 3.11"
+      - python3-evdev
+    recommends:
+      - python3-gobject
+      - gtk3
+      - libayatana-appindicator-gtk3

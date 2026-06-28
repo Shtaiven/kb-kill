@@ -57,7 +57,8 @@ def icon_dir() -> str | None:
     for candidate in (
         os.path.join(here, "icons"),
         os.path.join(here, os.pardir, "icons"),  # scripts/ -> ../icons
-        "/usr/local/share/kb-kill/icons",
+        "/usr/local/share/kb-kill/icons",  # install.sh (local source install)
+        "/usr/share/kb-kill/icons",  # distro package (deb/rpm/AUR)
         os.path.expanduser("~/.config/kb-kill/icons"),
     ):
         if os.path.isdir(candidate):

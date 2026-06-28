@@ -1,0 +1,42 @@
+name: Release
+
+# Build .deb and .rpm on a version tag push and attach them to the GitHub
+# release. Tag with e.g. `git tag v0.1.0 && git push origin v0.1.0`.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write          # needed to create the release and upload assets
+
+jobs:
+  packages:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nfpm
+        run: |
+          echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' \
+            | sudo tee /etc/apt/sources.list.d/goreleaser.list
+          sudo apt-get update
+          sudo apt-get install -y nfpm
+
+      - name: Build .deb and .rpm
+        run: |
+          # Tag v0.1.0 -> package version 0.1.0.
+          packaging/build-packages.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: packaging/dist/*
+
+      - name: Attach packages to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: packaging/dist/*
+          fail_on_unmatched_files: true

@@ -1,0 +1,40 @@
+# kb-kill pacman scriptlet. Per Arch convention, packages do NOT auto-enable or
+# start services — we only tell the user what to run.
+
+_notice() {
+  cat <<'EOF'
+
+kb-kill installed. To activate it:
+
+  # the root daemon (system-wide):
+  sudo systemctl enable --now kb-kill-daemon.service
+
+  # the per-user config pusher (+ optional tray) for every user, at next login:
+  sudo systemctl --global enable kb-kill-push.service kb-kill-tray.service
+
+  # or just for the current session, right now:
+  systemctl --user enable --now kb-kill-push.service kb-kill-tray.service
+
+Edit your config at ~/.config/kb-kill/kb-kill.toml (falls back to
+/etc/kb-kill/kb-kill.toml). See `kb-kill-daemon detect` and the README.
+EOF
+}
+
+post_install() {
+  _notice
+}
+
+post_upgrade() {
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  # Pick up the new daemon binary if it's already running.
+  systemctl try-restart kb-kill-daemon.service >/dev/null 2>&1 || true
+}
+
+pre_remove() {
+  systemctl disable --now kb-kill-daemon.service >/dev/null 2>&1 || true
+  systemctl --global disable kb-kill-push.service kb-kill-tray.service >/dev/null 2>&1 || true
+}
+
+post_remove() {
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}

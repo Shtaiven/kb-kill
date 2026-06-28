@@ -1,0 +1,58 @@
+# Maintainer: Steven Eisinger <steven.a.eisinger@gmail.com>
+# makepkg sources this file: it consumes the metadata vars (pkgrel, pkgdesc, …)
+# and provides srcdir/pkgdir, so SC2034/SC2154 are false positives here.
+# shellcheck shell=bash disable=SC2034,SC2154
+pkgname=kb-kill
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Disable/enable a target keyboard on a global hotkey via a hardened root daemon (EVIOCGRAB, no virtual device)"
+arch=('any')
+url="https://github.com/Shtaiven/kb-kill"
+license=('MIT')
+depends=('python>=3.11' 'python-evdev')
+optdepends=(
+  'python-gobject: tray icon (kb-kill-tray)'
+  'gtk3: tray icon (kb-kill-tray)'
+  'libayatana-appindicator: tray icon (kb-kill-tray)'
+)
+backup=('etc/kb-kill/kb-kill.toml')
+install="$pkgname.install"
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# Run `updpkgsums` to replace SKIP with the real checksum before publishing.
+sha256sums=('SKIP')
+
+package() {
+  cd "$srcdir/$pkgname-$pkgver" || return 1
+
+  # Executables (root-owned copies on the global PATH).
+  install -Dm0755 scripts/kb-kill-daemon "$pkgdir/usr/bin/kb-kill-daemon"
+  install -Dm0755 scripts/kb-kill-push   "$pkgdir/usr/bin/kb-kill-push"
+  install -Dm0755 scripts/kb-kill-tray   "$pkgdir/usr/bin/kb-kill-tray"
+
+  # systemd units + .desktop launchers, with /usr/local paths rewritten to /usr
+  # (packages own /usr, not /usr/local).
+  install -dm0755 "$pkgdir/usr/lib/systemd/system" "$pkgdir/usr/lib/systemd/user"
+  sed -e 's#/usr/local/bin#/usr/bin#g' -e 's#/usr/local/share#/usr/share#g' \
+    services/kb-kill-daemon.service > "$pkgdir/usr/lib/systemd/system/kb-kill-daemon.service"
+  for u in kb-kill-push kb-kill-tray; do
+    sed -e 's#/usr/local/bin#/usr/bin#g' -e 's#/usr/local/share#/usr/share#g' \
+      "services/$u.service" > "$pkgdir/usr/lib/systemd/user/$u.service"
+  done
+
+  install -dm0755 "$pkgdir/usr/share/applications"
+  for d in kb-kill-push kb-kill-tray; do
+    sed -e 's#/usr/local/bin#/usr/bin#g' -e 's#/usr/local/share#/usr/share#g' \
+      "desktop/$d.desktop" > "$pkgdir/usr/share/applications/$d.desktop"
+  done
+
+  # Icons.
+  install -Dm0644 icons/kb-kill-awake.svg  "$pkgdir/usr/share/kb-kill/icons/kb-kill-awake.svg"
+  install -Dm0644 icons/kb-kill-killed.svg "$pkgdir/usr/share/kb-kill/icons/kb-kill-killed.svg"
+
+  # Default config (a backup= conffile — pacman preserves user edits as .pacsave).
+  install -Dm0644 kb-kill.toml "$pkgdir/etc/kb-kill/kb-kill.toml"
+
+  # License + README.
+  install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
