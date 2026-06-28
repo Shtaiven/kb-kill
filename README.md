@@ -1,5 +1,7 @@
 # kb-kill
 
+<img src="icons/kb-kill-killed.svg" alt="kb-kill" width="128" />
+
 Disable/enable a target keyboard with a global hotkey, as a background service.
 
 Press the **kill** hotkey on *any* keyboard to disable a target keyboard (e.g.
@@ -7,12 +9,46 @@ the laptop's built-in keyboard). While disabled, every key from the target is
 swallowed **except** the **wake** hotkey — so the target keyboard can always
 wake itself. There is no way to lock yourself out.
 
-Typical use: you're docked with an external keyboard and want the laptop's
-built-in keyboard to stop registering stray presses.
+Typical use: your cat is sitting on your laptop keyboard while you're working on
+an external keyboard. Kill the laptop keyboard with a hotkey!
+
+## Quick Start
+
+Install the prebuilt package for your distro from the
+[releases page](https://github.com/Shtaiven/kb-kill/releases). You make have to logout and login
+again for services to start.
+
+**Debian / Ubuntu / Pop!\_OS** (`.deb`, needs Python ≥ 3.11 — Ubuntu 24.04+):
+
+```sh
+sudo apt install ./kb-kill_0.1.0_all.deb
+```
+
+**Fedora / RHEL** (`.rpm`):
+
+```sh
+sudo dnf install ./kb-kill-0.1.0-1.noarch.rpm
+```
+
+After installing, kb-kill does nothing until you define a group: edit
+`~/.config/kb-kill/kb-kill.toml` (or the `/etc/kb-kill/kb-kill.toml` default) to
+set a target keyboard and a `kill_combo`/`wake_combo` — see
+[Configuration](#configuration). Verify it's running:
+
+```sh
+systemctl status kb-kill-daemon          # the shared root daemon
+systemctl --user status kb-kill-push     # your config pusher (after you log in)
+```
+
+Arch users: build from the AUR recipe in `packaging/aur/` (see
+[packaging/README.md](packaging/README.md)). To install from a git checkout on
+any distro instead of a package, see [Install](#install).
 
 ## A note on AI usage
 
-This program is written mostly by agentic AI (Claude using Opus 4.8). Read the scripts before installing this on your system! This has been tested and reviewed, but never run scripts that you don't trust!
+This program is written mostly by agentic AI (Claude using Opus 4.8). Read the scripts before
+installing this on your system! This has been tested and reviewed, but never run scripts that
+you don't trust!
 
 ## How it works
 
@@ -238,7 +274,7 @@ config-less and waits for `kb-kill-push`.
 ## Tray icon
 
 `kb-kill-tray` is an optional tray icon (StatusNotifierItem) that shows whether
-any group is **disabled** (⛔) or **active** (⌨) and lets you toggle a group by
+any group is **disabled** (no checkmark) or **active** (checkmark) and lets you toggle a group by
 clicking its menu entry. It is an unprivileged **user** service that never sees
 keystrokes and just talks to the root daemon over the control socket
 (`/run/kb-kill/control.sock`) — the same socket `kb-kill-push` uses. The daemon
@@ -336,39 +372,3 @@ minimizes and contains that:
   connections per user against DoS, and drops idle connections. Scope is a single
   seat (`seat0`); any process of the active user (not only `kb-kill-push`) can
   command the daemon, which is within that user's own trust boundary.
-
-## Files
-
-Self-contained project: the executables live in `scripts/`, the systemd units in
-`services/`, and `install.sh`/`uninstall.sh` at the root.
-
-| Path                              | Purpose                                                                                          |
-| --------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `scripts/kb-kill-daemon`          | the daemon (Python) → `/usr/local/bin/kb-kill-daemon` (root)                                     |
-| `scripts/kb-kill-push`            | mandatory per-user config pusher (Python, stdlib) — user process → `/usr/local/bin/kb-kill-push` |
-| `scripts/kb-kill-tray`            | optional tray icon (Python / AppIndicator) — user process → `/usr/local/bin/kb-kill-tray`        |
-| `install.sh`                      | installer (system-wide; self-elevates with sudo)                                                 |
-| `uninstall.sh`                    | reverses the install (keeps your config + project files)                                         |
-| `services/kb-kill-daemon.service` | hardened **system** unit → `/etc/systemd/system/`                                                |
-| `services/kb-kill-push.service`   | pusher **global user** unit → `/etc/systemd/user/`                                               |
-| `services/kb-kill-tray.service`   | tray **global user** unit → `/etc/systemd/user/`                                                 |
-| `kb-kill.toml`                    | example config → `/etc/kb-kill/kb-kill.toml` (system default) + your `~/.config/kb-kill/`        |
-| `icons/`                          | tray icons (awake / killed) → `/usr/local/share/kb-kill/icons/`                                  |
-
-Per-user config lives in `~/.config/kb-kill/kb-kill.toml` (the installing user's is
-seeded from the example; you may also stow it from your dotfiles).
-
-## Troubleshooting
-
-- **Nothing happens on the hotkey** — first check the daemon actually has your
-  config: `journalctl -u kb-kill-daemon -e` should show a `live config: uid <you>`
-  line. If it says `idle`, your `kb-kill-push` isn't running or you aren't the active
-  seat user — `systemctl --user status kb-kill-push`. Then `sudo kb-kill-daemon detect` to confirm a target is found. If a key in your combo is remapped by
-  input-remapper, use its remapped form.
-- **A keyboard can't kill/wake itself** — restart the daemon after a code
-  redeploy: `sudo systemctl restart kb-kill-daemon`.
-- **Tray shows "connecting…"** — the daemon isn't running; check
-  `systemctl status kb-kill-daemon`. If the tray connects but shows no groups, you
-  may not be the active seat user (state is only sent to the live user).
-- **Stuck modifier after killing from the target** — shouldn't happen: kb-kill
-  defers the grab until the target has no keys held. Report if it does.
