@@ -1,6 +1,8 @@
-# kb-kill
+<p align="center">
+  <img src="icons/kb-kill-killed.svg" alt="kb-kill" width="128" />
+</p>
 
-<img src="icons/kb-kill-killed.svg" alt="kb-kill" width="128" />
+# kb-kill
 
 Disable/enable a target keyboard with a global hotkey, as a background service.
 
