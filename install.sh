@@ -138,7 +138,7 @@ fi
 
 # logind (required at runtime, warn-only): the daemon follows the active seat
 # user via /run/systemd/seats/* (ACTIVE_UID). Without an active seat it runs but
-# stays idle and never grabs the keyboard — so warn now rather than let that be
+# stays idle and never grabs any device — so warn now rather than let that be
 # a silent non-functional install. Not a hard failure: a headless redeploy is
 # legitimate, and a seat can appear later at login.
 if ! systemctl is-active --quiet systemd-logind 2>/dev/null; then

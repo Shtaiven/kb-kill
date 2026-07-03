@@ -13,10 +13,10 @@ section: utils
 priority: optional
 maintainer: Steven Eisinger <steven.a.eisinger@gmail.com>
 description: |
-  Disable/enable a target keyboard on a global hotkey via a hardened root daemon.
-  "Disable" is an exclusive EVIOCGRAB on the device (no virtual device, no event
-  re-injection); config is pushed per-user over a control socket and follows the
-  active seat user.
+  Disable/enable target input devices (keyboards, mice, touchpads) on a global
+  hotkey via a hardened root daemon. "Disable" is an exclusive EVIOCGRAB on the
+  device (no virtual device, no event re-injection); config is pushed per-user
+  over a control socket and follows the active seat user.
 vendor: kb-kill
 homepage: https://github.com/Shtaiven/kb-kill
 license: MIT

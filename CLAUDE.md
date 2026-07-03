@@ -4,12 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-kb-kill disables/enables a target keyboard (e.g. a laptop's built-in keyboard) on a
-global hotkey, as a hardened root systemd daemon. "Disable" = an exclusive
-`EVIOCGRAB` on the device so the kernel routes its events only to kb-kill, which drops
-them. There is **no virtual device and no event re-injection**: kb-kill grabs *only
-while killed*; when awake it merely monitors (reads, never grabs), so a crash can never
-break your keyboard, and the kernel auto-releases grabs if the process dies.
+kb-kill disables/enables target input devices — keyboards **and** pointers (mice,
+trackballs, touchpads) — on a global hotkey, as a hardened root systemd daemon.
+"Disable" = an exclusive `EVIOCGRAB` on the device so the kernel routes its events only
+to kb-kill, which drops them. There is **no virtual device and no event re-injection**:
+kb-kill grabs *only while killed*; when awake it merely monitors (reads, never grabs),
+so a crash can never break your devices, and the kernel auto-releases grabs if the
+process dies.
 
 **Config is pushed, not read from a path (pure-push model).** The daemon starts
 config-less and is *told* what to do over its control socket, like input-remapper's
@@ -50,7 +51,7 @@ binary and its unit carry the `-daemon` suffix.
 
 ```sh
 ./install.sh                       # deploy (and REDEPLOY) — see redeploy note below
-sudo kb-kill-daemon detect         # list keyboards, which are targets, parsed combos — START HERE when debugging
+sudo kb-kill-daemon detect         # list devices (kbd/ptr), which are targets, parsed combos — START HERE when debugging
 sudo kb-kill-daemon monitor        # print raw key events + per-device/global combo matches
 sudo systemctl restart kb-kill-daemon
 journalctl -u kb-kill-daemon -f    # watch live: "live config", KILLED / WOKEN (daemon logs only to stderr/journal)
@@ -81,11 +82,20 @@ tag), per-client connection fds (`("client", conn)` tags), and the seats-dir ino
 (`_SEATWATCH` tag). Loop timeout = `RESCAN_INTERVAL` (2s), which drives device hotplug
 rescans and is the backstop for re-checking the active seat user.
 
-**Groups are the core abstraction.** A `Group` = a set of target keyboards + its own
-kill/wake combo + a `killed` flag + `virtual_keyboard` flag. Config produces a list of
-`Group`s: top-level keys form the "default" group (and supply combo defaults inherited
-by `[groups.*]` tables). Each group kills/wakes independently; `_reconcile_grabs()`
-makes the grabbed-device set equal the union of every *killed* group's targets.
+**Groups are the core abstraction.** A `Group` = a set of target devices + its own
+kill/wake combo + a `killed` flag + `virtual` flag. Targets are chosen by up to three
+name matcher fields, one per device class: `keyboards` (keyboard-class,
+`is_keyboard()`), `pointers` (mice/trackballs/touchpads, `is_pointer()`), and `devices`
+(any class). A group needs ≥1; several fields kill multiple classes together. Each entry
+matches as a case-insensitive **substring OR glob** (`fnmatch`: `*`/`?`/`[seq]`) of the
+whole name — substring kept for backward compat, so a bare `*` matches all (see
+`_dev_matches`). Config produces a list of `Group`s: top-level keys form the "default"
+group (and supply combo defaults inherited by `[groups.*]` tables). Each group
+kills/wakes independently; `_reconcile_grabs()` makes the grabbed-device set equal the
+union of every *killed* group's targets. Pointer devices are only *opened*
+(`open_devices(want_pointers)`) when a live group references `pointers`/`devices`;
+keyboards are always opened. Mouse buttons are `EV_KEY` like keys (so `btn_*`/`mouse*`
+combos work and a killed pointer can self-wake); pointer motion is never processed.
 
 **Combos match globally, not per-device.** `_global_pressed()` unions held keys across
 *all* monitored devices. This is deliberate: input-remapper fans one physical
@@ -94,10 +104,14 @@ a whole combo. Combo syntax is parsed in `_parse_combo`/`_parse_token` into
 `list[frozenset[int]]` (each token = an "any-of" set of keycodes; combo fires when every
 set has ≥1 key held).
 
-**input-remapper coexistence** (`_resolve_targets` + `virtual_keyboard`): a
-`virtual_keyboard = true` group targets *only* the input-remapper "forwarded" virtual
-device (`is_virtual()`), never the physical keyboard, so input-remapper can always
-re-grab the physical device. Ordinary groups grab matching physical devices directly.
+**input-remapper coexistence** (`_resolve_targets` + `virtual`): a `virtual = true`
+group targets *only* the input-remapper "forwarded" virtual device (`is_virtual()`),
+never the physical device, so input-remapper can always re-grab the physical device.
+Ordinary groups grab matching physical devices directly. The flag is group-wide and
+applies after the class-matching in `_dev_matches`, so a single group can't mix physical
+and virtual targets — use two groups sharing a combo (they toggle together). `virtual`
+was renamed from `virtual_keyboard` (still accepted as a deprecated alias) since it now
+applies to pointers too.
 
 **Grab-deferral invariant:** grabbing a device with keys currently held would swallow
 their key-ups and leave them stuck down at the OS. So `_reconcile_grabs()` defers
@@ -148,10 +162,11 @@ kb-kill is keylogger-*capable*, and the design is built to contain that. When ch
 anything, preserve these invariants (see README "Security model" and the systemd unit):
 
 - **No keystroke ever persists or leaves the process.** Only the set of *currently
-  held* keys is kept (for combo matching), discarded on key-up. No history, file, or
-  network. The control socket carries config text + group state only, **never key data**
-  (config TOML is not key data). (`monitor` printing to a terminal is a manual debug
-  tool; the *service* never does.)
+  held* keys/buttons is kept (for combo matching), discarded on release. Pointer motion
+  (`EV_REL`/`EV_ABS`) is never processed — `_process` acts only on `EV_KEY`. No history,
+  file, or network. The control socket carries config text + group state only, **never
+  key data** (config TOML is not key data). (`monitor` printing to a terminal is a manual
+  debug tool; the *service* never does.)
 - **The deployed daemon binary must stay root-owned and not user-writable** — a root
   service executing a user-writable script is a privesc hole. That's why `install.sh`
   copies to `/usr/local/bin` rather than symlinking the working tree.

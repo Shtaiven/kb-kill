@@ -5,7 +5,7 @@
 pkgname=kb-kill
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="Disable/enable a target keyboard on a global hotkey via a hardened root daemon (EVIOCGRAB, no virtual device)"
+pkgdesc="Disable/enable target input devices (keyboards, mice, touchpads) on a global hotkey via a hardened root daemon (EVIOCGRAB, no virtual device)"
 arch=('any')
 url="https://github.com/Shtaiven/kb-kill"
 license=('MIT')
