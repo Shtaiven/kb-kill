@@ -33,6 +33,8 @@
 #       keyboards = ...   → keyboard-class devices only
 #       pointers  = ...   → pointing devices only (mice, trackballs, touchpads)
 #       devices   = ...   → ANY input device, regardless of class
+#   * Optional per group: label = "Laptop keyboard" — a display name the tray
+#     shows instead of the group's table key. Cosmetic only.
 #   * TOML rule: top-level keys MUST come before any [groups.*] table.
 #   * Give each group a DISTINCT combo (a shared combo just toggles both groups
 #     together — which is how you kill a physical + a virtual target at once).
@@ -47,7 +49,7 @@
 # ─── Default group (uncomment + edit to enable) ───────────────────────────────
 # keyboards  = "AT Translated Set 2 keyboard"   # your keyboard (see `detect`)
 # kill_combo = "ctrl+alt+shift+k"               # required — no default
-# wake_combo = "ctrl+alt+shift+u"               # required — no default
+# wake_combo = "ctrl+alt+shift+w"               # required — no default
 #
 # Set true only if this device is fronted by an input-remapper "forwarded"
 # virtual device: kb-kill then targets that virtual device and never the
@@ -60,6 +62,7 @@
 # itself (or use a keyboard combo and wake it from the keyboard).
 #
 # [groups.pointer]
+# label      = "Mouse & touchpad"     # optional: shown in the tray
 # pointers   = "*"                    # all mice/trackballs/touchpads
 # kill_combo = "ctrl+alt+shift+m"
 # wake_combo = "mouseleft+mouseright"

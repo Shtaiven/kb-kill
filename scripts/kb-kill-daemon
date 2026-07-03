@@ -331,8 +331,10 @@ class Group:
         virtual: bool,
         kill_raw: str,
         wake_raw: str,
+        label: str | None,
     ) -> None:
-        self.name = name  # label for logs/detect
+        self.name = name  # identity: logs, control commands, killed-state preserve
+        self.label = label  # optional display name (config 'label'); tray shows it
         # Name matchers, one per device class (any may be empty). Each entry is
         # a lowercased substring-or-glob pattern:
         #   keyboards -> keyboard-class devices, pointers -> pointing devices,
@@ -428,6 +430,7 @@ _MATCH_KEYS = ("keyboards", "pointers", "devices")
 # is the deprecated alias for `virtual` (kept for backward compatibility).
 _GROUP_KEYS = {
     *_MATCH_KEYS,
+    "label",
     "kill_combo",
     "wake_combo",
     "virtual",
@@ -487,10 +490,18 @@ def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
     virtual = table.get("virtual", table.get("virtual_keyboard", False))
     if not isinstance(virtual, bool):
         raise ConfigError(f"{where}: 'virtual' must be true or false")
-    for label, val in (("kill_combo", kill_raw), ("wake_combo", wake_raw)):
+    # Optional display label, shown by the tray instead of the group's table key.
+    # Purely cosmetic: identity (control commands, killed-state preservation
+    # across a re-push) stays the group name.
+    label = table.get("label")
+    if label is not None:
+        if not isinstance(label, str) or not label.strip():
+            raise ConfigError(f"{where}: 'label' must be a non-empty string")
+        label = label.strip()
+    for combo_key, val in (("kill_combo", kill_raw), ("wake_combo", wake_raw)):
         if val is None:
             raise ConfigError(
-                f"{where}: '{label}' is required (no built-in default) — a "
+                f"{where}: '{combo_key}' is required (no built-in default) — a "
                 "keyboard can only be disabled by a combo you set explicitly."
             )
     if not isinstance(kill_raw, str) or not isinstance(wake_raw, str):
@@ -501,7 +512,16 @@ def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
     except ConfigError as e:
         raise ConfigError(f"{where}: {e}")
     return Group(
-        name, kbs, pointers, devs, kill_combo, wake_combo, virtual, kill_raw, wake_raw
+        name,
+        kbs,
+        pointers,
+        devs,
+        kill_combo,
+        wake_combo,
+        virtual,
+        kill_raw,
+        wake_raw,
+        label,
     )
 
 
@@ -1044,7 +1064,12 @@ class KbKill:
         return {
             "type": "state",
             "groups": [
-                {"name": g.name, "killed": g.killed, "targets": len(g.targets)}
+                {
+                    "name": g.name,
+                    "label": g.label or g.name,
+                    "killed": g.killed,
+                    "targets": len(g.targets),
+                }
                 for g in self.groups
             ],
         }
@@ -1326,7 +1351,8 @@ def cmd_detect(config: Config) -> int:
             for field in ("keyboards", "pointers", "devices")
             if getattr(g, field)
         )
-        print(f"  [{g.name}]  {matchers}")
+        shown = f' (shown as "{g.label}")' if g.label else ""
+        print(f"  [{g.name}]{shown}  {matchers}")
         print(f"  {'':9}kill={g.kill_raw}  wake={g.wake_raw}  virtual={g.virtual}")
     print()
 

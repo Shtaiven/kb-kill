@@ -256,6 +256,10 @@ devices and its own kill/wake hotkeys:
   built-in default**, so each combo must be set *somewhere* (top-level or the
   group itself), else the group is rejected. `virtual` is per-group
   (default `false`) and is **not** inherited.
+- An optional **`label = "…"`** per group sets a display name the tray shows
+  instead of the group's table key (e.g. `label = "Mouse & touchpad"` for
+  `[groups.pointer]`). Cosmetic only — logs, `detect`, and control commands
+  keep using the table key.
 - TOML rule: top-level keys must come **before** any `[groups.*]` table.
 - Give each group a **distinct** combo — a shared combo toggles them together
   (handy for mixing a physical and a virtual target across two groups).
@@ -338,11 +342,14 @@ systemctl --user stop  kb-kill-tray    # or stop it; it returns on next login
   "tray" line for your distro in [Requirements](#requirements).
 - The icons are installed to `/usr/local/share/kb-kill/icons/` and the menu lists
   every group from your config, so multiple groups each get their own toggle entry.
+  A group's optional `label = "…"` config key sets the text shown here.
 
 The control socket is also a small JSON line protocol if you want to script it:
 send `{"cmd":"toggle","group":"<name>"}` (or `kill`/`wake`/`status`) — accepted only
 while you are the active user; the service replies/broadcasts
-`{"type":"state","groups":[{"name","killed","targets"}]}`. (Config is delivered the
+`{"type":"state","groups":[{"name","label","killed","targets"}]}` (`label` is the
+group's display label from the config, falling back to the group name).
+(Config is delivered the
 same way: `{"cmd":"set_config","toml":"<text>"}`, which is what `kb-kill-push` sends.)
 
 ## input-remapper coexistence
@@ -390,7 +397,8 @@ keylogger-*capable*. The design minimizes and contains that:
   of keys/buttons *currently held* (for combo matching) and discards them on
   release — there is no history, no log, no file, no network. Pointer **motion** is
   never processed at all (only `EV_KEY` button events are). The control socket
-  carries config text + group state (`{name, killed, targets}`), **never key data**.
+  carries config text + group state (`{name, label, killed, targets}`), **never key
+  data**.
   (`kb-kill-daemon monitor` is a manual debug tool that prints to the terminal; the
   service never does.)
 - **Reading input is confined to one process.** Device access lives entirely in
