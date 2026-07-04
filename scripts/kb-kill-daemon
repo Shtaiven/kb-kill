@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""kb-kill-daemon - disable/enable a target keyboard on a global hotkey.
+"""kb-kill-daemon - disable/enable target input devices on a global hotkey.
 
 Runs as a long-lived root service. Any keyboard can press the configured *kill*
-hotkey to disable (grab + eat all events from) the target keyboard(s). While
-killed, every key from the target is swallowed EXCEPT the *wake* hotkey, so the
-target keyboard can always wake itself - there is no way to lock yourself out.
+hotkey to disable (grab + eat all events from) the target device(s) - keyboards,
+mice, or touchpads. While killed, every event from the target is swallowed
+EXCEPT the *wake* hotkey, so a killed keyboard can always wake itself - there is
+no way to lock yourself out. (A killed pointer self-wakes only if its wake combo
+uses its own buttons, e.g. "mouseleft+mouseright"; otherwise wake it from the
+keyboard.)
 
 Config arrives by PUSH, not from a file path: the daemon starts config-less and
 each logged-in user's `kb-kill-push` sends their config (TOML text) over the
@@ -23,10 +26,16 @@ Design notes
   latency.
 * Coexistence with input-remapper: input-remapper grabs the physical keyboard
   (e.g. /dev/input/event3) and forwards it to a virtual "...forwarded" device.
-  Mark such a group `virtual_keyboard = true` and kb-kill targets only that
-  virtual device, never the physical one, so input-remapper can always
-  (re)grab the physical device - including across a restart. Ordinary groups
-  (the default) grab matching devices directly. See `_resolve_targets`.
+  Mark such a group `virtual = true` and kb-kill targets only that virtual
+  device, never the physical one, so input-remapper can always (re)grab the
+  physical device - including across a restart. Ordinary groups (the default)
+  grab matching devices directly. See `_resolve_targets`.
+* Targets are chosen per group by name matchers, one per device class:
+  `keyboards` (keyboard-class), `pointers` (mice/trackballs/touchpads), and
+  `devices` (any class). Each entry matches case-insensitively as a substring
+  OR an fnmatch glob (`*`/`?`/`[seq]`) of the whole name. A group needs at
+  least one field; set several to kill, e.g., a keyboard and a mouse together.
+  See `_dev_matches`.
 
 Requires: python-evdev and read access to /dev/input/event*. The daemon runs as
 root (the systemd service); `detect`/`monitor` therefore need `sudo`.
@@ -35,6 +44,7 @@ root (the systemd service); `detect`/`monitor` therefore need `sudo`.
 import argparse
 import ctypes
 import errno
+import fnmatch
 import json
 import os
 import pwd
@@ -84,9 +94,12 @@ except ImportError:
 #   lshift / rshift                left-only           / right-only
 #   super / meta / win / cmd      KEY_LEFTMETA  (125) or KEY_RIGHTMETA (126)
 #   lsuper/lmeta / rsuper/rmeta    left-only           / right-only
+#   mouseleft / mouseright        BTN_LEFT            / BTN_RIGHT
+#   mousemiddle                   BTN_MIDDLE
 #
 # Any other token resolves to a single keycode: a letter a-z -> KEY_A..KEY_Z,
-# a raw evdev name like KEY_SCROLLLOCK, or a numeric keycode.
+# a raw evdev name like KEY_SCROLLLOCK or BTN_SIDE (mouse buttons let a killed
+# pointer self-wake), or a numeric keycode.
 # --------------------------------------------------------------------------- #
 MODIFIER_ALIASES = {
     "ctrl": frozenset({ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL}),
@@ -108,6 +121,11 @@ MODIFIER_ALIASES = {
     "lmeta": frozenset({ecodes.KEY_LEFTMETA}),
     "rsuper": frozenset({ecodes.KEY_RIGHTMETA}),
     "rmeta": frozenset({ecodes.KEY_RIGHTMETA}),
+    # Mouse-button aliases (for pointer self-wake, e.g. wake_combo =
+    # "mouseleft+mouseright"). Raw BTN_* names also work via the fallback below.
+    "mouseleft": frozenset({ecodes.BTN_LEFT}),
+    "mouseright": frozenset({ecodes.BTN_RIGHT}),
+    "mousemiddle": frozenset({ecodes.BTN_MIDDLE}),
 }
 
 
@@ -306,22 +324,36 @@ class Group:
         self,
         name: str,
         keyboards: list[str],
+        pointers: list[str],
+        devices: list[str],
         kill_combo: list[frozenset[int]],
         wake_combo: list[frozenset[int]],
-        virtual_keyboard: bool,
+        virtual: bool,
         kill_raw: str,
         wake_raw: str,
+        label: str | None,
     ) -> None:
-        self.name = name  # label for logs/detect
-        self.keyboards = keyboards  # lowercase substrings
+        self.name = name  # identity: logs, control commands, killed-state preserve
+        self.label = label  # optional display name (config 'label'); tray shows it
+        # Name matchers, one per device class (any may be empty). Each entry is
+        # a lowercased substring-or-glob pattern:
+        #   keyboards -> keyboard-class devices, pointers -> pointing devices,
+        #   devices   -> any input device regardless of class. A device is a
+        # target when it matches at least one applicable field. See _dev_matches.
+        self.keyboards = keyboards  # lowercase patterns (keyboard-class only)
+        self.pointers = pointers  # lowercase patterns (pointer-class only)
+        self.devices = devices  # lowercase patterns (any class)
         self.kill_combo = kill_combo
         self.wake_combo = wake_combo
-        self.virtual_keyboard = virtual_keyboard
+        # Grab only the input-remapper "forwarded" copy, never the physical
+        # device (any class), so input-remapper can keep the physical one.
+        self.virtual = virtual
         self.kill_raw = kill_raw  # original strings (for display)
         self.wake_raw = wake_raw
         # runtime state (managed by KbKill)
         self.targets: dict[str, InputDevice] = {}  # path -> InputDevice
         self.killed = False
+        self.warned_empty = False  # zero-match warning emitted (reset on match)
 
 
 class Config:
@@ -342,8 +374,9 @@ def _parse_token(token: str) -> frozenset[int]:
         code = getattr(ecodes, name, None)
         if code is not None:
             return frozenset({code})
-    # raw evdev name, e.g. KEY_SCROLLLOCK / SCROLLLOCK
-    name = t.upper() if t.upper().startswith("KEY_") else f"KEY_{t.upper()}"
+    # raw evdev name, e.g. KEY_SCROLLLOCK / SCROLLLOCK / BTN_LEFT (mouse button)
+    upper = t.upper()
+    name = upper if upper.startswith(("KEY_", "BTN_")) else f"KEY_{upper}"
     code = getattr(ecodes, name, None)
     if code is not None:
         return frozenset({code})
@@ -351,7 +384,8 @@ def _parse_token(token: str) -> frozenset[int]:
     if t.isdigit():
         return frozenset({int(t)})
     raise ConfigError(
-        f"unknown key {token!r} (try ctrl/alt/shift/super, a-z, or a KEY_* name)"
+        f"unknown key {token!r} (try ctrl/alt/shift/super, a-z, a KEY_*/BTN_* name, "
+        "or mouseleft/mouseright/mousemiddle)"
     )
 
 
@@ -384,27 +418,37 @@ def find_config(explicit: str | None = None) -> Path:
             return p
     raise ConfigError(
         "no config file found. Create ~/.config/kb-kill/kb-kill.toml with:\n"
-        '  keyboards  = "AT Translated Set 2 keyboard"\n'
+        '  keyboards  = "AT Translated Set 2 keyboard"   # or pointers = / devices =\n'
         '  kill_combo = "ctrl+alt+shift+k"\n'
         '  wake_combo = "ctrl+alt+shift+u"'
     )
 
 
-# Keys allowed in a group table / the top-level default group.
-_GROUP_KEYS = {"keyboards", "kill_combo", "wake_combo", "virtual_keyboard"}
+# The device-matcher fields a group may set (at least one required).
+_MATCH_KEYS = ("keyboards", "pointers", "devices")
+# Keys allowed in a group table / the top-level default group. `virtual_keyboard`
+# is the deprecated alias for `virtual` (kept for backward compatibility).
+_GROUP_KEYS = {
+    *_MATCH_KEYS,
+    "label",
+    "kill_combo",
+    "wake_combo",
+    "virtual",
+    "virtual_keyboard",
+}
 
 
-def _as_keyboards(value: object, where: str) -> list[str]:
-    """Coerce the `keyboards` value (string or list of strings) to a list of
-    lowercased substrings."""
+def _as_names(value: object, where: str, field: str) -> list[str]:
+    """Coerce a matcher field (string or list of strings) to a list of
+    lowercased patterns (each matched as a substring or an fnmatch glob)."""
     if isinstance(value, str):
         value = [value]
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
-        raise ConfigError(f"{where}: 'keyboards' must be a string or list of strings")
-    kbs = [v.strip().lower() for v in value if v.strip()]
-    if not kbs:
-        raise ConfigError(f"{where}: 'keyboards' is empty")
-    return kbs
+        raise ConfigError(f"{where}: '{field}' must be a string or list of strings")
+    names = [v.strip().lower() for v in value if v.strip()]
+    if not names:
+        raise ConfigError(f"{where}: '{field}' is empty")
+    return names
 
 
 def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
@@ -416,18 +460,48 @@ def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
         if key not in _GROUP_KEYS:
             log(f"warning: {where}: unknown key {key!r} (ignored)")
 
-    kbs = _as_keyboards(table["keyboards"], where)
+    # Each of keyboards/pointers/devices is optional, but at least one must be
+    # present (a group with no matcher has nothing to grab).
+    matchers = {
+        field: _as_names(table[field], where, field)
+        for field in _MATCH_KEYS
+        if field in table
+    }
+    if not matchers:
+        raise ConfigError(
+            f"{where}: a group needs at least one of "
+            f"{', '.join(_MATCH_KEYS)} (device-name matchers)."
+        )
+    kbs = matchers.get("keyboards", [])
+    pointers = matchers.get("pointers", [])
+    devs = matchers.get("devices", [])
     kill_raw = table.get("kill_combo", defaults["kill_combo"])
     wake_raw = table.get("wake_combo", defaults["wake_combo"])
-    # virtual_keyboard describes one keyboard's nature, so it is per-group only
-    # (default false) and never inherited from the top-level defaults.
-    virtual = table.get("virtual_keyboard", False)
+    # `virtual` describes a target's nature, so it is per-group only (default
+    # false) and never inherited from the top-level defaults. `virtual_keyboard`
+    # is the deprecated alias (applied to all classes now, not just keyboards).
+    if "virtual" in table and "virtual_keyboard" in table:
+        raise ConfigError(
+            f"{where}: set either 'virtual' or 'virtual_keyboard' (its deprecated "
+            "alias), not both."
+        )
+    if "virtual_keyboard" in table:
+        log(f"warning: {where}: 'virtual_keyboard' is deprecated — use 'virtual'")
+    virtual = table.get("virtual", table.get("virtual_keyboard", False))
     if not isinstance(virtual, bool):
-        raise ConfigError(f"{where}: 'virtual_keyboard' must be true or false")
-    for label, val in (("kill_combo", kill_raw), ("wake_combo", wake_raw)):
+        raise ConfigError(f"{where}: 'virtual' must be true or false")
+    # Optional display label, shown by the tray instead of the group's table key.
+    # Purely cosmetic: identity (control commands, killed-state preservation
+    # across a re-push) stays the group name.
+    label = table.get("label")
+    if label is not None:
+        if not isinstance(label, str) or not label.strip():
+            raise ConfigError(f"{where}: 'label' must be a non-empty string")
+        label = label.strip()
+    for combo_key, val in (("kill_combo", kill_raw), ("wake_combo", wake_raw)):
         if val is None:
             raise ConfigError(
-                f"{where}: '{label}' is required (no built-in default) — a "
+                f"{where}: '{combo_key}' is required (no built-in default) — a "
                 "keyboard can only be disabled by a combo you set explicitly."
             )
     if not isinstance(kill_raw, str) or not isinstance(wake_raw, str):
@@ -437,7 +511,18 @@ def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
         wake_combo = _parse_combo(wake_raw)
     except ConfigError as e:
         raise ConfigError(f"{where}: {e}")
-    return Group(name, kbs, kill_combo, wake_combo, virtual, kill_raw, wake_raw)
+    return Group(
+        name,
+        kbs,
+        pointers,
+        devs,
+        kill_combo,
+        wake_combo,
+        virtual,
+        kill_raw,
+        wake_raw,
+        label,
+    )
 
 
 def parse_config(doc: dict, source: str) -> Config:
@@ -451,8 +536,8 @@ def parse_config(doc: dict, source: str) -> Config:
     if not isinstance(doc, dict):
         raise ConfigError(f"{source}: top level must be a table")
 
-    # Top-level keys form the default group (if they include `keyboards`) and
-    # supply defaults inherited by [groups.*].
+    # Top-level keys form the default group (if they include a matcher field:
+    # keyboards/pointers/devices) and supply defaults inherited by [groups.*].
     sections = doc.pop("groups", {})
     if not isinstance(sections, dict):
         raise ConfigError(f"{source}: 'groups' must be a table ([groups.<name>])")
@@ -466,7 +551,7 @@ def parse_config(doc: dict, source: str) -> Config:
     }
 
     groups = []
-    if "keyboards" in doc:
+    if any(field in doc for field in _MATCH_KEYS):
         groups.append(_build_group("default", doc, defaults, f"{source} [top-level]"))
     else:
         # No top-level group: validate stray top-level keys are known defaults.
@@ -477,8 +562,11 @@ def parse_config(doc: dict, source: str) -> Config:
     for name, table in sections.items():
         if not isinstance(table, dict):
             raise ConfigError(f"{source}: [groups.{name}] must be a table")
-        if "keyboards" not in table:
-            raise ConfigError(f"{source}: [groups.{name}] is missing 'keyboards'")
+        if not any(field in table for field in _MATCH_KEYS):
+            raise ConfigError(
+                f"{source}: [groups.{name}] needs one of "
+                f"{', '.join(_MATCH_KEYS)} (device-name matchers)"
+            )
         groups.append(_build_group(name, table, defaults, f"{source} [groups.{name}]"))
 
     if not groups:
@@ -526,6 +614,21 @@ def is_keyboard(dev: InputDevice) -> bool:
     return ecodes.KEY_A in keys and ecodes.KEY_Z in keys and ecodes.KEY_ENTER in keys
 
 
+def is_pointer(dev: InputDevice) -> bool:
+    """True for pointing devices: mice, trackballs, and touchpads.
+
+    A pointer has a mouse button plus motion — relative (mice/trackballs) or
+    an absolute touch surface (touchpads). This is the `pointers` field's class.
+    """
+    caps = dev.capabilities()
+    keys = caps.get(ecodes.EV_KEY, [])
+    has_button = ecodes.BTN_LEFT in keys or ecodes.BTN_MOUSE in keys
+    rel = caps.get(ecodes.EV_REL, [])
+    has_rel = ecodes.REL_X in rel and ecodes.REL_Y in rel
+    has_abs_touch = ecodes.BTN_TOUCH in keys  # touchpads report an absolute surface
+    return has_button and (has_rel or has_abs_touch)
+
+
 def is_virtual(dev: InputDevice) -> bool:
     """True for uinput / forwarded devices (e.g. input-remapper output)."""
     phys = (dev.phys or "").lower()
@@ -533,15 +636,21 @@ def is_virtual(dev: InputDevice) -> bool:
     return "uinput" in phys or "forwarded" in name or "input-remapper" in name
 
 
-def open_keyboards() -> dict[str, InputDevice]:
-    """Return {path: InputDevice} for every readable keyboard."""
+def open_devices(want_pointers: bool = False) -> dict[str, InputDevice]:
+    """Return {path: InputDevice} for every readable device we might target.
+
+    Keyboards are always opened (so a killed pointer can be woken from the
+    keyboard, and combos match globally). Pointers are only opened when the live
+    config actually references them — keeping monitoring minimal for the common
+    keyboard-only case.
+    """
     found = {}
     for path in list_devices():
         try:
             dev = InputDevice(path)
         except OSError:
             continue
-        if is_keyboard(dev):
+        if is_keyboard(dev) or (want_pointers and is_pointer(dev)):
             found[path] = dev
         else:
             dev.close()
@@ -591,26 +700,40 @@ class KbKill:
         # seats inotify watch (best-effort; falls back to periodic polling)
         self._seatwatch: SeatWatch | None = None
 
-    # -- device name matching ------------------------------------------------ #
+    # -- device matching ----------------------------------------------------- #
     @staticmethod
-    def _name_matches(group: Group, name: str | None) -> bool:
-        if "*" in group.keyboards:  # wildcard: match every keyboard
+    def _dev_matches(group: Group, dev: InputDevice) -> bool:
+        """True if `dev` is a target of `group`.
+
+        A device matches when its name matches an applicable matcher field:
+        `keyboards` (keyboard-class only), `pointers` (pointer-class only), or
+        `devices` (any class). Each entry matches as a case-insensitive substring
+        or, additively, as a glob (fnmatch: `*`, `?`, `[seq]`) against the whole
+        name — so a bare `*` matches every device.
+        """
+        low = (dev.name or "").lower()
+
+        def hit(subs: list[str]) -> bool:
+            return any(s in low or fnmatch.fnmatchcase(low, s) for s in subs)
+
+        if hit(group.keyboards) and is_keyboard(dev):
             return True
-        low = (name or "").lower()
-        return any(sub in low for sub in group.keyboards)
+        if hit(group.pointers) and is_pointer(dev):
+            return True
+        if hit(group.devices):
+            return True
+        return False
 
     def _resolve_targets(self, group: Group) -> dict[str, InputDevice]:
         """Pick the devices to grab for a group.
 
-        For a `virtual_keyboard` group (one fronted by an input-remapper
-        "forwarded" device), target only the virtual device(s) and never the
-        physical keyboard, so input-remapper can always keep/regrab the physical
-        device. For an ordinary group, grab whatever matches directly.
+        For a `virtual` group (one fronted by an input-remapper "forwarded"
+        device), target only the virtual device(s) and never the physical one,
+        so input-remapper can always keep/regrab the physical device. For an
+        ordinary group, grab whatever matches directly.
         """
-        matched = {
-            p: d for p, d in self.devices.items() if self._name_matches(group, d.name)
-        }
-        if group.virtual_keyboard:
+        matched = {p: d for p, d in self.devices.items() if self._dev_matches(group, d)}
+        if group.virtual:
             return {p: d for p, d in matched.items() if is_virtual(d)}
         return matched
 
@@ -638,7 +761,8 @@ class KbKill:
 
     def rescan(self) -> None:
         self.need_rescan = False
-        current = open_keyboards()
+        want_pointers = any(g.pointers or g.devices for g in self.groups)
+        current = open_devices(want_pointers)
 
         # Drop devices that vanished.
         for path in list(self.devices):
@@ -657,6 +781,41 @@ class KbKill:
         for group in self.groups:
             group.targets = self._resolve_targets(group)
         self._reconcile_grabs()
+        self._warn_empty_groups()
+
+    def _warn_empty_groups(self) -> None:
+        """Warn once per group while it matches zero devices.
+
+        A zero-match group is silent otherwise and looks exactly like a config
+        that was never picked up (bad matcher, typo, or virtual=true filtering
+        out every physical match). Runs after every rescan — i.e. right after a
+        config push lands (pointer devices are only opened by that rescan, so
+        checking earlier would false-positive) — and logs only on transitions:
+        once when a group goes empty, once when a device appears for it.
+        """
+        for group in self.groups:
+            if group.targets:
+                if group.warned_empty:
+                    group.warned_empty = False
+                    log(f"[{group.name}] now matches {len(group.targets)} device(s)")
+                continue
+            if group.warned_empty:
+                continue
+            group.warned_empty = True
+            if group.virtual and any(
+                self._dev_matches(group, d) for d in self.devices.values()
+            ):
+                log(
+                    f"[{group.name}] warning: matches only physical devices and "
+                    "virtual=true skips them — nothing will be grabbed (drop "
+                    "'virtual' unless input-remapper fronts this device)"
+                )
+            else:
+                log(
+                    f"[{group.name}] warning: matches no present device — "
+                    "nothing will be grabbed until one appears (check the "
+                    "matchers against `kb-kill-daemon detect`)"
+                )
 
     # -- live config (which pushed config governs the keyboard) -------------- #
     def _install_groups(self, groups: list[Group], preserve: dict[str, bool]) -> None:
@@ -678,6 +837,10 @@ class KbKill:
         for g in self.groups:
             g.targets = self._resolve_targets(g)
         self._reconcile_grabs()
+        # The new config may need pointer devices the previous one didn't (they
+        # are only opened when a live group references them), so re-enumerate on
+        # the next loop tick to pick them up promptly.
+        self.need_rescan = True
         self._last_sig = None  # force a fresh state broadcast
 
     def _set_live(self, uid: int | None) -> None:
@@ -804,20 +967,43 @@ class KbKill:
                 group.killed = False
                 log(f"[{group.name}] WOKEN")
 
+    @staticmethod
+    def _combo_satisfiable(combo: list[frozenset[int]], devs) -> bool:
+        """True if `devs` can, between them, produce every token of `combo`."""
+        caps: set[int] = set()
+        for d in devs:
+            caps |= set(d.capabilities().get(ecodes.EV_KEY, []))
+        return all(token & caps for token in combo)
+
     def _log_kill(self, group: Group) -> None:
-        # Lockout guard: warn (do not refuse) if killing the only keyboard(s)
-        # present. A killed group can always wake itself, so this is never a
-        # hard lockout.
+        # Lockout guard: warn (never refuse). A killed keyboard can always wake
+        # itself (you type the wake combo on it). A killed pointer can only
+        # self-wake if the wake combo is producible on the pointer (e.g. a
+        # mouse-button combo); otherwise it must be woken from another device.
         non_targets = [p for p in self.devices if p not in group.targets]
+        self_wakeable = self._combo_satisfiable(
+            group.wake_combo, group.targets.values()
+        )
         if not group.targets:
             log(
-                f"[{group.name}] kill: no target keyboard present yet "
+                f"[{group.name}] kill: no target device present yet "
                 "(will grab when it appears)"
+            )
+        elif not non_targets and not self_wakeable:
+            log(
+                f"[{group.name}] warning: killing the only device(s) present and the "
+                "wake combo can't be produced on them — wake needs another device, a "
+                "config re-push, or a daemon restart"
             )
         elif not non_targets:
             log(
-                f"[{group.name}] warning: killing the only keyboard present "
-                "(wake hotkey on it still works)"
+                f"[{group.name}] warning: killing the only device(s) present "
+                "(wake hotkey on them still works)"
+            )
+        elif not self_wakeable:
+            log(
+                f"[{group.name}] note: this group can't self-wake — use the wake "
+                "hotkey on another device (e.g. your keyboard)"
             )
         log(f"[{group.name}] KILLED")
 
@@ -878,7 +1064,12 @@ class KbKill:
         return {
             "type": "state",
             "groups": [
-                {"name": g.name, "killed": g.killed, "targets": len(g.targets)}
+                {
+                    "name": g.name,
+                    "label": g.label or g.name,
+                    "killed": g.killed,
+                    "targets": len(g.targets),
+                }
                 for g in self.groups
             ],
         }
@@ -1155,11 +1346,14 @@ def cmd_detect(config: Config) -> int:
         print("          disable a keyboard. Add a group (with kill/wake combos)")
         print("          to enable it; see the comments in kb-kill.toml.")
     for g in config.groups:
-        print(f"  [{g.name}]  keyboards={g.keyboards}")
-        print(
-            f"  {'':9}kill={g.kill_raw}  wake={g.wake_raw}  "
-            f"virtual_keyboard={g.virtual_keyboard}"
+        matchers = ", ".join(
+            f"{field}={getattr(g, field)}"
+            for field in ("keyboards", "pointers", "devices")
+            if getattr(g, field)
         )
+        shown = f' (shown as "{g.label}")' if g.label else ""
+        print(f"  [{g.name}]{shown}  {matchers}")
+        print(f"  {'':9}kill={g.kill_raw}  wake={g.wake_raw}  virtual={g.virtual}")
     print()
 
     if os.geteuid() != 0:
@@ -1167,9 +1361,9 @@ def cmd_detect(config: Config) -> int:
         print("  Re-run with sudo:  sudo kb-kill-daemon detect")
         print()
 
-    devices = open_keyboards()
+    devices = open_devices(want_pointers=True)
     if not devices:
-        print("No keyboards found (permission problem?).")
+        print("No input devices found (permission problem?).")
         return 1
 
     svc = KbKill(config)
@@ -1178,32 +1372,40 @@ def cmd_detect(config: Config) -> int:
     for g in config.groups:
         g.targets = svc._resolve_targets(g)
 
-    any_target = any(g.targets for g in config.groups)
-    print("Keyboards:")
+    print("Devices:")
     for path in sorted(devices):
         dev = devices[path]
-        kind = "virtual " if is_virtual(dev) else "physical"
+        cls = "ptr" if is_pointer(dev) else "kbd"
+        virt = "virtual " if is_virtual(dev) else "physical"
         target_of = [g.name for g in config.groups if path in g.targets]
-        matched_of = [g.name for g in config.groups if svc._name_matches(g, dev.name)]
+        matched_of = [g.name for g in config.groups if svc._dev_matches(g, dev)]
         if target_of:
             mark = f"TARGET of {', '.join(target_of)} (grabbed when killed)"
         elif matched_of:
             mark = (
                 f"matches {', '.join(matched_of)}, but skipped "
-                "(virtual_keyboard=true ignores the physical device)"
+                "(virtual=true ignores the physical device)"
             )
         else:
             mark = "monitored only (can trigger any hotkey)"
-        print(f"  {path:24} [{kind}] {dev.name}")
+        print(f"  {path:24} [{cls}/{virt}] {dev.name}")
         print(f"  {'':24}   {mark}")
 
-    if config.groups and not any_target:
+    empty = [g for g in config.groups if not g.targets]
+    if empty:
         print()
-        print(
-            "No target will be grabbed. A virtual_keyboard group needs its "
-            "input-remapper\nforwarded device present; an ordinary group needs "
-            "a matching keyboard."
-        )
+        for g in empty:
+            if g.virtual and any(svc._dev_matches(g, d) for d in devices.values()):
+                print(
+                    f"WARNING: [{g.name}] matches only physical devices and "
+                    "virtual=true skips them —\n  nothing will be grabbed. Drop "
+                    "'virtual' unless input-remapper fronts this device."
+                )
+            else:
+                print(
+                    f"WARNING: [{g.name}] matches no present device — nothing "
+                    "will be grabbed until one appears."
+                )
     for dev in devices.values():
         dev.close()
     return 0
@@ -1220,9 +1422,9 @@ def cmd_monitor(config: Config) -> int:
     """Print every key event with its device + keycode, and flag when the
     kill/wake combos match per-device or globally. Used to diagnose how
     input-remapper routes the target keyboard's keys."""
-    devices = open_keyboards()
+    devices = open_devices(want_pointers=True)
     if not devices:
-        print("No keyboards found.")
+        print("No input devices found.")
         return 1
 
     sel = selectors.DefaultSelector()
@@ -1231,7 +1433,7 @@ def cmd_monitor(config: Config) -> int:
         pressed[path] = set(dev.active_keys())
         sel.register(dev, selectors.EVENT_READ, path)
 
-    print("Monitoring all keyboards. Press a group's kill/wake combo.")
+    print("Monitoring all input devices. Press a group's kill/wake combo.")
     for g in config.groups:
         print(f"  [{g.name}] kill={g.kill_raw} wake={g.wake_raw}")
     print("Ctrl+C to stop.\n")
@@ -1274,15 +1476,16 @@ def cmd_monitor(config: Config) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="kb-kill-daemon",
-        description="Disable/enable a target keyboard on a global hotkey.",
+        description="Disable/enable target input devices (keyboards, mice, "
+        "touchpads) on a global hotkey.",
     )
     parser.add_argument(
         "command",
         nargs="?",
         default="run",
         choices=["run", "detect", "monitor"],
-        help="run the service (default), detect keyboards, "
-        "or monitor raw key events for debugging",
+        help="run the service (default), detect input devices, "
+        "or monitor raw key/button events for debugging",
     )
     parser.add_argument(
         "-c",

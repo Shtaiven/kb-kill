@@ -1,5 +1,5 @@
 [Unit]
-Description=kb-kill - disable/enable a target keyboard on a global hotkey
+Description=kb-kill - disable/enable target input devices on a global hotkey
 After=multi-user.target
 
 [Service]
@@ -11,7 +11,7 @@ Restart=on-failure
 RestartSec=2
 
 # --- sandboxing -------------------------------------------------------------
-# Runs as root only to read /dev/input and grab keyboards; it needs nothing else.
+# Runs as root only to read /dev/input and grab input devices; it needs nothing else.
 # Config now arrives over the socket (never read from disk), and the socket is
 # 0666 + SO_PEERCRED-gated (no chown), so NO capabilities are required at all -
 # CAP_DAC_READ_SEARCH and CAP_CHOWN (and the @chown syscall carve-out) are gone.

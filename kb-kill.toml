@@ -11,44 +11,67 @@
 # just uses the active user's config. Edits are re-pushed and applied live.
 #
 # ─── How to enable it ─────────────────────────────────────────────────────────
-# 1. Find your keyboard's name:   sudo kb-kill-daemon detect
-# 2. Uncomment the default group below and set `keyboards` to that name.
+# 1. Find your device's name:     sudo kb-kill-daemon detect
+# 2. Uncomment the default group below and set `keyboards` (or `pointers` /
+#    `devices`) to that name.
 # 3. Keep (or change) the kill/wake combos — both are REQUIRED; there is no
 #    hidden default. Save; it applies live.
 #
 # ─── Groups ──────────────────────────────────────────────────────────────────
-# Each "group" is a set of target keyboards with its own kill/wake hotkeys:
+# Each "group" is a set of target devices with its own kill/wake hotkeys:
 #
 #   * Top-level keys (uncommented, below) form the DEFAULT group, if they include
-#     `keyboards`. Their kill_combo/wake_combo also act as DEFAULTS inherited by
-#     every [groups.*] table (virtual_keyboard is per-group, never inherited).
+#     a matcher field. Their kill_combo/wake_combo also act as DEFAULTS inherited
+#     by every [groups.*] table (`virtual` is per-group, never inherited).
 #   * Each [groups.<name>] table adds another group, inheriting kill_combo /
-#     wake_combo it doesn't set. virtual_keyboard defaults to false per group.
-#   * `keyboards` is a string or a list of strings: case-insensitive substrings
-#     matched against device names. Use keyboards = "*" to match every keyboard.
+#     wake_combo it doesn't set. `virtual` defaults to false per group.
+#   * A group is matched by up to three name fields (case-insensitive; each a
+#     string or list of strings). An entry matches as a substring OR a glob
+#     (fnmatch: * ? [seq]) of the whole device name — so "razer" matches by
+#     substring, "logitech mx*" globs, and a bare "*" matches every device of
+#     that class. At least ONE is required — set several to target them together:
+#       keyboards = ...   → keyboard-class devices only
+#       pointers  = ...   → pointing devices only (mice, trackballs, touchpads)
+#       devices   = ...   → ANY input device, regardless of class
+#   * Optional per group: label = "Laptop keyboard" — a display name the tray
+#     shows instead of the group's table key. Cosmetic only.
 #   * TOML rule: top-level keys MUST come before any [groups.*] table.
-#   * Give each group a DISTINCT combo (a shared combo just kills both groups).
+#   * Give each group a DISTINCT combo (a shared combo just toggles both groups
+#     together — which is how you kill a physical + a virtual target at once).
 #
 # Hotkey tokens are joined by '+'. Modifier aliases match either side: ctrl, alt,
 # shift, super/meta/win. Pin a side with l/r: lctrl, rctrl, lalt, ralt, ...
-# Other tokens: a letter a-z, a raw KEY_* name, or a numeric keycode.
+# Mouse buttons: mouseleft / mouseright / mousemiddle (or a raw BTN_* name) — use
+# these so a killed pointer can self-wake. Other tokens: a letter a-z, a raw
+# KEY_* name, or a numeric keycode.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─── Default group (uncomment + edit to enable) ───────────────────────────────
 # keyboards  = "AT Translated Set 2 keyboard"   # your keyboard (see `detect`)
 # kill_combo = "ctrl+alt+shift+k"               # required — no default
-# wake_combo = "ctrl+alt+shift+u"               # required — no default
+# wake_combo = "ctrl+alt+shift+w"               # required — no default
 #
-# Set true only if this keyboard is fronted by an input-remapper "forwarded"
+# Set true only if this device is fronted by an input-remapper "forwarded"
 # virtual device: kb-kill then targets that virtual device and never the
 # physical one, so input-remapper keeps/regrabs the physical device. Leave false
-# (the default) for an ordinary keyboard, which kb-kill grabs directly.
-# virtual_keyboard = false
+# (the default) for an ordinary device, which kb-kill grabs directly.
+# virtual = false
 
-# ─── A second group (optional) ────────────────────────────────────────────────
-# Inherits the top-level wake_combo unless it sets its own.
+# ─── A pointer group (optional) ───────────────────────────────────────────────
+# Disable mice/touchpads; wake with a mouse-button combo so the pointer can wake
+# itself (or use a keyboard combo and wake it from the keyboard).
+#
+# [groups.pointer]
+# label      = "Mouse & touchpad"     # optional: shown in the tray
+# pointers   = "*"                    # all mice/trackballs/touchpads
+# kill_combo = "ctrl+alt+shift+m"
+# wake_combo = "mouseleft+mouseright"
+
+# ─── A mixed group (optional) ─────────────────────────────────────────────────
+# One hotkey kills a keyboard AND a mouse together.
 #
 # [groups.externals]
 # keyboards  = ["KBDfans", "some-other-keyboard"]
+# pointers   = "Logitech"
 # kill_combo = "ctrl+alt+shift+j"
-# wake_combo = "ctrl+alt+shift+m"
+# wake_combo = "ctrl+alt+shift+n"

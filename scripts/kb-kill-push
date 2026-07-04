@@ -12,9 +12,10 @@ follow the active user automatically.
 It is deliberately separate from the optional tray (`kb-kill-tray`) so config
 push works with no GUI. Stdlib only - no third-party deps.
 
-Security: the config TEXT crosses the socket (never any keystroke). The daemon
-binds the config to this process's kernel-verified uid (SO_PEERCRED) and only
-lets it govern the keyboard while this uid is the active seat user.
+Security: the config TEXT crosses the socket (never any keystroke or button).
+The daemon binds the config to this process's kernel-verified uid (SO_PEERCRED)
+and only lets it govern the input devices (keyboards, mice, touchpads) while
+this uid is the active seat user.
 """
 
 import json

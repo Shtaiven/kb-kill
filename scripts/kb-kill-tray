@@ -5,7 +5,7 @@ Shows whether each kb-kill group is disabled (killed) or active, and lets you
 toggle a group by clicking its menu entry. Talks to the kb-kill service over its
 Unix control socket (see `control_socket_path` in `kb-kill-daemon`).
 
-Runs as its own process so a GUI hiccup can never affect keyboard handling. Uses
+Runs as its own process so a GUI hiccup can never affect input handling. Uses
 the AppIndicator / StatusNotifierItem D-Bus protocol, which works on COSMIC and
 KDE natively, and on GNOME with the AppIndicator shell extension installed.
 
@@ -181,7 +181,9 @@ class Tray:
         if not self.connected:
             self.ind.set_title("kb-kill: connecting…")
         elif any_killed:
-            killed = [g["name"] for g in self.groups if g.get("killed")]
+            killed = [
+                g.get("label") or g["name"] for g in self.groups if g.get("killed")
+            ]
             self.ind.set_title("kb-kill: disabled (" + ", ".join(killed) + ")")
         else:
             self.ind.set_title("kb-kill: all active")
@@ -204,10 +206,12 @@ class Tray:
                 # re-rendered by the shell, so it can't host arbitrary widgets
                 # (a Gtk.Switch is dropped). A CheckMenuItem maps to dbusmenu's
                 # checkmark toggle: it renders, and clicking anywhere on the row
-                # toggles it. The check (on = keyboard active/awake) is the
+                # toggles it. The check (on = group active/awake) is the
                 # switch. set_active() runs before connect(), so rebuilding the
                 # menu from the daemon's broadcast never re-fires the handler.
-                item = Gtk.CheckMenuItem(label=g["name"])
+                # Show the config's display label when set; commands still
+                # address the group by its real name.
+                item = Gtk.CheckMenuItem(label=g.get("label") or g["name"])
                 item.set_active(not killed)
                 item.connect("toggled", self._on_toggle, g["name"])
                 menu.append(item)

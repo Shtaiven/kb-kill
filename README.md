@@ -4,15 +4,22 @@
 
 # kb-kill
 
-Disable/enable a target keyboard with a global hotkey, as a background service.
+Disable/enable a target keyboard, mouse, or touchpad with a global hotkey, as a
+background service.
 
 Press the **kill** hotkey on *any* keyboard to disable a target keyboard (e.g.
 the laptop's built-in keyboard). While disabled, every key from the target is
-swallowed **except** the **wake** hotkey — so the target keyboard can always
+swallowed **except** the **wake** hotkey — so a killed keyboard can always
 wake itself. There is no way to lock yourself out.
 
+It works for **mice and touchpads** too: a group can target pointing devices
+(`pointers`) or any input device (`devices`), and even a keyboard and a mouse
+together. A killed pointer self-wakes with a mouse-button combo, or you wake it
+from the keyboard — see [Configuration](#configuration).
+
 Typical use: your cat is sitting on your laptop keyboard while you're working on
-an external keyboard. Kill the laptop keyboard with a hotkey!
+an external keyboard. Kill the laptop keyboard with a hotkey! Or disable the
+touchpad so your palm stops moving the cursor while you type.
 
 ## Quick Start
 
@@ -23,13 +30,13 @@ again for services to start.
 **Debian / Ubuntu / Pop!\_OS** (`.deb`, needs Python ≥ 3.11 — Ubuntu 24.04+):
 
 ```sh
-sudo apt install ./kb-kill_0.1.0_all.deb
+sudo apt install ./kb-kill_0.2.0_all.deb
 ```
 
 **Fedora / RHEL** (`.rpm`):
 
 ```sh
-sudo dnf install ./kb-kill-0.1.0-1.noarch.rpm
+sudo dnf install ./kb-kill-0.2.0-1.noarch.rpm
 ```
 
 After installing, kb-kill does nothing until you define a group: edit
@@ -57,14 +64,14 @@ you don't trust!
 - "Disable" means an exclusive `EVIOCGRAB` on the target device: the kernel
   routes its events only to kb-kill, which drops them.
 - The grab happens **only while killed**. When awake, kb-kill merely *monitors*
-  keyboards (reads, never grabs, never re-injects), so normal typing is 100%
-  native and a crash of the service cannot break your keyboard. The kernel also
-  releases every grab automatically if the process dies.
-- Hotkeys are matched **globally** (across the union of all keyboards), not
-  per-device — see [input-remapper](#input-remapper-coexistence) for why that
+  devices (reads, never grabs, never re-injects), so normal typing and pointing is
+  100% native and a crash of the service cannot break your keyboard or mouse. The
+  kernel also releases every grab automatically if the process dies.
+- Hotkeys are matched **globally** (across the union of all monitored devices),
+  not per-device — see [input-remapper](#input-remapper-coexistence) for why that
   matters.
 - No virtual device. kb-kill runs as a **hardened root system daemon** so that no
-  ordinary user process needs access to your keyboards — see
+  ordinary user process needs access to your keyboards or mice — see
   [Security model](#security-model).
 - **It follows whoever is logged in.** The daemon has no config of its own: a tiny
   per-user service (`kb-kill-push`) hands it your config, and the daemon uses the
@@ -180,12 +187,34 @@ A simple single-keyboard config:
 keyboards  = "AT Translated Set 2 keyboard"
 kill_combo = "ctrl+alt+shift+k"   # required — no default hotkey exists
 wake_combo = "ctrl+alt+shift+u"   # required; always honored on the killed keyboard
-virtual_keyboard = true           # input-remapper-managed; see coexistence below
+virtual    = true                 # input-remapper-managed; see coexistence below
 ```
 
-`keyboards` is a string or a list of strings — case-insensitive substrings
-matched against device names (`kb-kill-daemon detect` shows the names). Use
-`keyboards = "*"` to match **every** keyboard.
+A group picks its targets with up to three **name-matcher fields**, each a string
+or a list of strings, matched case-insensitively against device names
+(`kb-kill-daemon detect` shows the names). Each entry matches as a **substring**
+*or* a **glob** (`fnmatch`: `*`, `?`, `[seq]`) of the whole name — so `"razer"`
+matches by substring, `"logitech mx*"` globs, and a bare `"*"` matches every
+device of that class. **At least one** field is required:
+
+| field       | matches                                                 |
+| ----------- | ------------------------------------------------------- |
+| `keyboards` | keyboard-class devices only                             |
+| `pointers`  | pointing devices only — mice, trackballs, and touchpads |
+| `devices`   | **any** input device, regardless of class               |
+
+Set several fields to target them together — e.g. `keyboards` **and** `pointers`
+in one group disables a keyboard and a mouse on the same hotkey. A pointer group
+can **self-wake** if its `wake_combo` is a mouse-button combo (see
+[Hotkey syntax](#hotkey-syntax)); otherwise wake it from the keyboard. Killing a
+touchpad while typing on an external keyboard is a common use:
+
+```toml
+[groups.pointer]
+pointers   = "*"
+kill_combo = "ctrl+alt+shift+m"
+wake_combo = "mouseleft+mouseright"   # the pointer wakes itself
+```
 
 The config is **applied live**: edit the file and `kb-kill-push` re-pushes it within
 ~1 s. A group that is currently killed keeps that state across an edit (so a re-push
@@ -194,10 +223,13 @@ error is logged and the previous config is kept. (Switching to a *different* use
 however, always starts that user's config **awake** — see
 [Multiple users](#multiple-users).) The tray updates its menu automatically.
 
-`virtual_keyboard` (default `false`): set `true` when the keyboard is fronted by
-an input-remapper "forwarded" virtual device — kb-kill then targets that virtual
-device and never the physical one. Leave it `false` for an ordinary keyboard,
-which kb-kill grabs directly.
+`virtual` (default `false`; the old name `virtual_keyboard` still works as a
+deprecated alias): set `true` when the target is fronted by an input-remapper
+"forwarded" virtual device — kb-kill then targets that virtual device and never
+the physical one. Leave it `false` for an ordinary device, which kb-kill grabs
+directly. The flag is **group-wide**, so a single group is either all-forwarded or
+match-anything; to disable a *physical* target and a *virtual* one at once, use
+two groups sharing the same `kill_combo`/`wake_combo` — they toggle together.
 
 ### Multiple users
 
@@ -212,37 +244,43 @@ active user has a config (e.g. the login screen), the daemon is idle and every
 keyboard works normally. Each user's config is `~/.config/kb-kill/kb-kill.toml`,
 falling back to the system default `/etc/kb-kill/kb-kill.toml`.
 
-### Groups: per-keyboard hotkeys
+### Groups: per-device hotkeys
 
 You can define several independent **groups**, each with its own target
-keyboards and its own kill/wake hotkeys:
+devices and its own kill/wake hotkeys:
 
-- The **top-level** keys (above) are the **default group** (when they include
-  `keyboards`) and also supply **defaults** that every `[groups.*]` inherits.
+- The **top-level** keys (above) are the **default group** (when they include a
+  matcher field) and also supply **defaults** that every `[groups.*]` inherits.
 - Each **`[groups.<name>]`** table adds a group; it inherits `kill_combo` and
   `wake_combo` from the top-level unless it sets its own — but there is **no
   built-in default**, so each combo must be set *somewhere* (top-level or the
-  group itself), else the group is rejected. `virtual_keyboard` is per-group
+  group itself), else the group is rejected. `virtual` is per-group
   (default `false`) and is **not** inherited.
+- An optional **`label = "…"`** per group sets a display name the tray shows
+  instead of the group's table key (e.g. `label = "Mouse & touchpad"` for
+  `[groups.pointer]`). Cosmetic only — logs, `detect`, and control commands
+  keep using the table key.
 - TOML rule: top-level keys must come **before** any `[groups.*]` table.
-- Give each group a **distinct** combo — a shared combo simply kills both.
+- Give each group a **distinct** combo — a shared combo toggles them together
+  (handy for mixing a physical and a virtual target across two groups).
 
 ```toml
 wake_combo = "ctrl+alt+shift+u"               # default, inherited below
 
 keyboards  = "AT Translated Set 2 keyboard"   # default group (the laptop)
 kill_combo = "ctrl+alt+shift+k"
-virtual_keyboard = true                       # input-remapper-managed
+virtual    = true                             # input-remapper-managed
 
 [groups.externals]
 keyboards  = ["KBDfans", "solaar-keyboard"]
+pointers   = "Logitech"                       # kill this keyboard + mouse together
 kill_combo = "ctrl+alt+shift+j"
 wake_combo = "ctrl+alt+shift+m"               # overrides the default
-# virtual_keyboard defaults to false → grabbed directly
+# virtual defaults to false → grabbed directly
 ```
 
 Any keyboard can trigger any group's hotkey, and each group kills/wakes
-independently. Groups should target **disjoint** keyboards; if they overlap, a
+independently. Groups should target **disjoint** devices; if they overlap, a
 device stays disabled while *any* group targeting it is killed.
 
 ### Hotkey syntax
@@ -250,15 +288,20 @@ device stays disabled while *any* group targeting it is killed.
 Tokens joined by `+`. Each token is an "any-of" group; the combo fires when
 every group has at least one key held.
 
-| token                                               | matches                     |
-| --------------------------------------------------- | --------------------------- |
-| `ctrl` / `control`                                  | either Ctrl                 |
-| `lctrl` / `rctrl`                                   | left / right Ctrl only      |
-| `alt`                                               | either Alt (`ralt` = AltGr) |
-| `shift`                                             | either Shift                |
-| `super` / `meta` / `win` / `cmd`                    | either Super                |
-| `lalt`/`ralt`, `lshift`/`rshift`, `lsuper`/`rsuper` | pin a side                  |
-| `a`–`z`, a raw `KEY_*` name, or a numeric code      | that single key             |
+| token                                                  | matches                           |
+| ------------------------------------------------------ | --------------------------------- |
+| `ctrl` / `control`                                     | either Ctrl                       |
+| `lctrl` / `rctrl`                                      | left / right Ctrl only            |
+| `alt`                                                  | either Alt (`ralt` = AltGr)       |
+| `shift`                                                | either Shift                      |
+| `super` / `meta` / `win` / `cmd`                       | either Super                      |
+| `lalt`/`ralt`, `lshift`/`rshift`, `lsuper`/`rsuper`    | pin a side                        |
+| `mouseleft` / `mouseright` / `mousemiddle`             | mouse buttons (pointer self-wake) |
+| `a`–`z`, a raw `KEY_*`/`BTN_*` name, or a numeric code | that single key                   |
+
+Mouse-button tokens (`mouseleft`, or any raw `BTN_*` name like `BTN_SIDE`) let a
+killed pointer wake itself — a killed device is still read for combo matching, so
+its own buttons can trigger the wake combo.
 
 ## Commands
 
@@ -299,11 +342,14 @@ systemctl --user stop  kb-kill-tray    # or stop it; it returns on next login
   "tray" line for your distro in [Requirements](#requirements).
 - The icons are installed to `/usr/local/share/kb-kill/icons/` and the menu lists
   every group from your config, so multiple groups each get their own toggle entry.
+  A group's optional `label = "…"` config key sets the text shown here.
 
 The control socket is also a small JSON line protocol if you want to script it:
 send `{"cmd":"toggle","group":"<name>"}` (or `kill`/`wake`/`status`) — accepted only
 while you are the active user; the service replies/broadcasts
-`{"type":"state","groups":[{"name","killed","targets"}]}`. (Config is delivered the
+`{"type":"state","groups":[{"name","label","killed","targets"}]}` (`label` is the
+group's display label from the config, falling back to the group name).
+(Config is delivered the
 same way: `{"cmd":"set_config","toml":"<text>"}`, which is what `kb-kill-push` sends.)
 
 ## input-remapper coexistence
@@ -316,12 +362,14 @@ When input-remapper manages a keyboard it grabs the **physical** device (e.g.
 - a per-keyboard `…forwarded` device for **un-remapped** (passthrough) keys, and
 - the shared `input-remapper keyboard` device for the **output of mappings**.
 
-Mark such a group **`virtual_keyboard = true`** and kb-kill targets the
+Mark such a group **`virtual = true`** and kb-kill targets the
 **forwarded** (virtual) device and **never the physical one**, so input-remapper
 can always (re)grab the physical keyboard — including across an input-remapper
 restart (kb-kill re-attaches by name). If the forwarded device isn't present
-(input-remapper not running), a `virtual_keyboard` group simply grabs nothing
-rather than risk fighting input-remapper for the physical device.
+(input-remapper not running), a `virtual` group simply grabs nothing
+rather than risk fighting input-remapper for the physical device. (This applies to
+pointers too — input-remapper can forward mice — so `virtual` is no longer
+keyboard-specific; the old name `virtual_keyboard` remains a deprecated alias.)
 
 Two consequences worth knowing:
 
@@ -337,23 +385,27 @@ Two consequences worth knowing:
    they exist **after** remapping (e.g. if CapsLock is mapped to Ctrl, press
    CapsLock for the `ctrl` token).
 
-For a keyboard that input-remapper doesn't manage, leave `virtual_keyboard`
+For a keyboard that input-remapper doesn't manage, leave `virtual`
 at its default (`false`) and kb-kill grabs the physical keyboard directly.
 
 ## Security model
 
-kb-kill reads all keyboard input, so it is keylogger-*capable*. The design
-minimizes and contains that:
+kb-kill reads all keyboard input (and mouse buttons, for pointer groups), so it is
+keylogger-*capable*. The design minimizes and contains that:
 
 - **No keystrokes are ever stored or transmitted.** The daemon keeps only the set
-  of keys *currently held* (for combo matching) and discards them on key-up —
-  there is no history, no log, no file, no network. The control socket carries
-  config text + group state (`{name, killed, targets}`), **never key data**.
+  of keys/buttons *currently held* (for combo matching) and discards them on
+  release — there is no history, no log, no file, no network. Pointer **motion** is
+  never processed at all (only `EV_KEY` button events are). The control socket
+  carries config text + group state (`{name, label, killed, targets}`), **never key
+  data**.
   (`kb-kill-daemon monitor` is a manual debug tool that prints to the terminal; the
   service never does.)
-- **Reading input is confined to one process.** Keyboard access lives entirely in
+- **Reading input is confined to one process.** Device access lives entirely in
   this single audited, sandboxed root daemon — no ordinary user process needs (or
-  is granted) access to your keyboards.
+  is granted) access to your keyboards or mice. Pointer devices are only opened when
+  a live config references them (`pointers`/`devices`); a keyboard-only config never
+  touches them.
 - **The daemon binary is root-owned** (`/usr/local/bin/kb-kill-daemon`), never your
   user-writable working tree — a root service running a user-writable script
   would be a privilege-escalation hole. (Config never executes — it is parsed as
