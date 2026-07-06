@@ -48,6 +48,18 @@ ICON_AWAKE = "kb-kill-awake"
 ICON_KILLED = "kb-kill-killed"
 RECONNECT_SECONDS = 2
 
+# Badge shown in the lower right of the killed icon when 2+ groups are killed.
+# AppIndicator has no overlay-icon API, so the badge is baked into a generated
+# SVG variant and selected by icon name.
+BADGE_MAX = 9  # counts above this render as "9+"
+BADGE_SVG = (
+    '<circle cx="72" cy="72" r="28" fill="#FF0000" stroke="white" stroke-width="5"/>'
+    # y is the text baseline, placed by hand: librsvg versions in the wild
+    # ignore dominant-baseline, which would anchor the digit's bottom at cy.
+    '<text x="72" y="86" fill="white" font-family="sans-serif" font-size="40"'
+    ' font-weight="bold" text-anchor="middle">{n}</text>'
+)
+
 
 def icon_dir() -> str | None:
     """Locate the tray icons. Prefer icons shipped in the project tree (this
@@ -82,14 +94,36 @@ def socket_path() -> str:
     return candidates[0]
 
 
+def badge_icon_dir(base: str) -> str | None:
+    """A per-user writable icon dir seeded with the base icons, so generated
+    badge variants can live next to them (the indicator has a single icon theme
+    path, and the installed icons dir is root-owned). Returns None on failure;
+    the tray then falls back to the read-only dir and plain icons."""
+    root = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/kb-kill-{os.getuid()}"
+    d = os.path.join(root, "kb-kill-tray-icons")
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        for name in (ICON_AWAKE, ICON_KILLED):
+            shutil.copyfile(
+                os.path.join(base, name + ".svg"), os.path.join(d, name + ".svg")
+            )
+    except OSError as e:
+        sys.stderr.write(f"kb-kill-tray: no writable icon dir ({e}); no badges\n")
+        return None
+    return d
+
+
 class Tray:
     def __init__(self) -> None:
         self.ind = AppIndicator3.Indicator.new(
             APP_ID, ICON_AWAKE, AppIndicator3.IndicatorCategory.HARDWARE
         )
         icons = icon_dir()
-        if icons:
-            self.ind.set_icon_theme_path(icons)
+        self.icons = icons
+        self.badge_dir = badge_icon_dir(icons) if icons else None
+        self._badges_made: set[str] = set()
+        if self.badge_dir or icons:
+            self.ind.set_icon_theme_path(self.badge_dir or icons)
         self.ind.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
         self.ind.set_title("kb-kill")
         self.sock: socket.socket | None = None
@@ -175,9 +209,33 @@ class Tray:
             self._drop()
 
     # -- UI ------------------------------------------------------------------ #
+    def _killed_icon(self, count: int) -> str:
+        """Icon name for `count` killed groups (count >= 1). For 2+, generate
+        (once) a killed-icon variant with a count badge in the lower right."""
+        if count < 2 or self.badge_dir is None or self.icons is None:
+            return ICON_KILLED
+        label = str(count) if count <= BADGE_MAX else f"{BADGE_MAX}+"
+        name = f"{ICON_KILLED}-{count if count <= BADGE_MAX else 'more'}"
+        if name in self._badges_made:
+            return name
+        try:
+            with open(os.path.join(self.icons, ICON_KILLED + ".svg")) as f:
+                svg = f.read()
+            svg = svg.replace("</svg>", BADGE_SVG.format(n=label) + "</svg>")
+            with open(os.path.join(self.badge_dir, name + ".svg"), "w") as f:
+                f.write(svg)
+        except OSError as e:
+            sys.stderr.write(f"kb-kill-tray: cannot write badge icon: {e}\n")
+            return ICON_KILLED
+        self._badges_made.add(name)
+        return name
+
     def _render(self) -> None:
-        any_killed = any(g.get("killed") for g in self.groups)
-        self.ind.set_icon_full(ICON_KILLED if any_killed else ICON_AWAKE, "kb-kill")
+        n_killed = sum(1 for g in self.groups if g.get("killed"))
+        any_killed = n_killed > 0
+        self.ind.set_icon_full(
+            self._killed_icon(n_killed) if any_killed else ICON_AWAKE, "kb-kill"
+        )
         if not self.connected:
             self.ind.set_title("kb-kill: connecting…")
         elif any_killed:
