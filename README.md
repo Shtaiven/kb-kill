@@ -316,6 +316,32 @@ kb-kill-daemon -c PATH run    # run with a specific config pinned live (ad-hoc t
 requires root. The service itself (`kb-kill-daemon run` with no `-c`) starts
 config-less and waits for `kb-kill-push`.
 
+### Debugging a wake that won't fire
+
+An exclusive grab routes a device's events to the grabber only, so **`monitor`
+cannot show events from a device the daemon (or input-remapper) has grabbed** —
+while a group is killed, its target devices look silent in `monitor` even though
+the daemon is receiving every event. Both `detect` and `monitor` flag such
+devices (`GRABBED by another process`). To see what the *daemon* sees instead:
+
+- **Wake-progress journal lines.** While a group is killed, the daemon logs a
+  line to `journalctl -u kb-kill-daemon` every time the held part of the wake
+  combo changes, e.g. \`[laptop] wake progress: 3/4 tokens held (missing: ctrl)
+
+  - last event from 'input-remapper keyboard'\`. Press the wake combo one key at
+    a time and watch which token never registers (and from which device the keys
+    arrive). Only combo token names are logged, never other keys.
+
+- **`devices` control command.** Ask the running daemon what it monitors/grabs:
+
+  ```sh
+  printf '{"cmd":"devices"}\n' | nc -U /run/kb-kill/control.sock -q1
+  ```
+
+  Each entry shows the device's class, whether it is a virtual (uinput) device,
+  whether the daemon currently has it grabbed, and how many keys it currently
+  holds down (counts only — never which keys).
+
 ## Tray icon
 
 `kb-kill-tray` is an optional tray icon (StatusNotifierItem) that shows whether

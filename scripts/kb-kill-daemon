@@ -350,10 +350,14 @@ class Group:
         self.virtual = virtual
         self.kill_raw = kill_raw  # original strings (for display)
         self.wake_raw = wake_raw
+        # wake token names, aligned index-for-index with wake_combo (used by
+        # the wake-progress debug log to name missing tokens)
+        self.wake_tokens = [t.strip() for t in wake_raw.split("+") if t.strip()]
         # runtime state (managed by KbKill)
         self.targets: dict[str, InputDevice] = {}  # path -> InputDevice
         self.killed = False
         self.warned_empty = False  # zero-match warning emitted (reset on match)
+        self.wake_progress: tuple[bool, ...] | None = None  # last logged (debug)
 
 
 class Config:
@@ -634,6 +638,22 @@ def is_virtual(dev: InputDevice) -> bool:
     phys = (dev.phys or "").lower()
     name = (dev.name or "").lower()
     return "uinput" in phys or "forwarded" in name or "input-remapper" in name
+
+
+def grabbed_elsewhere(dev: InputDevice) -> bool:
+    """True when another process holds an exclusive grab on `dev` (probed by
+    attempting a grab: EBUSY means someone else has it). That process may be
+    input-remapper (it grabs the physical device it fronts) or the kb-kill
+    daemon itself while a group is killed. Skipped while keys are held so the
+    momentary probe grab can't swallow a key-up and leave a key stuck down."""
+    try:
+        if dev.active_keys():
+            return False
+        dev.grab()
+        dev.ungrab()
+    except OSError as e:
+        return e.errno == errno.EBUSY
+    return False
 
 
 def open_devices(want_pointers: bool = False) -> dict[str, InputDevice]:
@@ -1019,7 +1039,38 @@ class KbKill:
             pressed.discard(event.code)
         else:  # autorepeat (2) - ignore for combos
             return
+        self._log_wake_progress(path)
         self._reconcile_grabs()
+
+    def _log_wake_progress(self, path: str) -> None:
+        """Debug aid for "wake doesn't fire": while a group is killed, log how
+        much of its wake combo is currently held whenever that changes, plus
+        which device delivered the deciding event.
+
+        Security note: this logs only combo *token names* (config data, e.g.
+        "ctrl") and their held/not-held state, and only while the group is
+        killed — never raw keycodes — so nothing typed can reach the journal.
+        """
+        held: set[int] | None = None
+        for group in self.groups:
+            if not group.killed:
+                group.wake_progress = None
+                continue
+            if held is None:
+                held = self._global_pressed()
+            progress = tuple(bool(tok & held) for tok in group.wake_combo)
+            if progress == group.wake_progress:
+                continue
+            group.wake_progress = progress
+            missing = [t for t, ok in zip(group.wake_tokens, progress) if not ok]
+            dev = self.devices.get(path)
+            src = dev.name if dev is not None else path
+            log(
+                f"[{group.name}] wake progress: {sum(progress)}/{len(progress)} "
+                f"tokens held"
+                + (f" (missing: {'+'.join(missing)})" if missing else "")
+                + f" - last event from {src!r}"
+            )
 
     def _read_device(self, dev: InputDevice, path: str) -> None:
         try:
@@ -1207,6 +1258,30 @@ class KbKill:
                 self._send(conn, self._state_dict())
             return
 
+        # devices: dump what the daemon is monitoring/grabbing right now
+        # (debug aid). Names, classes, and held-key COUNTS only — never
+        # keycodes — so no key data crosses the socket.
+        if cmd == "devices":
+            if uid in (0, self.live_uid):
+                self._send(
+                    conn,
+                    {
+                        "type": "devices",
+                        "devices": [
+                            {
+                                "path": p,
+                                "name": d.name,
+                                "class": "ptr" if is_pointer(d) else "kbd",
+                                "virtual": is_virtual(d),
+                                "grabbed": p in self.grabbed,
+                                "held_keys": len(self.pressed.get(p, ())),
+                            }
+                            for p, d in sorted(self.devices.items())
+                        ],
+                    },
+                )
+            return
+
         # kill/wake/toggle: only the user whose config is currently live (or root).
         if uid not in (0, self.live_uid):
             log(f"control: rejected {cmd!r} from uid {uid} (not the live user)")
@@ -1388,7 +1463,10 @@ def cmd_detect(config: Config) -> int:
             )
         else:
             mark = "monitored only (can trigger any hotkey)"
-        print(f"  {path:24} [{cls}/{virt}] {dev.name}")
+        grab = (
+            " [GRABBED by another process right now]" if grabbed_elsewhere(dev) else ""
+        )
+        print(f"  {path:24} [{cls}/{virt}] {dev.name}{grab}")
         print(f"  {'':24}   {mark}")
 
     empty = [g for g in config.groups if not g.targets]
@@ -1426,6 +1504,22 @@ def cmd_monitor(config: Config) -> int:
     if not devices:
         print("No input devices found.")
         return 1
+
+    # An exclusive grab by another process routes a device's events away from
+    # this monitor entirely — the #1 "my keys don't show up" confusion. Two
+    # common grabbers: input-remapper (always grabs the physical device it
+    # fronts) and the kb-kill daemon itself (grabs a group's targets while
+    # that group is killed).
+    hidden = [
+        (path, dev.name) for path, dev in devices.items() if grabbed_elsewhere(dev)
+    ]
+    if hidden:
+        print("NOTE: exclusively grabbed by another process (input-remapper, or")
+        print("the kb-kill daemon while a group is killed) — events from these")
+        print("devices will NOT appear below:")
+        for path, name in sorted(hidden):
+            print(f"  {path:20} {name}")
+        print()
 
     sel = selectors.DefaultSelector()
     pressed: dict[str, set[int]] = {}

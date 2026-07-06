@@ -148,6 +148,11 @@ keystrokes**. Commands:
 - `{"cmd":"kill|wake|toggle|status","group":"<name>"}` — only from the **live** uid (or
   root). The daemon replies/broadcasts `{"type":"state","groups":[…]}` only to the live
   uid/root.
+- `{"cmd":"devices"}` — live uid/root only: dump monitored devices (name, class,
+  virtual, grabbed-by-us, held-key *count* — never keycodes). Debug aid; pairs with the
+  wake-progress journal lines (`_log_wake_progress`: while a group is killed, log which
+  wake-combo *tokens* are held whenever that set changes — token names are config data,
+  so the no-key-data invariant holds).
 
 Authorization is per-command by kernel-verified peer uid (`SO_PEERCRED`), moved from
 connect-time to command-time. DoS bounds: `MAX_CLIENTS` (global) + `MAX_CONNS_PER_UID`
