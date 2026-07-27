@@ -76,6 +76,11 @@ except ImportError:
     sys.exit(1)
 
 
+# Suite version. Source of truth is the VERSION file at the repo root; this
+# constant is rewritten by packaging/bump-version.sh — don't edit it by hand.
+VERSION = "0.2.1"
+
+
 # --------------------------------------------------------------------------- #
 # Modifier aliases
 #
@@ -1824,6 +1829,14 @@ def main(argv: list[str] | None = None) -> int:
         "show your setup; for `run` it pins that config live "
         "for ad-hoc testing (the service instead receives "
         "config from the active user via kb-kill-push).",
+    )
+    # The path disambiguates a package install (/usr/bin) from an install.sh
+    # deploy (/usr/local/bin) when both are present.
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"kb-kill-daemon {VERSION} ({Path(__file__).resolve()})",
     )
     args = parser.parse_args(argv)
 

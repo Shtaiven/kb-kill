@@ -28,6 +28,9 @@ from pathlib import Path
 POLL_SECONDS = 1.0  # how often to check the config file for edits
 RECONNECT_SECONDS = 2.0  # backoff between connection attempts
 
+# Rewritten by packaging/bump-version.sh; the repo-root VERSION file is canonical.
+VERSION = "0.2.1"
+
 
 def log(msg: str) -> None:
     sys.stderr.write(f"kb-kill-push: {msg}\n")
@@ -160,6 +163,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] and sys.argv[1] in ("-V", "--version"):
+        print(f"kb-kill-push {VERSION} ({Path(__file__).resolve()})")
+        sys.exit(0)
     try:
         sys.exit(main())
     except KeyboardInterrupt:

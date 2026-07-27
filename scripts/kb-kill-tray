@@ -23,7 +23,15 @@ import socket
 import subprocess
 import sys
 
-import gi
+# Rewritten by packaging/bump-version.sh; the repo-root VERSION file is canonical.
+VERSION = "0.2.1"
+
+# Answer --version before the gi imports so it works without GTK/AppIndicator.
+if __name__ == "__main__" and sys.argv[1:] and sys.argv[1] in ("-V", "--version"):
+    print(f"kb-kill-tray {VERSION} ({os.path.realpath(__file__)})")
+    sys.exit(0)
+
+import gi  # noqa: E402
 
 gi.require_version("Gtk", "3.0")
 try:

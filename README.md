@@ -30,13 +30,13 @@ again for services to start.
 **Debian / Ubuntu / Pop!\_OS** (`.deb`, needs Python ≥ 3.11 — Ubuntu 24.04+):
 
 ```sh
-sudo apt install ./kb-kill_0.2.0_all.deb
+sudo apt install ./kb-kill_*_all.deb
 ```
 
 **Fedora / RHEL** (`.rpm`):
 
 ```sh
-sudo dnf install ./kb-kill-0.2.0-1.noarch.rpm
+sudo dnf install ./kb-kill-*.noarch.rpm
 ```
 
 After installing, kb-kill does nothing until you define a group: edit

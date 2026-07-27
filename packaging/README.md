@@ -15,11 +15,32 @@ admin and off-limits to package managers). The repo's systemd units and
 `.desktop` files point at `/usr/local/*` for `install.sh`; both build paths
 rewrite those to `/usr/*`.
 
+## Versioning (single source of truth)
+
+The `VERSION` file at the repo root is canonical. The `VERSION = "..."`
+constants in the three scripts (what `--version` prints) and `pkgver=` in
+`aur/PKGBUILD` are copies kept in sync by `bump-version.sh`; the release
+workflow runs `bump-version.sh --check <tag>` before building, so a tag that
+disagrees with any copy fails the release. README install commands use
+wildcards instead of version literals so the docs can't rot.
+
+## Cutting a release
+
+```sh
+packaging/bump-version.sh 0.3.0    # rewrites VERSION + every synced copy
+                                   # (or --patch / --minor / --major to auto-increment)
+git commit -am "chore: release 0.3.0"
+git tag v0.3.0 && git push origin main v0.3.0   # CI builds + attaches .deb/.rpm
+# AUR, after the tag is published:
+cd packaging/aur && updpkgsums && makepkg --printsrcinfo > .SRCINFO
+```
+
 ## Build .deb + .rpm
 
 ```sh
 # install nfpm once: https://nfpm.goreleaser.com/install/ (single static binary)
-packaging/build-packages.sh 0.1.0      # -> packaging/dist/*.deb, *.rpm
+packaging/build-packages.sh        # -> packaging/dist/*.deb, *.rpm
+                                   # version defaults to the VERSION file
 ```
 
 ## Build / publish the AUR package

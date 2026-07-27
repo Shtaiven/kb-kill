@@ -2,7 +2,7 @@
 #
 # Build kb-kill .deb and .rpm packages with nfpm.
 #
-#   packaging/build-packages.sh [VERSION]   # default version: 0.1.0
+#   packaging/build-packages.sh [VERSION]   # default: the repo-root VERSION file
 #
 # Output lands in packaging/dist/. Requires `nfpm` on PATH (a single static Go
 # binary — https://nfpm.goreleaser.com/install/). No root, no Docker needed.
@@ -16,7 +16,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 cd "$REPO_DIR"
 
-export KB_KILL_VERSION="${1:-0.1.0}"
+export KB_KILL_VERSION="${1:-$(tr -d '[:space:]' < VERSION)}"
 BUILD="packaging/build"
 DIST="packaging/dist"
 

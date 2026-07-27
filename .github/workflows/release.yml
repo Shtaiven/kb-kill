@@ -17,6 +17,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Check version consistency
+        # The tag is the released version; the VERSION file, the scripts'
+        # --version constants, and the AUR pkgver must all agree, or the
+        # release fails here instead of shipping mismatched artifacts.
+        run: packaging/bump-version.sh --check "${GITHUB_REF_NAME#v}"
+
       - name: Install nfpm
         run: |
           echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' \

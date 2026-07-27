@@ -65,6 +65,13 @@ systemctl --user restart kb-kill-tray    # optional UI
 sudo systemctl edit kb-kill-daemon # [Service] Environment=KB_KILL_DEBUG_KEYS=1 + LogLevelMax=debug
 ```
 
+**Versioning:** the repo-root `VERSION` file is the single source of truth.
+`packaging/bump-version.sh X.Y.Z` rewrites it plus every synced copy (the
+`VERSION = "..."` constant in each script — what `--version` prints — and the AUR
+`pkgver=`); never edit those copies by hand. `release.yml` runs
+`bump-version.sh --check <tag>` so an out-of-sync tag fails the release. Keep
+version literals out of README/docs (use wildcards).
+
 There is no lint/test/build step. To run the daemon unprivileged for ad-hoc testing,
 run `./scripts/kb-kill-daemon run -c some.toml` directly: `-c` pins that file live
 (bypassing seat arbitration, so you don't need a pusher) and falls back to a user
