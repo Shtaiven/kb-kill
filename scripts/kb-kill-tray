@@ -24,7 +24,7 @@ import subprocess
 import sys
 
 # Rewritten by packaging/bump-version.sh; the repo-root VERSION file is canonical.
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 
 # Answer --version before the gi imports so it works without GTK/AppIndicator.
 if __name__ == "__main__" and sys.argv[1:] and sys.argv[1] in ("-V", "--version"):

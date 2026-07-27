@@ -78,7 +78,7 @@ except ImportError:
 
 # Suite version. Source of truth is the VERSION file at the repo root; this
 # constant is rewritten by packaging/bump-version.sh — don't edit it by hand.
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 
 
 # --------------------------------------------------------------------------- #
