@@ -48,6 +48,7 @@ import fnmatch
 import json
 import os
 import pwd
+import re
 import selectors
 import signal
 import socket
@@ -191,6 +192,18 @@ MAX_LINE = 65536  # bytes buffered per client before a newline; drop if exceeded
 # (a full set_config TOML payload, JSON-escaped, must fit)
 HANDSHAKE_SECONDS = 10  # drop a connection that sends no valid command in this long
 
+# Group names and labels are echoed into the system log and the tray, so restrict
+# them to a boring charset. TOML allows quoted keys with escapes, so
+# [groups."x\nJul 27 00:00:00 host sshd[1]: Accepted password for root"] is a
+# legal group name - without this, any local uid could forge journal records under
+# kb-kill's identifier. (log() sanitizes too; this rejects at the door so the name
+# shown in the tray and in error text is sane as well.) This is a charset check
+# only - there is deliberately NO cap on how many groups a config may define.
+GROUP_NAME_RE = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9 ._-]{0,31}\Z")
+# A `label` is free display text ("Mouse & touchpad"), so it is only bounded and
+# checked for control characters, not restricted to the name charset.
+LABEL_MAX_LEN = 64
+
 # logind exposes the foreground session's user per seat here, as ACTIVE_UID=.
 # We read this file (systemd marks it "do not parse", so we parse defensively and
 # tolerate any field being absent) rather than dlopen libsystemd for
@@ -227,9 +240,120 @@ def control_socket_path() -> str:
     return f"/tmp/kb-kill-{os.getuid()}.sock"
 
 
-def log(msg: str) -> None:
-    sys.stderr.write(f"kb-kill: {msg}\n")
+# --------------------------------------------------------------------------- #
+# Journal hygiene
+# --------------------------------------------------------------------------- #
+# Everything the SERVICE writes to stderr lands in the system journal, which on a
+# stock Debian/Ubuntu/Pop!_OS desktop is readable by group `adm` (the primary user
+# is in it) and is mirrored into /var/log/syslog (root:adm 0640) when journald
+# forwards to syslog. Because `set_config` is accepted from ANY local uid by
+# design, every log site is a channel an unprivileged, otherwise-sandboxed process
+# can shape - push a config with one group per key, named after that key, and the
+# daemon's own log becomes a keylogger. Three rules, enforced here rather than at
+# 40-odd call sites:
+#   1. Nothing that fires at per-key-event rate may reach the journal - even with
+#      no key identity, the TIMING is a password side channel. Those lines go
+#      through log_keys(), off unless KB_KILL_DEBUG_KEYS=1, and marked <7>/debug.
+#   2. State/config/control lines go through a token bucket, so a hostile config
+#      cannot turn KILLED/WOKEN into a per-keystroke record.
+#   3. Attacker-supplied text (group names, labels, device names, parse errors) is
+#      flattened to one printable, length-capped line: a TOML quoted key may
+#      legally contain "\n", which would otherwise forge journal records.
+LOG_MAX_LEN = 400
+_LOG_UNSAFE = re.compile(r"[\x00-\x1f\x7f]")
+
+# syslog priorities. systemd parses a leading "<N>" on stderr (SyslogLevelPrefix=yes
+# is the default), which is what lets the unit's LogLevelMax= drop a whole class.
+# Suppressed on a tty so `-c` dev runs and detect/monitor stay readable.
+PRI_ERR, PRI_WARN, PRI_NOTICE, PRI_INFO, PRI_DEBUG = 3, 4, 5, 6, 7
+try:
+    _LOG_PREFIX = not sys.stderr.isatty()
+except (AttributeError, ValueError):
+    _LOG_PREFIX = True
+
+
+def _safe(text: object) -> str:
+    """One printable, length-capped line - no journal injection."""
+    out = _LOG_UNSAFE.sub("?", str(text))
+    return out if len(out) <= LOG_MAX_LEN else out[: LOG_MAX_LEN - 1] + "…"
+
+
+def log(msg: str, pri: int = PRI_INFO) -> None:
+    head = f"<{pri}>" if _LOG_PREFIX else ""
+    sys.stderr.write(f"{head}kb-kill: {_safe(msg)}\n")
     sys.stderr.flush()
+
+
+def log_warn(msg: str) -> None:
+    log(msg, PRI_WARN)
+
+
+# Per-key diagnostics (wake progress, deferred/failed grabs, grab/release). OFF
+# unless the root operator opts in, because these fire at key-event rate and the
+# journal is readable by group `adm`. THIS is the gate: with it unset the lines
+# are never written at all, so there is nothing for journald to filter. The
+# unit's LogLevelMax=info is only belt-and-braces against a future regression
+# that emits a <7> line ungated - do not rely on it, since journald was measured
+# NOT to apply LogLevelMax to stderr-derived priorities on every systemd version.
+# Setting it is root-only either way (see README, "Turning on the per-key
+# diagnostics").
+DEBUG_KEYS = os.environ.get("KB_KILL_DEBUG_KEYS") == "1"
+
+
+def log_keys(msg: str) -> None:
+    """Key-event-rate diagnostics. Emits nothing unless DEBUG_KEYS is set."""
+    if DEBUG_KEYS:
+        log(msg, PRI_DEBUG)
+
+
+# Token bucket for journal lines an attacker can trigger. The sustained rate is
+# far too slow to carry typing - 12 wpm is ~1 key/100 ms, and 0.2 lines/s cannot
+# encode that. There is deliberately no cap on group count, so this bucket is the
+# sole bound on the KILLED/WOKEN channel; two consequences:
+#   * It MUST stay global, never per-group, or N groups would leak a burst per
+#     keystroke.
+#   * The BURST is what an attacker gets for free, so keep it tight. A real toggle
+#     costs one line, and the only legitimate way to spend several at once is
+#     several groups sharing a combo, so 4 is already generous. Config/device
+#     chatter has its own bucket (CTRL_LOG) and does not compete for these.
+LOG_STATE_BURST = 4
+LOG_STATE_REFILL = 0.2  # tokens/sec -> 1 line per 5 s sustained
+LOG_SUPPRESS_NOTICE = 60.0  # at most one "N suppressed" summary per minute
+
+
+class _RateLimiter:
+    def __init__(self, burst: int, refill: float) -> None:
+        self.burst: float = float(burst)
+        self.refill: float = refill
+        self.tokens: float = float(burst)
+        self.last: float = time.monotonic()
+        self.dropped: int = 0
+        self.next_notice: float = 0.0
+
+    def emit(self, msg: str, pri: int = PRI_INFO) -> None:
+        now = time.monotonic()
+        self.tokens = min(self.burst, self.tokens + (now - self.last) * self.refill)
+        self.last = now
+        if self.tokens >= 1.0:
+            self.tokens -= 1.0
+            log(msg, pri)
+            return
+        self.dropped += 1
+        # Residual, disclosed channel: a COUNT at a fixed 60 s cadence. No
+        # identity, no per-event timing.
+        if now >= self.next_notice:
+            self.next_notice = now + LOG_SUPPRESS_NOTICE
+            n, self.dropped = self.dropped, 0
+            log(f"suppressed {n} further log line(s) (rate limit)", PRI_NOTICE)
+
+
+# Two buckets, so a config-push flood cannot starve legitimate KILLED/WOKEN lines.
+STATE_LOG = _RateLimiter(LOG_STATE_BURST, LOG_STATE_REFILL)  # kill/wake
+CTRL_LOG = _RateLimiter(8, 0.2)  # config pushes + control-socket refusals
+
+
+def log_state(msg: str, pri: int = PRI_INFO) -> None:
+    STATE_LOG.emit(msg, pri)
 
 
 # --------------------------------------------------------------------------- #
@@ -284,7 +408,7 @@ class SeatWatch:
                 raise OSError(ctypes.get_errno(), "inotify_add_watch")
             self.fd = fd
         except (OSError, AttributeError) as e:
-            log(
+            log_warn(
                 f"seat inotify unavailable ({e}); polling active user every "
                 f"{RESCAN_INTERVAL:g}s instead"
             )
@@ -357,6 +481,9 @@ class Group:
         self.targets: dict[str, InputDevice] = {}  # path -> InputDevice
         self.killed = False
         self.warned_empty = False  # zero-match warning emitted (reset on match)
+        # Lockout advisories emitted once per config install, so a toggle loop
+        # can't multiply journal lines. See _log_kill.
+        self.warned_kill = False
         self.wake_progress: tuple[bool, ...] | None = None  # last logged (debug)
 
 
@@ -460,9 +587,16 @@ def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
     top-level defaults. There is no built-in fallback: a group with a target
     keyboard but no kill_combo/wake_combo (here or inherited) is an error, so no
     keyboard can ever be disabled by a hotkey the user didn't explicitly set."""
-    for key in table:
-        if key not in _GROUP_KEYS:
-            log(f"warning: {where}: unknown key {key!r} (ignored)")
+    # Summarise past a handful: a pushed config is attacker-supplied, so a table
+    # with thousands of stray keys must not become thousands of journal lines.
+    unknown = [key for key in table if key not in _GROUP_KEYS]
+    for key in unknown[:4]:
+        CTRL_LOG.emit(f"warning: {where}: unknown key {key!r} (ignored)", PRI_WARN)
+    if len(unknown) > 4:
+        CTRL_LOG.emit(
+            f"warning: {where}: {len(unknown) - 4} further unknown key(s) ignored",
+            PRI_WARN,
+        )
 
     # Each of keyboards/pointers/devices is optional, but at least one must be
     # present (a group with no matcher has nothing to grab).
@@ -490,7 +624,10 @@ def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
             "alias), not both."
         )
     if "virtual_keyboard" in table:
-        log(f"warning: {where}: 'virtual_keyboard' is deprecated — use 'virtual'")
+        CTRL_LOG.emit(
+            f"warning: {where}: 'virtual_keyboard' is deprecated — use 'virtual'",
+            PRI_WARN,
+        )
     virtual = table.get("virtual", table.get("virtual_keyboard", False))
     if not isinstance(virtual, bool):
         raise ConfigError(f"{where}: 'virtual' must be true or false")
@@ -502,6 +639,16 @@ def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
         if not isinstance(label, str) or not label.strip():
             raise ConfigError(f"{where}: 'label' must be a non-empty string")
         label = label.strip()
+        # A label is free display text ("Mouse & touchpad"), so it gets a looser
+        # rule than a group name: any printable string, bounded, but no control
+        # characters — a TOML quoted value may contain "\n", and the label reaches
+        # both the tray and (via a rejection message) the journal. See
+        # GROUP_NAME_RE and the journal-hygiene note above log().
+        if len(label) > LABEL_MAX_LEN or _LOG_UNSAFE.search(label):
+            raise ConfigError(
+                f"{where}: invalid 'label' {_safe(label)!r} — up to "
+                f"{LABEL_MAX_LEN} printable characters, no control characters"
+            )
     for combo_key, val in (("kill_combo", kill_raw), ("wake_combo", wake_raw)):
         if val is None:
             raise ConfigError(
@@ -559,11 +706,25 @@ def parse_config(doc: dict, source: str) -> Config:
         groups.append(_build_group("default", doc, defaults, f"{source} [top-level]"))
     else:
         # No top-level group: validate stray top-level keys are known defaults.
-        for key in doc:
-            if key not in _GROUP_KEYS:
-                log(f"warning: {source}: unknown top-level key {key!r} (ignored)")
+        unknown = [key for key in doc if key not in _GROUP_KEYS]
+        for key in unknown[:4]:
+            CTRL_LOG.emit(
+                f"warning: {source}: unknown top-level key {key!r} (ignored)", PRI_WARN
+            )
+        if len(unknown) > 4:
+            CTRL_LOG.emit(
+                f"warning: {source}: {len(unknown) - 4} further unknown top-level "
+                "key(s) ignored",
+                PRI_WARN,
+            )
 
     for name, table in sections.items():
+        if not GROUP_NAME_RE.match(name):
+            raise ConfigError(
+                f"{source}: invalid group name {_safe(name)!r} — up to 32 chars of "
+                "letters, digits, space, '.', '_' or '-' (group names are echoed "
+                "into the system log and the tray)"
+            )
         if not isinstance(table, dict):
             raise ConfigError(f"{source}: [groups.{name}] must be a table")
         if not any(field in table for field in _MATCH_KEYS):
@@ -579,7 +740,7 @@ def parse_config(doc: dict, source: str) -> Config:
         # a keyboard. This is the shipped default — a user must explicitly add a
         # group (top-level 'keyboards = ...' and/or a [groups.<name>] table)
         # before any hotkey can disable a keyboard.
-        log(
+        CTRL_LOG.emit(
             f"{source}: no groups defined — inert (monitor only, nothing can be killed)"
         )
     return Config(groups, source)
@@ -694,6 +855,13 @@ class KbKill:
         self.running = True
         self.need_rescan = False
 
+        # Dedup sets. _reconcile_grabs() runs on EVERY key event, so an
+        # un-deduped log line inside it is a per-keystroke journal record naming
+        # a device — see the journal-hygiene note above log().
+        self._deferred: set[str] = set()  # paths whose grab is deferred (keys held)
+        self._grab_failed: set[str] = set()  # paths whose last grab attempt failed
+        self._read_errored: set[str] = set()  # paths that errored on read
+
         # Pure-push model: the daemon starts with no config and is told what to
         # do over the control socket. `pushed[uid]` holds the Config most
         # recently pushed by each uid; only the config of the uid that currently
@@ -778,6 +946,11 @@ class KbKill:
         for group in self.groups:
             group.targets.pop(path, None)
         self.grabbed.discard(path)
+        # Clear the log-dedup state, so a device that comes back and genuinely
+        # fails again is reported again.
+        self._deferred.discard(path)
+        self._grab_failed.discard(path)
+        self._read_errored.discard(path)
 
     def rescan(self) -> None:
         self.need_rescan = False
@@ -787,7 +960,7 @@ class KbKill:
         # Drop devices that vanished.
         for path in list(self.devices):
             if path not in current:
-                log(f"device gone: {path}")
+                CTRL_LOG.emit(f"device gone: {path}")
                 self._remove_device(path)
 
         # Add newly appeared devices.
@@ -796,7 +969,7 @@ class KbKill:
                 dev.close()  # already monitored; discard the duplicate handle
             else:
                 self._add_device(path, dev)
-                log(f"watching: {path} ({dev.name})")
+                CTRL_LOG.emit(f"watching: {path} ({dev.name})")
 
         for group in self.groups:
             group.targets = self._resolve_targets(group)
@@ -817,7 +990,9 @@ class KbKill:
             if group.targets:
                 if group.warned_empty:
                     group.warned_empty = False
-                    log(f"[{group.name}] now matches {len(group.targets)} device(s)")
+                    CTRL_LOG.emit(
+                        f"[{group.name}] now matches {len(group.targets)} device(s)"
+                    )
                 continue
             if group.warned_empty:
                 continue
@@ -825,16 +1000,18 @@ class KbKill:
             if group.virtual and any(
                 self._dev_matches(group, d) for d in self.devices.values()
             ):
-                log(
+                CTRL_LOG.emit(
                     f"[{group.name}] warning: matches only physical devices and "
                     "virtual=true skips them — nothing will be grabbed (drop "
-                    "'virtual' unless input-remapper fronts this device)"
+                    "'virtual' unless input-remapper fronts this device)",
+                    PRI_WARN,
                 )
             else:
-                log(
+                CTRL_LOG.emit(
                     f"[{group.name}] warning: matches no present device — "
                     "nothing will be grabbed until one appears (check the "
-                    "matchers against `kb-kill-daemon detect`)"
+                    "matchers against `kb-kill-daemon detect`)",
+                    PRI_WARN,
                 )
 
     # -- live config (which pushed config governs the keyboard) -------------- #
@@ -869,12 +1046,14 @@ class KbKill:
         cfg = self.pushed.get(uid) if uid is not None else None
         self._install_groups(cfg.groups if cfg else [], preserve={})
         if cfg:
-            log(
+            CTRL_LOG.emit(
                 f"live config: uid {uid} -> {len(self.groups)} group(s) "
                 f"[{', '.join(g.name for g in self.groups)}]"
             )
         else:
-            log("live config: none (idle) - no active user has pushed a config")
+            CTRL_LOG.emit(
+                "live config: none (idle) - no active user has pushed a config"
+            )
 
     def _reevaluate_live(self) -> None:
         """Pick the live uid from the active seat user(s) and swap if it changed.
@@ -895,14 +1074,16 @@ class KbKill:
         try:
             cfg = load_config_text(text, f"uid {uid}")
         except ConfigError as e:
-            log(f"rejected config from uid {uid}: {e}")
+            CTRL_LOG.emit(f"rejected config from uid {uid}: {e}", PRI_WARN)
             return
         self.pushed[uid] = cfg
         if uid == self.live_uid:
             # The live user edited their config: re-apply, preserving killed state.
             preserve = {g.name: g.killed for g in self.groups}
             self._install_groups(cfg.groups, preserve)
-            log(f"live config updated by uid {uid}: {len(self.groups)} group(s)")
+            CTRL_LOG.emit(
+                f"live config updated by uid {uid}: {len(self.groups)} group(s)"
+            )
         else:
             # A (possibly newly-active) user pushed: maybe it should go live now.
             self._reevaluate_live()
@@ -915,12 +1096,22 @@ class KbKill:
         try:
             dev.grab()
             self.grabbed.add(path)
-            log(f"grabbed (eating): {dev.name}")
+            self._grab_failed.discard(path)
+            # 1:1 with a kill, so its information is already in the KILLED line's
+            # device count; keep the per-device detail for debug runs only.
+            log_keys(f"grabbed (eating): {dev.name}")
         except OSError as e:
+            # _reconcile_grabs runs on every key event and re-attempts a failed
+            # grab each time, so an un-deduped failure here is a per-keystroke
+            # journal line naming the device — and "busy" is the NORMAL state when
+            # input-remapper holds the physical device. Log once per path.
+            if path in self._grab_failed:
+                return
+            self._grab_failed.add(path)
             if e.errno == errno.EBUSY:
-                log(f"cannot grab {dev.name}: busy (held by another process)")
+                log_warn(f"cannot grab {dev.name}: busy (held by another process)")
             else:
-                log(f"cannot grab {dev.name}: {e}")
+                log_warn(f"cannot grab {dev.name}: {e}")
 
     def _ungrab(self, path: str) -> None:
         dev = self.devices.get(path)
@@ -929,8 +1120,9 @@ class KbKill:
                 dev.ungrab()
             except OSError:
                 pass
-            log(f"released: {dev.name}")
+            log_keys(f"released: {dev.name}")
         self.grabbed.discard(path)
+        self._grab_failed.discard(path)
 
     # -- state transitions --------------------------------------------------- #
     def _global_pressed(self) -> set[int]:
@@ -966,10 +1158,19 @@ class KbKill:
 
         for path in desired:
             if path in self.grabbed:
+                self._deferred.discard(path)
                 continue
             if self.pressed.get(path):
-                log(f"deferring grab of {self.devices[path].name} until keys released")
+                # Deduped AND debug-only: this fires on every key event while a
+                # kill is pending and keys are held.
+                if path not in self._deferred:
+                    self._deferred.add(path)
+                    log_keys(
+                        f"deferring grab of {self.devices[path].name} "
+                        "until keys released"
+                    )
                 continue
+            self._deferred.discard(path)
             self._grab(path)
 
         for path in list(self.grabbed):
@@ -985,7 +1186,7 @@ class KbKill:
                     self._log_kill(group)
             elif combo_held(group.wake_combo, held):
                 group.killed = False
-                log(f"[{group.name}] WOKEN")
+                log_state(f"[{group.name}] WOKEN")
 
     @staticmethod
     def _combo_satisfiable(combo: list[frozenset[int]], devs) -> bool:
@@ -1000,32 +1201,44 @@ class KbKill:
         # itself (you type the wake combo on it). A killed pointer can only
         # self-wake if the wake combo is producible on the pointer (e.g. a
         # mouse-button combo); otherwise it must be woken from another device.
-        non_targets = [p for p in self.devices if p not in group.targets]
-        self_wakeable = self._combo_satisfiable(
-            group.wake_combo, group.targets.values()
-        )
-        if not group.targets:
-            log(
-                f"[{group.name}] kill: no target device present yet "
-                "(will grab when it appears)"
+        #
+        # The advisories are emitted at most once per group per config install, so
+        # a toggle loop can't multiply them (warned_kill resets when
+        # _install_groups rebuilds the Group objects).
+        if not group.warned_kill:
+            group.warned_kill = True
+            non_targets = [p for p in self.devices if p not in group.targets]
+            self_wakeable = self._combo_satisfiable(
+                group.wake_combo, group.targets.values()
             )
-        elif not non_targets and not self_wakeable:
-            log(
-                f"[{group.name}] warning: killing the only device(s) present and the "
-                "wake combo can't be produced on them — wake needs another device, a "
-                "config re-push, or a daemon restart"
-            )
-        elif not non_targets:
-            log(
-                f"[{group.name}] warning: killing the only device(s) present "
-                "(wake hotkey on them still works)"
-            )
-        elif not self_wakeable:
-            log(
-                f"[{group.name}] note: this group can't self-wake — use the wake "
-                "hotkey on another device (e.g. your keyboard)"
-            )
-        log(f"[{group.name}] KILLED")
+            if not group.targets:
+                log_state(
+                    f"[{group.name}] kill: no target device present yet "
+                    "(will grab when it appears)",
+                    PRI_WARN,
+                )
+            elif not non_targets and not self_wakeable:
+                log_state(
+                    f"[{group.name}] warning: killing the only device(s) present and "
+                    "the wake combo can't be produced on them — wake needs another "
+                    "device, a config re-push, or a daemon restart",
+                    PRI_WARN,
+                )
+            elif not non_targets:
+                log_state(
+                    f"[{group.name}] warning: killing the only device(s) present "
+                    "(wake hotkey on them still works)",
+                    PRI_WARN,
+                )
+            elif not self_wakeable:
+                log_state(
+                    f"[{group.name}] note: this group can't self-wake — use the wake "
+                    "hotkey on another device (e.g. your keyboard)",
+                    PRI_WARN,
+                )
+        # The device count carries what the (now debug-only) per-device "grabbed
+        # (eating)" lines used to say, so a toggle costs exactly one journal record.
+        log_state(f"[{group.name}] KILLED ({len(group.targets)} device(s))")
 
     # -- event handling ------------------------------------------------------ #
     def _process(self, path: str, event) -> None:
@@ -1047,10 +1260,17 @@ class KbKill:
         much of its wake combo is currently held whenever that changes, plus
         which device delivered the deciding event.
 
-        Security note: this logs only combo *token names* (config data, e.g.
-        "ctrl") and their held/not-held state, and only while the group is
-        killed — never raw keycodes — so nothing typed can reach the journal.
+        Security: this runs on EVERY key event, so it is not merely logged at a
+        low level — with DEBUG_KEYS unset it is not written at all. It is NOT
+        enough that the text holds no raw keycodes: the combo token names, the
+        held counts and the source device name are each sufficient to rebuild
+        what was typed when sampled at key rate, and the timing alone is a
+        password side channel. Any local uid can push a config, so a group per
+        key would otherwise make this a keylogger readable by group `adm`. See
+        the journal-hygiene note above log().
         """
+        if not DEBUG_KEYS:
+            return
         held: set[int] | None = None
         for group in self.groups:
             if not group.killed:
@@ -1065,7 +1285,7 @@ class KbKill:
             missing = [t for t, ok in zip(group.wake_tokens, progress) if not ok]
             dev = self.devices.get(path)
             src = dev.name if dev is not None else path
-            log(
+            log_keys(
                 f"[{group.name}] wake progress: {sum(progress)}/{len(progress)} "
                 f"tokens held"
                 + (f" (missing: {'+'.join(missing)})" if missing else "")
@@ -1076,13 +1296,20 @@ class KbKill:
         try:
             for event in dev.read():
                 self._process(path, event)
+            self._read_errored.discard(path)
         except OSError as e:
             if e.errno in (errno.ENODEV, errno.EBADF):
-                log(f"device removed mid-read: {path}")
+                log_warn(f"device removed mid-read: {path}")
                 self._remove_device(path)
                 self.need_rescan = True
-            elif e.errno != errno.EAGAIN:
-                log(f"read error on {path}: {e}")
+            elif e.errno == errno.EAGAIN:
+                self._read_errored.discard(path)  # healthy, just drained
+            else:
+                # A wedged fd stays readable, so this would otherwise spin the
+                # event loop and flood the journal. Log once per path.
+                if path not in self._read_errored:
+                    self._read_errored.add(path)
+                    log_warn(f"read error on {path}: {e}")
 
     # -- control socket (config push + tray) --------------------------------- #
     def _open_control_socket(self) -> None:
@@ -1157,11 +1384,14 @@ class KbKill:
             and sum(1 for c in self.clients.values() if c["uid"] == uid)
             >= MAX_CONNS_PER_UID
         ):
-            log(f"control: per-uid connection cap reached for uid {uid}, refusing")
+            CTRL_LOG.emit(
+                f"control: per-uid connection cap reached for uid {uid}, refusing",
+                PRI_WARN,
+            )
             conn.close()
             return
         if len(self.clients) >= MAX_CLIENTS:
-            log("control: client cap reached, refusing connection")
+            CTRL_LOG.emit("control: client cap reached, refusing connection", PRI_WARN)
             conn.close()
             return
         conn.setblocking(False)
@@ -1193,7 +1423,7 @@ class KbKill:
             uid = info["uid"]
             if uid != 0 and not any(c["uid"] == uid for c in self.clients.values()):
                 if self.pushed.pop(uid, None) is not None:
-                    log(f"uid {uid} disconnected; dropping its pushed config")
+                    CTRL_LOG.emit(f"uid {uid} disconnected; dropping its pushed config")
                     if uid == self.live_uid:
                         self._reevaluate_live()
 
@@ -1202,9 +1432,10 @@ class KbKill:
         now = time.monotonic()
         for conn, info in list(self.clients.items()):
             if not info["hello"] and (now - info["born"]) > HANDSHAKE_SECONDS:
-                log(
+                CTRL_LOG.emit(
                     f"control: dropping idle connection from uid {info['uid']} "
-                    "(no command within handshake window)"
+                    "(no command within handshake window)",
+                    PRI_WARN,
                 )
                 self._drop_client(conn)
 
@@ -1224,7 +1455,7 @@ class KbKill:
         *lines, rest = buf.split(b"\n")
         # DoS bound: drop a client that floods bytes without a newline.
         if len(rest) > MAX_LINE:
-            log("control: dropping client (over-long line)")
+            CTRL_LOG.emit("control: dropping client (over-long line)", PRI_WARN)
             self._drop_client(conn)
             return
         info["buf"] = rest
@@ -1284,7 +1515,10 @@ class KbKill:
 
         # kill/wake/toggle: only the user whose config is currently live (or root).
         if uid not in (0, self.live_uid):
-            log(f"control: rejected {cmd!r} from uid {uid} (not the live user)")
+            CTRL_LOG.emit(
+                f"control: rejected {cmd!r} from uid {uid} (not the live user)",
+                PRI_WARN,
+            )
             return
         group = next((g for g in self.groups if g.name == obj.get("group")), None)
         if group is None:
@@ -1297,7 +1531,9 @@ class KbKill:
             group.killed = not group.killed
         else:
             return
-        log(f"[{group.name}] {'KILLED' if group.killed else 'WOKEN'} (via control)")
+        log_state(
+            f"[{group.name}] {'KILLED' if group.killed else 'WOKEN'} (via control)"
+        )
         self._reconcile_grabs()
 
     def _maybe_broadcast(self) -> None:
@@ -1321,7 +1557,7 @@ class KbKill:
         try:
             self._open_control_socket()
         except OSError as e:
-            log(f"FATAL: cannot open control socket: {e}")
+            log(f"FATAL: cannot open control socket: {e}", PRI_ERR)
             return 1
 
         if self.forced:
@@ -1598,7 +1834,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = load_config(args.config)
     except ConfigError as e:
-        log(str(e))
+        log(str(e), PRI_ERR)
         return 1
 
     if args.command == "detect":

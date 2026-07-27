@@ -54,9 +54,15 @@ binary and its unit carry the `-daemon` suffix.
 sudo kb-kill-daemon detect         # list devices (kbd/ptr), which are targets, parsed combos — START HERE when debugging
 sudo kb-kill-daemon monitor        # print raw key events + per-device/global combo matches
 sudo systemctl restart kb-kill-daemon
-journalctl -u kb-kill-daemon -f    # watch live: "live config", KILLED / WOKEN (daemon logs only to stderr/journal)
+journalctl -u kb-kill-daemon -f    # watch live: "live config", KILLED / WOKEN (rate-limited; daemon logs only to stderr/journal)
 systemctl --user restart kb-kill-push    # the mandatory config pusher
 systemctl --user restart kb-kill-tray    # optional UI
+
+# Per-key diagnostics (wake progress, grab/defer detail) are OFF by default and
+# need BOTH gates in a drop-in, then a restart (which releases all grabs, so
+# re-arm the kill before reproducing). `systemctl revert` when done. Full
+# procedure: README "Turning on the per-key diagnostics".
+sudo systemctl edit kb-kill-daemon # [Service] Environment=KB_KILL_DEBUG_KEYS=1 + LogLevelMax=debug
 ```
 
 There is no lint/test/build step. To run the daemon unprivileged for ad-hoc testing,
@@ -149,10 +155,12 @@ keystrokes**. Commands:
   root). The daemon replies/broadcasts `{"type":"state","groups":[…]}` only to the live
   uid/root.
 - `{"cmd":"devices"}` — live uid/root only: dump monitored devices (name, class,
-  virtual, grabbed-by-us, held-key *count* — never keycodes). Debug aid; pairs with the
-  wake-progress journal lines (`_log_wake_progress`: while a group is killed, log which
-  wake-combo *tokens* are held whenever that set changes — token names are config data,
-  so the no-key-data invariant holds).
+  virtual, grabbed-by-us, held-key *count* — never keycodes). Debug aid; pairs with
+  `_log_wake_progress` (while a group is killed, log which wake-combo *tokens* are held
+  whenever that set changes) — but note that one is **off unless `KB_KILL_DEBUG_KEYS=1`**,
+  because it fires at key-event rate. "Token names are only config data" was the old
+  justification and it was **wrong**: at key rate the *timing* is the leak, regardless of
+  what the text says. See the journal invariant below.
 
 Authorization is per-command by kernel-verified peer uid (`SO_PEERCRED`), moved from
 connect-time to command-time. DoS bounds: `MAX_CLIENTS` (global) + `MAX_CONNS_PER_UID`
@@ -172,6 +180,28 @@ anything, preserve these invariants (see README "Security model" and the systemd
   file, or network. The control socket carries config text + group state only, **never
   key data** (config TOML is not key data). (`monitor` printing to a terminal is a manual
   debug tool; the *service* never does.)
+- **The journal is an untrusted-reader channel — treat every `log()` call as attacker-
+  shapeable output.** The journal is readable by group `adm` and mirrored to
+  `/var/log/syslog`, and `set_config` is accepted from **any** local uid, so a hostile
+  config (one group per key, named after that key) can turn the daemon's own log into a
+  keylogger readable by a process with no `/dev/input` access. Three rules, all enforced
+  in the journal-hygiene block above `log()` rather than at the ~40 call sites:
+  1. **Nothing may reach the journal at per-key-event rate.** Anything reachable from
+     `_process` / `_reconcile_grabs` / `_toggle_groups` must go through `log_keys()`
+     (writes nothing unless `KB_KILL_DEBUG_KEYS=1` — that env var is the real gate;
+     the unit's `LogLevelMax=info` is belt-and-braces only, since journald was
+     measured not to apply it to stderr-derived `<7>` priorities) or be deduped to a
+     state transition
+     (`_deferred` / `_grab_failed` / `_read_errored`). Stripping key *identity* is **not**
+     sufficient — at key rate the timing alone is a password side channel.
+  1. **State/config/control lines go through the rate limiters** (`log_state` /
+     `CTRL_LOG`). The bucket must stay **global, never per-group**: it is the only bound
+     on the `KILLED`/`WOKEN` channel, since there is deliberately no cap on group count.
+     Keep `LOG_STATE_BURST` tight — the burst is what an attacker gets for free.
+  1. **All logged text passes through `_safe()`** (control chars → `?`, length-capped),
+     and group names/labels are validated (`GROUP_NAME_RE`, `LABEL_MAX_LEN`). TOML allows
+     a quoted key containing `\n`, which would otherwise forge journal records under
+     kb-kill's identifier.
 - **The deployed daemon binary must stay root-owned and not user-writable** — a root
   service executing a user-writable script is a privesc hole. That's why `install.sh`
   copies to `/usr/local/bin` rather than symlinking the working tree.
@@ -187,6 +217,11 @@ anything, preserve these invariants (see README "Security model" and the systemd
   **defensive file parse** — do **not** switch to `sd_seat_get_active` via ctypes/dlopen
   (risks tripping `MemoryDenyWriteExecute`). Any new behavior needing a syscall/capability/
   path outside this set means widening the sandbox — do that deliberately and minimally.
+  The unit's **journal block is part of the sandbox**: `SyslogLevelPrefix=yes` makes
+  the `<N>` priorities meaningful, `LogLevelMax=info` is belt-and-braces (measured
+  *not* to filter stderr-derived priorities on systemd 255 — never rely on it as a
+  gate), and `StandardError=journal` must stay explicit (its default `inherit` would
+  follow `StandardOutput=null` and silence the journal entirely).
 - **The 0666 socket is gated by `SO_PEERCRED`, not file permissions.** A non-active user
   can push a config but it never governs the keyboard (only the active seat uid's does),
   and only the live uid may kill/wake/toggle. Treat "a grab never outlives its live

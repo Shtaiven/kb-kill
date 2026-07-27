@@ -10,6 +10,28 @@ ExecStart=/usr/local/bin/kb-kill-daemon run
 Restart=on-failure
 RestartSec=2
 
+# --- journal exposure -------------------------------------------------------
+# Everything on stderr lands in the journal, which is readable by group `adm` on
+# a stock desktop (the primary user is in it) and is mirrored into
+# /var/log/syslog (root:adm 0640) when journald has ForwardToSyslog=yes. Because
+# ANY local uid may push a config over the 0666 control socket, the daemon's log
+# surface is attacker-shapeable: a config with one group per key, named after
+# that key, would turn its own log into a keylogger. So the daemon emits nothing
+# at per-key-event rate unless KB_KILL_DEBUG_KEYS=1, marks those lines <7>/debug,
+# and rate-limits state/config/control lines. The env var is the real gate (the
+# lines are simply not written without it); LogLevelMax=info here is only
+# belt-and-braces against a future regression emitting a <7> line ungated -
+# journald was measured NOT to apply LogLevelMax to stderr-derived priorities on
+# every systemd version, so do not treat it as a second gate. To debug a wake
+# combo, raise both (see the README, "Turning on the per-key diagnostics").
+# None of this widens the sandbox. StandardError must be set explicitly: its
+# default `inherit` would follow StandardOutput=null and silence the journal.
+StandardOutput=null
+StandardError=journal
+SyslogLevelPrefix=yes
+SyslogIdentifier=kb-kill-daemon
+LogLevelMax=info
+
 # --- sandboxing -------------------------------------------------------------
 # Runs as root only to read /dev/input and grab input devices; it needs nothing else.
 # Config now arrives over the socket (never read from disk), and the socket is

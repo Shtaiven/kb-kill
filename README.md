@@ -148,7 +148,7 @@ installer:
 ```sh
 systemctl status kb-kill-daemon          # the shared root daemon
 systemctl --user status kb-kill-push     # your config pusher (mandatory)
-journalctl -u kb-kill-daemon -f          # watch "live config", KILLED / WOKEN live
+journalctl -u kb-kill-daemon -f          # watch "live config", KILLED / WOKEN (rate-limited)
 ```
 
 Re-run `./install.sh` to redeploy after editing the code (the binaries run from the
@@ -259,7 +259,10 @@ devices and its own kill/wake hotkeys:
 - An optional **`label = "…"`** per group sets a display name the tray shows
   instead of the group's table key (e.g. `label = "Mouse & touchpad"` for
   `[groups.pointer]`). Cosmetic only — logs, `detect`, and control commands
-  keep using the table key.
+  keep using the table key. Up to 64 printable characters.
+- A group **name** is an identifier: up to 32 characters of letters, digits,
+  space, `.`, `_` or `-`. It appears in log lines, so it is charset-checked
+  rather than free text (see [Security model](#security-model)).
 - TOML rule: top-level keys must come **before** any `[groups.*]` table.
 - Give each group a **distinct** combo — a shared combo toggles them together
   (handy for mixing a physical and a virtual target across two groups).
@@ -309,6 +312,8 @@ its own buttons can trigger the wake combo.
 kb-kill-daemon                # run the service (same as `... run`); systemd does this as root, config-less
 sudo kb-kill-daemon detect    # list keyboards + which are targets + parsed combos
 sudo kb-kill-daemon monitor   # print raw key events (debugging)
+#                             # per-key daemon diagnostics are OFF by default:
+#                             # see "Turning on the per-key diagnostics" below
 kb-kill-daemon -c PATH run    # run with a specific config pinned live (ad-hoc testing, no pusher needed)
 ```
 
@@ -324,13 +329,9 @@ while a group is killed, its target devices look silent in `monitor` even though
 the daemon is receiving every event. Both `detect` and `monitor` flag such
 devices (`GRABBED by another process`). To see what the *daemon* sees instead:
 
-- **Wake-progress journal lines.** While a group is killed, the daemon logs a
-  line to `journalctl -u kb-kill-daemon` every time the held part of the wake
-  combo changes, e.g. \`[laptop] wake progress: 3/4 tokens held (missing: ctrl)
-
-  - last event from 'input-remapper keyboard'\`. Press the wake combo one key at
-    a time and watch which token never registers (and from which device the keys
-    arrive). Only combo token names are logged, never other keys.
+- **Wake-progress lines (`KB_KILL_DEBUG_KEYS`) — off by default, see below.**
+  While a group is killed, the daemon can log which part of the wake combo is
+  currently held, every time that changes, plus which device delivered the event.
 
 - **`devices` control command.** Ask the running daemon what it monitors/grabs:
 
@@ -341,6 +342,81 @@ devices (`GRABBED by another process`). To see what the *daemon* sees instead:
   Each entry shows the device's class, whether it is a virtual (uinput) device,
   whether the daemon currently has it grabbed, and how many keys it currently
   holds down (counts only — never which keys).
+
+### Turning on the per-key diagnostics (`KB_KILL_DEBUG_KEYS`)
+
+**1. What this is, and why it ships off.** With `KB_KILL_DEBUG_KEYS=1` the daemon
+logs a line every time the held portion of a killed group's wake combo changes,
+naming the tokens that are still missing and the device the events came from
+(plus `deferring grab` / `grabbed` / `released` detail). It is the only way to see
+what the daemon sees while a device is grabbed, and it is **off by default
+because it fires at key-event rate**. Those lines go to the system journal, which
+group `adm` can read (your desktop user is usually in it) and which journald
+mirrors into `/var/log/syslog`. Since *any* local process can push a config, a
+hostile one — one group per key, each named after its key — would turn these
+lines into a keylogger. See [Security model](#security-model).
+
+**2. Enable it in a drop-in.** `KB_KILL_DEBUG_KEYS=1` is the switch — without it
+the daemon never writes these lines at all. Raise `LogLevelMax` in the same
+drop-in as well: the lines are emitted at syslog priority `debug` (`<7>`), the
+shipped unit caps the unit at `info`, and whether that cap actually drops
+stderr-derived priorities varies by systemd version. Setting both means it works
+either way.
+
+```sh
+sudo systemctl edit kb-kill-daemon
+```
+
+```ini
+[Service]
+Environment=KB_KILL_DEBUG_KEYS=1
+LogLevelMax=debug
+```
+
+**3. Restart — this releases every grab.** The restart wakes everything, so any
+group that was killed is now awake:
+
+```sh
+sudo systemctl restart kb-kill-daemon
+```
+
+**Press your kill combo again to re-arm before you try to reproduce the
+problem.** This is the step people trip on: the wake-progress lines only appear
+while a group is actually killed.
+
+**4. Watch, and reproduce.**
+
+```sh
+journalctl -u kb-kill-daemon -f -o short-precise
+```
+
+Press the wake combo one key at a time and watch the tokens register:
+
+```
+kb-kill: [laptop] wake progress: 3/4 tokens held (missing: ctrl) - last event from 'input-remapper keyboard'
+```
+
+A token that **never** appears, no matter how you press it, means that key is not
+reaching kb-kill at all — suspect the keyboard's hardware matrix (some laptop
+keyboards physically cannot report certain chords) or an input-remapper mapping
+that consumes it, before suspecting kb-kill. Also check *which device* the events
+arrive from: if they come from a `...forwarded` virtual device, the group probably
+needs `virtual = true`.
+
+**5. Turn it back off — this is a required step.** A drop-in survives reboots and
+is invisible unless you go looking, so leaving it on silently keeps the channel
+open:
+
+```sh
+sudo systemctl revert kb-kill-daemon
+sudo systemctl restart kb-kill-daemon
+systemctl show kb-kill-daemon -p Environment -p LogLevelMax   # confirm it's clean
+```
+
+**6. Consider the history it wrote.** While it was on, keystroke-paced lines were
+written both to the journal and to `/var/log/syslog`. Neither is retracted by
+turning the switch off. `journalctl --vacuum-time=1h` trims the journal; the
+syslog copy is a separate file on its own logrotate schedule.
 
 ## Tray icon
 
@@ -419,23 +495,52 @@ at its default (`false`) and kb-kill grabs the physical keyboard directly.
 kb-kill reads all keyboard input (and mouse buttons, for pointer groups), so it is
 keylogger-*capable*. The design minimizes and contains that:
 
-- **No keystrokes are ever stored or transmitted.** The daemon keeps only the set
-  of keys/buttons *currently held* (for combo matching) and discards them on
-  release — there is no history, no log, no file, no network. Pointer **motion** is
-  never processed at all (only `EV_KEY` button events are). The control socket
-  carries config text + group state (`{name, label, killed, targets}`), **never key
+- **No keystroke content is ever stored or transmitted.** The daemon keeps only
+  the set of keys/buttons *currently held* (for combo matching) and discards them
+  on release — no history, no file, no network. Pointer **motion** is never
+  processed at all (only `EV_KEY` button events are). The control socket carries
+  config text + group state (`{name, label, killed, targets}`), **never key
   data**.
   (`kb-kill-daemon monitor` is a manual debug tool that prints to the terminal; the
   service never does.)
+
+- **Nothing keystroke-paced reaches the system journal.** This one needs spelling
+  out, because the journal is *not* private: group `adm` can read it (your desktop
+  user usually is in it) and journald mirrors it into `/var/log/syslog`. Config
+  arrives over a mode-0666 socket and is accepted from any local uid, so the
+  daemon's own log is a surface an attacker can shape — a config with one group per
+  key, each named after its key, would otherwise make `KILLED`/`WOKEN` a
+  timestamped record of everything you type, readable by a process that has no
+  access to `/dev/input` at all. Three bounds:
+
+  - Lines that fire at key-event rate are not written at all unless a root
+    operator sets `KB_KILL_DEBUG_KEYS=1` on the unit
+    ([how, and how to turn it off](#turning-on-the-per-key-diagnostics-kb_kill_debug_keys)).
+    Note that removing key *identity* would not have been enough on its own: at
+    key rate, the timing alone is a password side channel.
+  - State, config and control lines pass through a global token bucket (burst 4,
+    then one line per 5 s), so they cannot carry typing regardless of how many
+    groups a config defines.
+  - Logged text is flattened to one printable, length-capped line, and group
+    names/labels are charset-checked — TOML permits a quoted key containing `\n`,
+    which would otherwise let any local user forge journal records under
+    kb-kill's identifier.
+
+  The deliberate residual is a `suppressed N log line(s)` count at most once a
+  minute: coarse evidence that *something* is toggling, with no key identity and
+  no per-key timing.
+
 - **Reading input is confined to one process.** Device access lives entirely in
   this single audited, sandboxed root daemon — no ordinary user process needs (or
   is granted) access to your keyboards or mice. Pointer devices are only opened when
   a live config references them (`pointers`/`devices`); a keyboard-only config never
   touches them.
+
 - **The daemon binary is root-owned** (`/usr/local/bin/kb-kill-daemon`), never your
   user-writable working tree — a root service running a user-writable script
   would be a privilege-escalation hole. (Config never executes — it is parsed as
   TOML, and arrives over the socket rather than being read from disk.)
+
 - **systemd sandbox** (`/etc/systemd/system/kb-kill-daemon.service`): no network
   (`RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`), only input devices
   (`DevicePolicy=closed` + `DeviceAllow=char-input`), `SystemCallFilter`,
@@ -444,6 +549,7 @@ keylogger-*capable*. The design minimizes and contains that:
   capabilities are dropped** (`CapabilityBoundingSet=` empty) and home is invisible
   (`ProtectHome=true`). Even a hypothetical code-injection can't exfiltrate or touch
   other devices.
+
 - **Control socket: always on, per-command authenticated.** It is how config is
   delivered, so it accepts connections from any local user (mode 0666) — but the
   kernel-verified peer uid (`SO_PEERCRED`) gates every command: a pushed config only
