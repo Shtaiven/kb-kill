@@ -485,6 +485,12 @@ class Group:
         # runtime state (managed by KbKill)
         self.targets: dict[str, InputDevice] = {}  # path -> InputDevice
         self.killed = False
+        # Edge-trigger latches: was this combo fully held as of the previous key
+        # event? A combo fires only on the rising edge (not-held -> held), so
+        # holding it while pressing anything else can't re-fire it. See
+        # KbKill._toggle_groups.
+        self.kill_held = False
+        self.wake_held = False
         self.warned_empty = False  # zero-match warning emitted (reset on match)
         # Lockout advisories emitted once per config install, so a toggle loop
         # can't multiply journal lines. See _log_kill.
@@ -978,8 +984,50 @@ class KbKill:
 
         for group in self.groups:
             group.targets = self._resolve_targets(group)
+        self._release_stale_keys()
         self._reconcile_grabs()
         self._warn_empty_groups()
+
+    def _release_stale_keys(self) -> None:
+        """Drop keys the kernel says are no longer held.
+
+        `pressed` is seeded from active_keys() when a device is opened and then
+        maintained purely from that device's event stream — so a device we cannot
+        read leaves its entry frozen. That happens for real: another process
+        (input-remapper) can take an exclusive grab on a device we already
+        monitor, after which our reads yield nothing and any key held at that
+        moment stays "held" forever. A permanently non-empty entry is not
+        cosmetic: it defers that device's grab indefinitely (_reconcile_grabs), so
+        a kill silently never takes effect, and it pins a combo latched so the
+        wake hotkey can never edge-fire (_toggle_groups) — i.e. a lockout.
+
+        This only ever INTERSECTS with the kernel's view, never adds, which is
+        what makes it safe to run on a timer: it cannot complete a combo, so it
+        can never fire a hotkey, and re-latching afterwards can only *re-arm* a
+        combo, never suppress a real press. An unread event queued behind us is
+        likewise safe — a pending key-up we drop early is just discarded twice.
+        """
+        changed = False
+        for path, dev in self.devices.items():
+            held = self.pressed.get(path)
+            if not held:
+                continue
+            try:
+                live = set(dev.active_keys())
+            except OSError:
+                continue  # device is going away; rescan will drop it
+            stale = held - live
+            if stale:
+                held -= stale
+                changed = True
+        if changed:
+            # Re-derive the latches from the corrected state so a combo freed by
+            # this can fire again. Deliberately does NOT call _toggle_groups: a
+            # snapshot must never *fire* a hotkey, only re-arm one.
+            now_held = self._global_pressed()
+            for group in self.groups:
+                group.kill_held = combo_held(group.kill_combo, now_held)
+                group.wake_held = combo_held(group.wake_combo, now_held)
 
     def _warn_empty_groups(self) -> None:
         """Warn once per group while it matches zero devices.
@@ -1033,8 +1081,14 @@ class KbKill:
         """
         for path in list(self.grabbed):
             self._ungrab(path)
+        held = self._global_pressed()
         for g in groups:
             g.killed = preserve.get(g.name, False)
+            # Seed the edge latches from what is held right now, so a config that
+            # arrives while you happen to be holding a combo doesn't fire it on
+            # the next unrelated key event. Releasing re-arms it normally.
+            g.kill_held = combo_held(g.kill_combo, held)
+            g.wake_held = combo_held(g.wake_combo, held)
         self.groups = groups
         for g in self.groups:
             g.targets = self._resolve_targets(g)
@@ -1183,13 +1237,42 @@ class KbKill:
                 self._ungrab(path)
 
     def _toggle_groups(self, held: set[int]) -> None:
-        """Flip each group's killed state when its kill/wake combo is held."""
+        """Flip each group's killed state on the RISING EDGE of its kill/wake combo.
+
+        Edge- not level-triggered, and this is load-bearing. Called on every key
+        event (down *and* up); a combo fires only when it goes from not-fully-held
+        to fully-held, and the latch clears once you release any part of it. If it
+        fired whenever the combo merely *was* held, every later key-down while you
+        keep holding it would fire it again, which breaks three real cases:
+
+          * Rolling over from one group's hotkey to another's (ctrl+alt+shift down,
+            tap k then p without fully releasing k): the `p` down still sees k held,
+            so the keyboard group's combo would fire a second time and silently
+            undo the kill you just made.
+          * A `kill_combo == wake_combo` toggle config: any unrelated key pressed
+            while the combo is still down would flip the group straight back.
+          * One physical press seen twice, e.g. when both a device and its
+            input-remapper forwarded copy are readable: two key-downs, two fires,
+            net nothing, so the hotkey looks dead.
+
+        The latch is per group per combo, so groups stay independent. Key-ups can
+        only ever clear a latch, never produce an edge -- so this adds no journal
+        traffic (see the journal-hygiene note above log()).
+        """
         for group in self.groups:
+            kill_now = combo_held(group.kill_combo, held)
+            wake_now = combo_held(group.wake_combo, held)
+            kill_edge = kill_now and not group.kill_held
+            wake_edge = wake_now and not group.wake_held
+            # Latch before acting: when kill_combo == wake_combo a kill marks the
+            # wake combo held too, so the same hold can't immediately wake it.
+            group.kill_held = kill_now
+            group.wake_held = wake_now
             if not group.killed:
-                if combo_held(group.kill_combo, held):
+                if kill_edge:
                     group.killed = True
                     self._log_kill(group)
-            elif combo_held(group.wake_combo, held):
+            elif wake_edge:
                 group.killed = False
                 log_state(f"[{group.name}] WOKEN")
 
@@ -1252,11 +1335,13 @@ class KbKill:
         pressed = self.pressed[path]
         if event.value == 1:  # key down
             pressed.add(event.code)
-            self._toggle_groups(self._global_pressed())
         elif event.value == 0:  # key up
             pressed.discard(event.code)
         else:  # autorepeat (2) - ignore for combos
             return
+        # Runs on up as well as down: _toggle_groups is edge-triggered, and a
+        # release is what re-arms a combo's latch.
+        self._toggle_groups(self._global_pressed())
         self._log_wake_progress(path)
         self._reconcile_grabs()
 
@@ -1768,6 +1853,15 @@ def cmd_monitor(config: Config) -> int:
         pressed[path] = set(dev.active_keys())
         sel.register(dev, selectors.EVENT_READ, path)
 
+    # Mirror the daemon's edge latches (see KbKill._toggle_groups) so the KILL/
+    # WAKE flags below mark the moment a combo would actually FIRE, not merely
+    # every event while you keep holding it.
+    latched: dict[tuple[str, str], bool] = {}
+    glob0 = set().union(*pressed.values()) if pressed else set()
+    for g in config.groups:
+        latched[(g.name, "kill")] = combo_held(g.kill_combo, glob0)
+        latched[(g.name, "wake")] = combo_held(g.wake_combo, glob0)
+
     print("Monitoring all input devices. Press a group's kill/wake combo.")
     for g in config.groups:
         print(f"  [{g.name}] kill={g.kill_raw} wake={g.wake_raw}")
@@ -1794,10 +1888,14 @@ def cmd_monitor(config: Config) -> int:
                     glob = set().union(*pressed.values()) if pressed else set()
                     flags = []
                     for g in config.groups:
-                        if combo_held(g.kill_combo, glob):
-                            flags.append(f"KILL[{g.name}]")
-                        if combo_held(g.wake_combo, glob):
-                            flags.append(f"WAKE[{g.name}]")
+                        for kind, combo in (
+                            ("KILL", g.kill_combo),
+                            ("WAKE", g.wake_combo),
+                        ):
+                            now = combo_held(combo, glob)
+                            if now and not latched[(g.name, kind.lower())]:
+                                flags.append(f"{kind}[{g.name}]")
+                            latched[(g.name, kind.lower())] = now
                     tag = ("  <<< " + " ".join(flags)) if flags else ""
                     print(f"{path:20} {short:34} {_keyname(ev.code):16} {action}{tag}")
     except KeyboardInterrupt:

@@ -266,6 +266,13 @@ devices and its own kill/wake hotkeys:
 - TOML rule: top-level keys must come **before** any `[groups.*]` table.
 - Give each group a **distinct** combo — a shared combo toggles them together
   (handy for mixing a physical and a virtual target across two groups).
+- Setting a group's `kill_combo` and `wake_combo` to the **same** hotkey turns it
+  into a single toggle: press to disable, press again to re-enable.
+- Hotkeys fire on the **press** — the moment the combo completes — not for as long
+  as it is held. So holding a combo down while typing something else won't flip the
+  group back, and you can keep the modifiers down and tap one group's key then
+  another's (`ctrl+alt+shift` held, then `k`, then `p`) to disable both, even if you
+  don't fully release the first key.
 
 ```toml
 wake_combo = "ctrl+alt+shift+u"               # default, inherited below

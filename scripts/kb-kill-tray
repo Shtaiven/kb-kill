@@ -104,7 +104,15 @@ class Tray:
         self.buf = b""
         self.groups: list[dict] = []
         self.connected = False
-        self._render()  # initial "connecting" menu/icon
+        # Menu items are built once per group *list* and then updated in place -
+        # see _render() for why they are not rebuilt on every state change.
+        self._menu: Gtk.Menu | None = None
+        self._menu_key: tuple | None = None  # identity of the built menu
+        self._items: dict[str, Gtk.CheckMenuItem] = {}  # group name -> item
+        self._handlers: dict[str, int] = {}  # group name -> "toggled" handler id
+        self._icon: str | None = None  # last icon set (avoid redundant churn)
+        self._render_queued = False
+        self._render()  # initial "connecting" menu/icon (sync: before Gtk.main)
         self._connect()
 
     # -- connection ---------------------------------------------------------- #
@@ -116,7 +124,7 @@ class Tray:
         except OSError:
             s.close()
             self.connected = False
-            self._render()
+            self._schedule_render()
             GLib.timeout_add_seconds(RECONNECT_SECONDS, self._reconnect)
             return False
         s.setblocking(False)
@@ -142,7 +150,7 @@ class Tray:
                 pass
         self.sock = None
         self.connected = False
-        self._render()
+        self._schedule_render()
         GLib.timeout_add_seconds(RECONNECT_SECONDS, self._reconnect)
 
     def _on_readable(self, fd: int, condition: int) -> bool:
@@ -171,7 +179,7 @@ class Tray:
                 continue
             if msg.get("type") == "state":
                 self.groups = msg.get("groups", [])
-                self._render()
+                self._schedule_render()
         return True
 
     def _send(self, obj: dict[str, str]) -> None:
@@ -183,9 +191,30 @@ class Tray:
             self._drop()
 
     # -- UI ------------------------------------------------------------------ #
+    def _schedule_render(self) -> None:
+        """Coalesce a burst of state messages into one UI update.
+
+        The daemon can broadcast several states in quick succession (killing two
+        groups with two hotkeys in rapid succession, say), and they often arrive
+        in a single recv(). Re-exporting the menu once per message races the
+        shell's own repaint; folding them into one idle callback means the shell
+        only ever sees the settled state."""
+        if self._render_queued:
+            return
+        self._render_queued = True
+        GLib.idle_add(self._render_idle)
+
+    def _render_idle(self) -> bool:
+        self._render_queued = False
+        self._render()
+        return False  # one-shot
+
     def _render(self) -> None:
         any_killed = any(g.get("killed") for g in self.groups)
-        self.ind.set_icon_full(ICON_KILLED if any_killed else ICON_AWAKE, "kb-kill")
+        icon = ICON_KILLED if any_killed else ICON_AWAKE
+        if icon != self._icon:
+            self._icon = icon
+            self.ind.set_icon_full(icon, "kb-kill")
         if not self.connected:
             self.ind.set_title("kb-kill: connecting…")
         elif any_killed:
@@ -195,10 +224,46 @@ class Tray:
             self.ind.set_title("kb-kill: disabled (" + ", ".join(killed) + ")")
         else:
             self.ind.set_title("kb-kill: all active")
-        self.ind.set_menu(self._build_menu())
+
+        # Rebuild the menu only when its *structure* changes (connected state, or
+        # the set/order/labels of groups). A killed-state change just updates the
+        # existing items: replacing the Gtk.Menu re-exports the whole dbusmenu
+        # layout with fresh item ids, and a shell that is mid-repaint (or has the
+        # menu open) can keep rendering the old layout - leaving a checkmark
+        # showing the opposite of the truth. Stable items also mean a click can
+        # never land on an orphaned item from a superseded menu.
+        key = (self.connected, tuple((g["name"], g.get("label")) for g in self.groups))
+        if key != self._menu_key:
+            self._menu_key = key
+            self._menu = self._build_menu()
+            self.ind.set_menu(self._menu)
+        else:
+            self._sync_items()
+
+    def _sync_items(self) -> None:
+        """Point the existing check items at the daemon's state.
+
+        The handler is blocked around set_active() so a programmatic update can
+        never be mistaken for a user click and echoed back as a command - which
+        would fight the daemon instead of following it."""
+        for g in self.groups:
+            item = self._items.get(g["name"])
+            if item is None:
+                continue
+            want = not g.get("killed")
+            if item.get_active() == want:
+                continue
+            hid = self._handlers.get(g["name"])
+            if hid is not None:
+                item.handler_block(hid)
+            item.set_active(want)
+            if hid is not None:
+                item.handler_unblock(hid)
 
     def _build_menu(self) -> Gtk.Menu:
         menu = Gtk.Menu()
+        self._items = {}
+        self._handlers = {}
         if not self.connected:
             item = Gtk.MenuItem(label="Connecting to kb-kill service…")
             item.set_sensitive(False)
@@ -209,19 +274,19 @@ class Tray:
             menu.append(item)
         else:
             for g in self.groups:
-                killed = g.get("killed")
                 # A tray menu is exported over the dbusmenu D-Bus protocol and
                 # re-rendered by the shell, so it can't host arbitrary widgets
                 # (a Gtk.Switch is dropped). A CheckMenuItem maps to dbusmenu's
                 # checkmark toggle: it renders, and clicking anywhere on the row
-                # toggles it. The check (on = group active/awake) is the
-                # switch. set_active() runs before connect(), so rebuilding the
-                # menu from the daemon's broadcast never re-fires the handler.
+                # toggles it. The check (on = group active/awake) is the switch.
                 # Show the config's display label when set; commands still
                 # address the group by its real name.
                 item = Gtk.CheckMenuItem(label=g.get("label") or g["name"])
-                item.set_active(not killed)
-                item.connect("toggled", self._on_toggle, g["name"])
+                item.set_active(not g.get("killed"))
+                self._handlers[g["name"]] = item.connect(
+                    "toggled", self._on_toggle, g["name"]
+                )
+                self._items[g["name"]] = item
                 menu.append(item)
         menu.append(Gtk.SeparatorMenuItem())
         open_item = Gtk.MenuItem(label="Open config…")
@@ -233,8 +298,17 @@ class Tray:
         menu.show_all()
         return menu
 
-    def _on_toggle(self, _item: object, name: str) -> None:
-        self._send({"cmd": "toggle", "group": name})
+    def _on_toggle(self, item: Gtk.CheckMenuItem, name: str) -> None:
+        """Send the state the user just asked for - never a blind toggle.
+
+        `toggle` is relative, so if this checkmark ever disagrees with the daemon
+        (a dropped/coalesced update, or a shell that flipped it optimistically),
+        every click flips both and the disagreement survives forever. An absolute
+        kill/wake means one click always resyncs. The trailing status request
+        makes the daemon restate the truth even when the command was a no-op (a
+        no-op changes nothing, so it would not otherwise be broadcast)."""
+        self._send({"cmd": "wake" if item.get_active() else "kill", "group": name})
+        self._send({"cmd": "status"})
 
     # -- config --------------------------------------------------------------- #
     def _user_config_path(self) -> str:

@@ -117,6 +117,21 @@ a whole combo. Combo syntax is parsed in `_parse_combo`/`_parse_token` into
 `list[frozenset[int]]` (each token = an "any-of" set of keycodes; combo fires when every
 set has ≥1 key held).
 
+**Combos are edge-triggered, and that is an invariant** (`_toggle_groups`, per-group
+`kill_held`/`wake_held` latches). A combo fires only on the rising edge
+not-fully-held → fully-held; the latch clears when you release any part of it, so
+`_toggle_groups` runs on key **up** as well as down (a release can never create an edge,
+so this adds no journal traffic). Level-triggering re-fires on every later key-down while
+the combo stays held, which silently breaks three real cases: rolling over from one
+group's hotkey to another's (`ctrl+alt+shift` held, tap `k` then `p` — the `p` still sees
+`k` down and un-kills the first group), any `kill_combo == wake_combo` toggle config (an
+unrelated key flips it straight back), and one press seen twice when a device *and* its
+input-remapper forwarded copy are both readable (two fires, net nothing, hotkey looks
+dead). The latch makes a *stuck* held key a lockout risk rather than just noise, so
+`_release_stale_keys()` (per rescan) intersects `pressed` with each device's
+`active_keys()` — it only ever **drops** keys, never adds, so it can never complete a
+combo or fire a hotkey, only re-arm one. Don't make it additive.
+
 **input-remapper coexistence** (`_resolve_targets` + `virtual`): a `virtual = true`
 group targets *only* the input-remapper "forwarded" virtual device (`is_virtual()`),
 never the physical device, so input-remapper can always re-grab the physical device.
