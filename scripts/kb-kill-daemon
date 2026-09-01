@@ -25,16 +25,20 @@ Design notes
 * We never re-inject events, so there is no virtual device and no awake-path
   latency.
 * Coexistence with input-remapper: input-remapper grabs the physical keyboard
-  (e.g. /dev/input/event3) and forwards it to a virtual "...forwarded" device.
-  Mark such a group `virtual = true` and kb-kill targets only that virtual
-  device, never the physical one, so input-remapper can always (re)grab the
-  physical device - including across a restart. Ordinary groups (the default)
-  grab matching devices directly. See `_resolve_targets`.
+  (e.g. /dev/input/event3) and re-emits its events through a virtual forwarded
+  device. By default (`virtual = "auto"`) kb-kill detects that pairing per
+  device and targets the forwarded copy, leaving the physical device for
+  input-remapper to (re)grab - including across a restart - so a matcher naming
+  the hardware keeps working either way. `virtual = true` restricts a group to
+  virtual devices; `virtual = false` opts out of the pairing entirely, for a
+  remapper kb-kill cannot detect. See `fronting_map` / `_resolve_targets`.
 * Targets are chosen per group by name matchers, one per device class:
   `keyboards` (keyboard-class), `pointers` (mice/trackballs/touchpads), and
-  `devices` (any class). Each entry matches case-insensitively as a substring
-  OR an fnmatch glob (`*`/`?`/`[seq]`) of the whole name. A group needs at
-  least one field; set several to kill, e.g., a keyboard and a mouse together.
+  `devices` (any class). Each entry matches the WHOLE device name, case-
+  insensitively: exactly, unless it holds a bash-style glob metacharacter
+  (`*`/`?`/`[seq]`/`{a,b}`), in which case it is globbed - so "*razer*" is the
+  substring match and a bare "*" matches everything. A group needs at least
+  one field; set several to kill, e.g., a keyboard and a mouse together.
   See `_dev_matches`.
 
 Requires: python-evdev and read access to /dev/input/event*. The daemon runs as
@@ -56,7 +60,6 @@ import struct
 import sys
 import time
 import tomllib
-from collections.abc import Iterable
 from pathlib import Path
 
 try:
@@ -447,6 +450,12 @@ class ConfigError(Exception):
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
+# The tri-state `virtual` as written in the config. None is "auto" (the
+# default): pair each matched device with its forwarded copy if a remapper
+# fronts it. See Group.virtual and KbKill._resolve_targets.
+VIRTUAL_LABELS: dict[bool | None, str] = {None: "auto", True: "true", False: "false"}
+
+
 class Group:
     """One target set with its own kill/wake hotkeys."""
 
@@ -458,7 +467,7 @@ class Group:
         devices: list[str],
         kill_combo: list[frozenset[int]],
         wake_combo: list[frozenset[int]],
-        virtual: bool,
+        virtual: bool | None,
         kill_raw: str,
         wake_raw: str,
         label: str | None,
@@ -466,7 +475,7 @@ class Group:
         self.name = name  # identity: logs, control commands, killed-state preserve
         self.label = label  # optional display name (config 'label'); tray shows it
         # Name matchers, one per device class (any may be empty). Each entry is
-        # a lowercased substring-or-glob pattern:
+        # a lowercased pattern, matched exactly unless it is a glob:
         #   keyboards -> keyboard-class devices, pointers -> pointing devices,
         #   devices   -> any input device regardless of class. A device is a
         # target when it matches at least one applicable field. See _dev_matches.
@@ -475,8 +484,18 @@ class Group:
         self.devices = devices  # lowercase patterns (any class)
         self.kill_combo = kill_combo
         self.wake_combo = wake_combo
-        # Grab only the input-remapper "forwarded" copy, never the physical
-        # device (any class), so input-remapper can keep the physical one.
+        # How to treat a device that a remapper fronts (grabs and re-emits).
+        # Tri-state, so None is meaningful — see VIRTUAL_LABELS:
+        #   None  ("auto", the default) pair per device: target the forwarded
+        #         copy of any matched device something fronts, else the device
+        #         itself. Handles a mixed group and a remapper coming and going.
+        #   True  ("virtual") target only virtual devices — the forwarded copy
+        #         of a matched device, and any virtual device matched by name.
+        #         Never a physical device, even an unfronted one.
+        #   False literal: target exactly what the matchers named, fronted or
+        #         not. The escape hatch for a remapper kb-kill cannot detect
+        #         (kanata/keyd/evremap leave no link between output and source),
+        #         and the only setting that can fight input-remapper for a grab.
         self.virtual = virtual
         self.kill_raw = kill_raw  # original strings (for display)
         self.wake_raw = wake_raw
@@ -496,7 +515,14 @@ class Group:
         # Lockout advisories emitted once per config install, so a toggle loop
         # can't multiply journal lines. See _log_kill.
         self.warned_kill = False
+        # Advisory latch: virtual=false aimed at a device a remapper fronts.
+        self.warned_fronted = False
         self.wake_progress: tuple[bool, ...] | None = None  # last logged (debug)
+
+    @property
+    def virtual_label(self) -> str:
+        """`virtual` as the user wrote it (`self.virtual` is a tri-state)."""
+        return VIRTUAL_LABELS[self.virtual]
 
 
 class Config:
@@ -581,14 +607,95 @@ _GROUP_KEYS = {
 }
 
 
+# A glob metacharacter: `*`, `?`, or a bracket class (`[seq]`, `[!seq]`,
+# `[^seq]`). A pattern containing one is matched as a glob; a pattern without
+# one is matched EXACTLY (see _dev_matches). An unclosed `[` is literal, as in
+# bash/fnmatch, so it does not turn a pattern into a glob.
+_GLOB_META_RE = re.compile(r"[*?]|\[[!^]?\]?[^]]*\]")
+# `[^seq]` is bash's negated class; fnmatch spells it `[!seq]`. Rewritten at
+# parse time so both work.
+_NEG_CLASS_RE = re.compile(r"\[\^([^]]*\])")
+# Cap on the patterns one matcher entry may expand to. Brace alternation
+# multiplies ("{a,b}{c,d}" -> 4), and a config is accepted from any local uid,
+# so an unbounded expansion would be a cheap memory/CPU DoS.
+MAX_PATTERNS_PER_ENTRY = 256
+
+
+def _is_glob(pattern: str) -> bool:
+    """True if `pattern` carries a glob metacharacter (so fnmatch it rather
+    than compare it exactly)."""
+    return _GLOB_META_RE.search(pattern) is not None
+
+
+def _split_braces(pattern: str) -> list[str] | None:
+    """Expand the first bash-style brace alternation: "a{b,c}d" -> ["abd","acd"].
+
+    Returns None when there is nothing left to expand. Braces may nest, and the
+    alternatives are re-scanned by the caller. As in bash, a `{` with no `}` and
+    a group with no top-level comma are literal.
+    """
+    start = -1
+    while True:
+        start = pattern.find("{", start + 1)
+        if start == -1:
+            return None
+        depth = 0
+        parts: list[str] = []
+        chunk = start + 1
+        for i in range(start, len(pattern)):
+            c = pattern[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    if not parts:  # comma-less group: literal braces
+                        break
+                    parts.append(pattern[chunk:i])
+                    prefix, suffix = pattern[:start], pattern[i + 1 :]
+                    return [prefix + part + suffix for part in parts]
+            elif c == "," and depth == 1:
+                parts.append(pattern[chunk:i])
+                chunk = i + 1
+        # unmatched `{` or comma-less group: keep it literal, try the next one
+
+
+def _expand_entry(pattern: str, where: str, field: str) -> list[str]:
+    """Turn one matcher entry into the fnmatch-ready patterns it stands for.
+
+    fnmatch has no braces, so bash brace alternation is expanded here, once at
+    parse time, and `[^seq]` is rewritten to fnmatch's `[!seq]`.
+    """
+    done: list[str] = []
+    pending = [pattern]
+    while pending:
+        if len(done) + len(pending) > MAX_PATTERNS_PER_ENTRY:
+            raise ConfigError(
+                f"{where}: '{field}' entry expands to more than "
+                f"{MAX_PATTERNS_PER_ENTRY} patterns"
+            )
+        alternatives = _split_braces(pending[0])
+        if alternatives is None:
+            done.append(pending.pop(0))
+        else:
+            pending[:1] = alternatives
+    return [_NEG_CLASS_RE.sub(r"[!\1", p) for p in done]
+
+
 def _as_names(value: object, where: str, field: str) -> list[str]:
     """Coerce a matcher field (string or list of strings) to a list of
-    lowercased patterns (each matched as a substring or an fnmatch glob)."""
+    lowercased patterns (each matched exactly, or as an fnmatch glob when it
+    holds a glob metacharacter)."""
     if isinstance(value, str):
         value = [value]
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
         raise ConfigError(f"{where}: '{field}' must be a string or list of strings")
-    names = [v.strip().lower() for v in value if v.strip()]
+    names: list[str] = []
+    for v in value:
+        v = v.strip().lower()
+        if v:
+            names.extend(_expand_entry(v, where, field))
+    names = list(dict.fromkeys(names))  # de-dup, keep order (for `detect`)
     if not names:
         raise ConfigError(f"{where}: '{field}' is empty")
     return names
@@ -628,7 +735,7 @@ def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
     kill_raw = table.get("kill_combo", defaults["kill_combo"])
     wake_raw = table.get("wake_combo", defaults["wake_combo"])
     # `virtual` describes a target's nature, so it is per-group only (default
-    # false) and never inherited from the top-level defaults. `virtual_keyboard`
+    # "auto") and never inherited from the top-level defaults. `virtual_keyboard`
     # is the deprecated alias (applied to all classes now, not just keyboards).
     if "virtual" in table and "virtual_keyboard" in table:
         raise ConfigError(
@@ -640,9 +747,13 @@ def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
             f"warning: {where}: 'virtual_keyboard' is deprecated — use 'virtual'",
             PRI_WARN,
         )
-    virtual = table.get("virtual", table.get("virtual_keyboard", False))
-    if not isinstance(virtual, bool):
-        raise ConfigError(f"{where}: 'virtual' must be true or false")
+    virtual = table.get("virtual", table.get("virtual_keyboard", "auto"))
+    if isinstance(virtual, str) and virtual.strip().lower() == "auto":
+        virtual = None  # the tri-state's third value; see Group.virtual
+    # bool first: a TOML integer is not a valid `virtual`, but 1 == True would
+    # sail through any equality-based check.
+    elif not isinstance(virtual, bool):
+        raise ConfigError(f"{where}: 'virtual' must be true, false, or \"auto\"")
     # Optional display label, shown by the tray instead of the group's table key.
     # Purely cosmetic: identity (control commands, killed-state preservation
     # across a re-push) stays the group name.
@@ -827,21 +938,51 @@ def is_virtual(dev: InputDevice) -> bool:
     )
 
 
-def fronted_phys(devices: Iterable[InputDevice]) -> set[str]:
-    """phys values of physical devices that an input-remapper forwarded device
-    currently fronts.
+_IR_PHYS_PREFIX = "input-remapper/"
+_IR_NAME_PREFIX = "input-remapper "
+_IR_NAME_SUFFIX = " forwarded"
 
-    Since input-remapper 2.2.1 a forwarded device carries the phys of the
-    hardware it fronts, prefixed with "input-remapper/". That gives a direct
-    link back to the physical device, so we can decline to target hardware
-    that something else is already responsible for grabbing.
+
+def fronting_map(devices: dict[str, InputDevice]) -> dict[str, tuple[str, InputDevice]]:
+    """Map the path of each fronted physical device to its forwarded copy.
+
+    input-remapper "fronts" a device: it grabs the hardware and re-emits the
+    events through a virtual forwarded device. Pairing the two lets kb-kill
+    target the copy instead of fighting for the original (see
+    KbKill._resolve_targets).
+
+    Two pairings, because input-remapper 2.2.1 (commit 91f9753) moved the
+    marker. Since 2.2.1 the forwarded device carries the fronted hardware's
+    phys as "input-remapper/<orig phys>" — the reliable link, and the only one
+    that survives 2.2.1 truncating the copied name to 80 characters. Up to
+    2.2.0 phys was left unset, so fall back to the name it used then,
+    "input-remapper <orig name> forwarded".
+
+    Pairing is strictly per device. "Prefer a virtual device whenever any
+    virtual device matched" would be simpler and wrong: with `keyboards = "*"`
+    it silently drops every unmanaged physical keyboard from the group.
     """
-    out: set[str] = set()
-    for dev in devices:
+    by_phys: dict[str, tuple[str, InputDevice]] = {}
+    by_name: dict[str, tuple[str, InputDevice]] = {}
+    for path, dev in devices.items():
         phys = (dev.phys or "").lower()
-        prefix = "input-remapper/"
-        if phys.startswith(prefix) and len(phys) > len(prefix):
-            out.add(phys[len(prefix) :])
+        if phys.startswith(_IR_PHYS_PREFIX) and len(phys) > len(_IR_PHYS_PREFIX):
+            by_phys[phys[len(_IR_PHYS_PREFIX) :]] = (path, dev)
+        name = (dev.name or "").lower()
+        if name.startswith(_IR_NAME_PREFIX) and name.endswith(_IR_NAME_SUFFIX):
+            fronted = name[len(_IR_NAME_PREFIX) : -len(_IR_NAME_SUFFIX)]
+            if fronted:
+                by_name[fronted] = (path, dev)
+
+    out: dict[str, tuple[str, InputDevice]] = {}
+    for path, dev in devices.items():
+        if is_virtual(dev):
+            continue  # a forwarded device is never itself fronted
+        front = by_phys.get((dev.phys or "").lower()) or by_name.get(
+            (dev.name or "").lower()
+        )
+        if front is not None:
+            out[path] = front
     return out
 
 
@@ -939,14 +1080,19 @@ class KbKill:
 
         A device matches when its name matches an applicable matcher field:
         `keyboards` (keyboard-class only), `pointers` (pointer-class only), or
-        `devices` (any class). Each entry matches as a case-insensitive substring
-        or, additively, as a glob (fnmatch: `*`, `?`, `[seq]`) against the whole
-        name — so a bare `*` matches every device.
+        `devices` (any class). Matching is case-insensitive and against the
+        WHOLE name: an entry holding a glob metacharacter (`*`, `?`, `[seq]`;
+        `{a,b}` was already expanded at parse time) is matched with fnmatch — so
+        a bare `*` matches every device — and any other entry must match
+        exactly. There is no substring matching: wrap it in `*` for that.
         """
         low = (dev.name or "").lower()
 
-        def hit(subs: list[str]) -> bool:
-            return any(s in low or fnmatch.fnmatchcase(low, s) for s in subs)
+        def hit(patterns: list[str]) -> bool:
+            return any(
+                fnmatch.fnmatchcase(low, p) if _is_glob(p) else low == p
+                for p in patterns
+            )
 
         if hit(group.keyboards) and is_keyboard(dev):
             return True
@@ -957,34 +1103,37 @@ class KbKill:
         return False
 
     def _resolve_targets(self, group: Group) -> dict[str, InputDevice]:
-        """Pick the devices to grab for a group.
+        """Pick the devices to grab for a group, honouring `virtual`.
 
-        For a `virtual` group (one fronted by an input-remapper "forwarded"
-        device), target only the virtual device(s) and never the physical one,
-        so input-remapper can always keep/regrab the physical device. For an
-        ordinary group, grab whatever matches, minus any physical device that a
-        forwarded device is currently fronting.
+        Under "auto" (the default) each matched device is swapped for the
+        forwarded copy of it that a remapper fronts, if there is one — so a
+        matcher naming the physical keyboard keeps working when input-remapper
+        starts, stops, or restarts, and the physical device is left for
+        input-remapper to (re)grab. Never targeting fronted hardware matters
+        beyond politeness: _reconcile_grabs() retries a failed grab on every key
+        event, so a kill held across an input-remapper restart would poll until
+        the physical device came free and then steal it.
+
+        `virtual = true` narrows that to virtual devices only, never a physical
+        one — including an unfronted match, which auto would still grab.
+        `virtual = false` disables the swap: the group targets exactly what its
+        matchers named. See Group.virtual.
         """
         matched = {p: d for p, d in self.devices.items() if self._dev_matches(group, d)}
-        if group.virtual:
-            return {p: d for p, d in matched.items() if is_virtual(d)}
+        if group.virtual is False:
+            return matched  # escape hatch: no pairing, no filtering
 
-        # Even without an explicit `virtual`, never target hardware that an
-        # input-remapper forwarded device fronts. Grabbing it would break
-        # input-remapper, and _reconcile_grabs() retries failed grabs on every
-        # key event — so a kill held across an input-remapper restart would
-        # poll until the physical device came free and then take it. The check
-        # is per-device via phys, not "prefer virtual whenever any virtual
-        # matched", so a `keyboards = "*"` group still grabs unmanaged
-        # keyboards normally.
-        fronted = fronted_phys(self.devices.values())
-        if not fronted:
-            return matched
-        return {
-            p: d
-            for p, d in matched.items()
-            if is_virtual(d) or (d.phys or "").lower() not in fronted
-        }
+        fronting = fronting_map(self.devices)
+        out: dict[str, InputDevice] = {}
+        for path, dev in matched.items():
+            front = fronting.get(path)
+            if front is None:
+                out[path] = dev  # nothing fronts it: the device itself
+            else:
+                out[front[0]] = front[1]  # its forwarded copy instead
+        if group.virtual:
+            return {p: d for p, d in out.items() if is_virtual(d)}
+        return out
 
     # -- device lifecycle ---------------------------------------------------- #
     def _add_device(self, path: str, dev: InputDevice) -> None:
@@ -1088,8 +1237,23 @@ class KbKill:
         config push lands (pointer devices are only opened by that rescan, so
         checking earlier would false-positive) — and logs only on transitions:
         once when a group goes empty, once when a device appears for it.
+
+        Also advises once when `virtual = false` aims a group at hardware a
+        remapper fronts: that is the one setting that opts out of the pairing
+        in _resolve_targets, so the grab will fight input-remapper for it.
         """
+        fronting = fronting_map(self.devices)
         for group in self.groups:
+            if group.virtual is False and not group.warned_fronted:
+                fronted = [d for p, d in group.targets.items() if p in fronting]
+                if fronted:
+                    group.warned_fronted = True
+                    CTRL_LOG.emit(
+                        f"[{group.name}] warning: virtual=false targets "
+                        f"{len(fronted)} device(s) a remapper already fronts — "
+                        'the grab will fight it (use "auto" unless you mean to)',
+                        PRI_WARN,
+                    )
             if group.targets:
                 if group.warned_empty:
                     group.warned_empty = False
@@ -1100,20 +1264,22 @@ class KbKill:
             if group.warned_empty:
                 continue
             group.warned_empty = True
-            if group.virtual and any(
+            if group.virtual is True and any(
                 self._dev_matches(group, d) for d in self.devices.values()
             ):
                 CTRL_LOG.emit(
                     f"[{group.name}] warning: matches only physical devices and "
-                    "virtual=true skips them — nothing will be grabbed (drop "
-                    "'virtual' unless input-remapper fronts this device)",
+                    "virtual=true skips them — nothing will be grabbed (use "
+                    '"auto" unless input-remapper fronts this device)',
                     PRI_WARN,
                 )
             else:
                 CTRL_LOG.emit(
                     f"[{group.name}] warning: matches no present device — "
                     "nothing will be grabbed until one appears (check the "
-                    "matchers against `kb-kill-daemon detect`)",
+                    "matchers against `kb-kill-daemon detect`; an entry with no "
+                    "wildcard must equal the whole name — wrap it in * to match "
+                    "part of one)",
                     PRI_WARN,
                 )
 
@@ -1804,7 +1970,9 @@ def cmd_detect(config: Config) -> int:
         )
         shown = f' (shown as "{g.label}")' if g.label else ""
         print(f"  [{g.name}]{shown}  {matchers}")
-        print(f"  {'':9}kill={g.kill_raw}  wake={g.wake_raw}  virtual={g.virtual}")
+        print(
+            f"  {'':9}kill={g.kill_raw}  wake={g.wake_raw}  virtual={g.virtual_label}"
+        )
     print()
 
     if os.geteuid() != 0:
@@ -1823,6 +1991,7 @@ def cmd_detect(config: Config) -> int:
     for g in config.groups:
         g.targets = svc._resolve_targets(g)
 
+    fronting = fronting_map(devices)
     print("Devices:")
     for path in sorted(devices):
         dev = devices[path]
@@ -1830,12 +1999,18 @@ def cmd_detect(config: Config) -> int:
         virt = "virtual " if is_virtual(dev) else "physical"
         target_of = [g.name for g in config.groups if path in g.targets]
         matched_of = [g.name for g in config.groups if svc._dev_matches(g, dev)]
+        front = fronting.get(path)
         if target_of:
             mark = f"TARGET of {', '.join(target_of)} (grabbed when killed)"
+        elif matched_of and front is not None:
+            mark = (
+                f"matches {', '.join(matched_of)}, but a remapper fronts it — "
+                f"the group targets {front[0]} instead"
+            )
         elif matched_of:
             mark = (
                 f"matches {', '.join(matched_of)}, but skipped "
-                "(virtual=true ignores the physical device)"
+                "(virtual=true ignores a device nothing fronts)"
             )
         else:
             mark = "monitored only (can trigger any hotkey)"
@@ -1849,16 +2024,20 @@ def cmd_detect(config: Config) -> int:
     if empty:
         print()
         for g in empty:
-            if g.virtual and any(svc._dev_matches(g, d) for d in devices.values()):
+            if g.virtual is True and any(
+                svc._dev_matches(g, d) for d in devices.values()
+            ):
                 print(
                     f"WARNING: [{g.name}] matches only physical devices and "
-                    "virtual=true skips them —\n  nothing will be grabbed. Drop "
-                    "'virtual' unless input-remapper fronts this device."
+                    'virtual=true skips them —\n  nothing will be grabbed. Use "auto" '
+                    "unless a remapper fronts this device."
                 )
             else:
                 print(
                     f"WARNING: [{g.name}] matches no present device — nothing "
-                    "will be grabbed until one appears."
+                    "will be grabbed until one appears. An entry with no "
+                    "wildcard must equal the whole device name; wrap it in * "
+                    "to match part of one."
                 )
     for dev in devices.values():
         dev.close()

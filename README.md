@@ -184,18 +184,39 @@ target keyboard but no combo is a config error).
 A simple single-keyboard config:
 
 ```toml
-keyboards  = "AT Translated Set 2 keyboard"
+keyboards  = "AT Translated Set 2 keyboard"   # exact name (`detect` shows it)
 kill_combo = "ctrl+alt+shift+k"   # required — no default hotkey exists
 wake_combo = "ctrl+alt+shift+u"   # required; always honored on the killed keyboard
-virtual    = true                 # input-remapper-managed; see coexistence below
+# virtual defaults to "auto": if input-remapper fronts this keyboard, kb-kill
+# targets its forwarded copy instead. See coexistence below.
 ```
 
 A group picks its targets with up to three **name-matcher fields**, each a string
-or a list of strings, matched case-insensitively against device names
-(`kb-kill-daemon detect` shows the names). Each entry matches as a **substring**
-*or* a **glob** (`fnmatch`: `*`, `?`, `[seq]`) of the whole name — so `"razer"`
-matches by substring, `"logitech mx*"` globs, and a bare `"*"` matches every
-device of that class. **At least one** field is required:
+or a list of strings, matched case-insensitively against the **whole** device name
+(`kb-kill-daemon detect` shows the names). An entry that contains no wildcard is
+an **exact** match; one that contains a bash-style glob metacharacter is matched
+as a **glob**:
+
+| entry                           | matches                                                               |
+| ------------------------------- | --------------------------------------------------------------------- |
+| `"Logitech USB Keyboard"`       | that name and nothing else (exact, case-insensitive)                  |
+| `"*razer*"`                     | any name containing "razer" (the substring match)                     |
+| `"logitech mx*"`                | any name starting with "logitech mx"                                  |
+| `"Video Bu?"`                   | `?` — exactly one character                                           |
+| `"*pcm=[37]"`                   | `[seq]` — one character from the set; `[!seq]` and `[^seq]` negate it |
+| `"Logitech {MX*,USB Keyboard}"` | `{a,b}` — either alternative (braces may nest)                        |
+| `"*"`                           | every device of that class                                            |
+
+> **Breaking change (after 0.3.1):** a wildcard-free entry used to match as a
+> *substring*; it is now exact — add `*` around it (`"*razer*"`) for the old
+> behaviour.
+> Substring entries silently match too much: `"Logitech USB Keyboard"` also
+> caught `"Logitech USB Keyboard Consumer Control"`. Watch for two cases in
+> particular — an input-remapper `virtual = true` group, whose forwarded device
+> may be named `"input-remapper <name> forwarded"`, and any name over 80
+> characters, which input-remapper truncates; both want a `*` on each end.
+
+**At least one** field is required:
 
 | field       | matches                                                 |
 | ----------- | ------------------------------------------------------- |
@@ -223,13 +244,29 @@ error is logged and the previous config is kept. (Switching to a *different* use
 however, always starts that user's config **awake** — see
 [Multiple users](#multiple-users).) The tray updates its menu automatically.
 
-`virtual` (default `false`; the old name `virtual_keyboard` still works as a
-deprecated alias): set `true` when the target is fronted by an input-remapper
-"forwarded" virtual device — kb-kill then targets that virtual device and never
-the physical one. Leave it `false` for an ordinary device, which kb-kill grabs
-directly. The flag is **group-wide**, so a single group is either all-forwarded or
-match-anything; to disable a *physical* target and a *virtual* one at once, use
-two groups sharing the same `kill_combo`/`wake_combo` — they toggle together.
+`virtual` — `"auto"` (the default), `true`, or `false`; the old name
+`virtual_keyboard` still works as a deprecated alias. It says how the group
+should treat a device that a remapper **fronts** (grabs, then re-emits through a
+virtual "forwarded" copy):
+
+| value    | behaviour                                                                                                                                                                               |
+| -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `"auto"` | **Default.** Per device: target the forwarded copy of anything a remapper fronts, otherwise the device itself. Name the hardware and it works whether or not input-remapper is running. |
+| `true`   | Virtual devices only — never a physical one, even an unfronted match. Use when a group must never touch hardware.                                                                       |
+| `false`  | Literal: target exactly what the matchers named, fronted or not. The escape hatch (see below) — and the only value that can fight input-remapper for a grab.                            |
+
+`"auto"` recognises input-remapper specifically: since 2.2.1 a forwarded device
+carries the fronted device's `phys` as `input-remapper/<phys>`, and up to 2.2.0 it
+was named `input-remapper <name> forwarded`; kb-kill pairs on either. It cannot
+recognise a remapper that leaves no such link — **kanata**, `keyd`, and `evremap`
+don't mark their output, and kanata sets no `phys` at all, so nothing ties its
+device back to the keyboard it grabbed. There, point the matcher at the remapper's
+own output device by name, and use `virtual = false` if you deliberately want the
+grab to land on the hardware.
+
+The value is **group-wide**; to disable a *physical* target and a *virtual* one at
+once, use two groups sharing the same `kill_combo`/`wake_combo` — they toggle
+together.
 
 ### Multiple users
 
@@ -279,11 +316,11 @@ wake_combo = "ctrl+alt+shift+u"               # default, inherited below
 
 keyboards  = "AT Translated Set 2 keyboard"   # default group (the laptop)
 kill_combo = "ctrl+alt+shift+k"
-virtual    = true                             # input-remapper-managed
+# virtual = "auto" (the default) follows input-remapper if it fronts this one
 
 [groups.externals]
-keyboards  = ["KBDfans", "solaar-keyboard"]
-pointers   = "Logitech"                       # kill this keyboard + mouse together
+keyboards  = ["KBDfans*", "solaar-keyboard"]  # glob / exact name
+pointers   = "Logitech*"                      # kill this keyboard + mouse together
 kill_combo = "ctrl+alt+shift+j"
 wake_combo = "ctrl+alt+shift+m"               # overrides the default
 # virtual defaults to false → grabbed directly
@@ -471,14 +508,24 @@ When input-remapper manages a keyboard it grabs the **physical** device (e.g.
 - a per-keyboard `…forwarded` device for **un-remapped** (passthrough) keys, and
 - the shared `input-remapper keyboard` device for the **output of mappings**.
 
-Mark such a group **`virtual = true`** and kb-kill targets the
-**forwarded** (virtual) device and **never the physical one**, so input-remapper
-can always (re)grab the physical keyboard — including across an input-remapper
-restart (kb-kill re-attaches by name). If the forwarded device isn't present
-(input-remapper not running), a `virtual` group simply grabs nothing
-rather than risk fighting input-remapper for the physical device. (This applies to
-pointers too — input-remapper can forward mice — so `virtual` is no longer
-keyboard-specific; the old name `virtual_keyboard` remains a deprecated alias.)
+**You don't have to configure this.** With `virtual` left at its default
+`"auto"`, kb-kill pairs each matched device with the forwarded copy that fronts it
+and targets the copy, so input-remapper can always (re)grab the physical keyboard
+— including across an input-remapper restart, and including the case where
+input-remapper isn't running at all, where the same group simply grabs the
+hardware. Set **`virtual = true`** to forbid a group from ever touching a physical
+device (it then grabs nothing while input-remapper is stopped), and
+**`virtual = false`** to switch the pairing off. (This applies to pointers too —
+input-remapper can forward mice — so `virtual` is not keyboard-specific; the old
+name `virtual_keyboard` remains a deprecated alias.)
+
+Under the default `virtual = "auto"` you can **name the physical device** and let
+kb-kill find the forwarded copy — that pairing is by `phys`/naming convention, not
+by your matcher, so it survives input-remapper 2.2.1 truncating the copied name to
+80 characters. Only if you match the forwarded device *by name* do you need to know
+its naming (`input-remapper <name> forwarded` up to 2.2.0, the bare name since
+2.2.1) — `"*AT Translated Set 2*"` covers both layouts. `detect` shows which
+devices are present and which one each group actually targets.
 
 Two consequences worth knowing:
 
@@ -494,8 +541,14 @@ Two consequences worth knowing:
    they exist **after** remapping (e.g. if CapsLock is mapped to Ctrl, press
    CapsLock for the `ctrl` token).
 
-For a keyboard that input-remapper doesn't manage, leave `virtual`
-at its default (`false`) and kb-kill grabs the physical keyboard directly.
+For a keyboard no remapper manages, the default `"auto"` finds nothing to pair
+with and kb-kill grabs the physical keyboard directly.
+
+**Other remappers** — kanata, `keyd`, `evremap` — leave no link between their
+output device and the keyboard they grabbed (kanata sets no `phys` at all), so
+`"auto"` cannot pair them: it sees an ordinary keyboard plus an unrelated virtual
+device. Match the remapper's output device by name (`detect` lists it) and, if you
+mean to grab the hardware the remapper holds, say `virtual = false` explicitly.
 
 ## Security model
 

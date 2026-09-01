@@ -100,9 +100,14 @@ kill/wake combo + a `killed` flag + `virtual` flag. Targets are chosen by up to 
 name matcher fields, one per device class: `keyboards` (keyboard-class,
 `is_keyboard()`), `pointers` (mice/trackballs/touchpads, `is_pointer()`), and `devices`
 (any class). A group needs ≥1; several fields kill multiple classes together. Each entry
-matches as a case-insensitive **substring OR glob** (`fnmatch`: `*`/`?`/`[seq]`) of the
-whole name — substring kept for backward compat, so a bare `*` matches all (see
-`_dev_matches`). Config produces a list of `Group`s: top-level keys form the "default"
+matches the whole name case-insensitively: **exact unless it holds a glob
+metacharacter**, in which case `fnmatch` (`*`/`?`/`[seq]`/`[!seq]`). Bash brace
+alternation (`{a,b}`, nestable) is expanded at parse time in `_expand_entry` (fnmatch
+has no braces) and `[^seq]` is rewritten to `[!seq]`; expansion is capped at
+`MAX_PATTERNS_PER_ENTRY` because configs come from any local uid. Substring matching
+was **removed after 0.3.1** (`"*razer*"` replaces `"razer"`) — it silently over-matched
+(`"Logitech USB Keyboard"` also caught `"… Consumer Control"`). See `_dev_matches` /
+`_is_glob`. Config produces a list of `Group`s: top-level keys form the "default"
 group (and supply combo defaults inherited by `[groups.*]` tables). Each group
 kills/wakes independently; `_reconcile_grabs()` makes the grabbed-device set equal the
 union of every *killed* group's targets. Pointer devices are only *opened*
@@ -132,14 +137,31 @@ dead). The latch makes a *stuck* held key a lockout risk rather than just noise,
 `active_keys()` — it only ever **drops** keys, never adds, so it can never complete a
 combo or fire a hotkey, only re-arm one. Don't make it additive.
 
-**input-remapper coexistence** (`_resolve_targets` + `virtual`): a `virtual = true`
-group targets *only* the input-remapper "forwarded" virtual device (`is_virtual()`),
-never the physical device, so input-remapper can always re-grab the physical device.
-Ordinary groups grab matching physical devices directly. The flag is group-wide and
-applies after the class-matching in `_dev_matches`, so a single group can't mix physical
-and virtual targets — use two groups sharing a combo (they toggle together). `virtual`
-was renamed from `virtual_keyboard` (still accepted as a deprecated alias) since it now
-applies to pointers too.
+**input-remapper coexistence** (`fronting_map` + `_resolve_targets` + `virtual`):
+`virtual` is a **tri-state** — `"auto"` (the default, stored as `None`), `true`, `false`
+— applied after the class-matching in `_dev_matches`:
+
+- **`"auto"`** pairs each matched device with the forwarded copy that *fronts* it and
+  targets the copy, so the physical device stays free for input-remapper to re-grab.
+  Pairing must be **per device**: "prefer virtual whenever any virtual matched" would
+  silently drop every unmanaged keyboard from a `keyboards = "*"` group.
+  `fronting_map()` pairs two ways, because input-remapper 2.2.1 moved the marker —
+  by `phys` (`input-remapper/<orig phys>`, 2.2.1+, and the only link that survives
+  2.2.1 truncating the copied name to 80 chars) and by the ≤2.2.0 name
+  (`input-remapper <orig> forwarded`).
+- **`true`** keeps only `is_virtual()` targets — never a physical device, even an
+  unfronted one, so the group grabs nothing while the remapper is stopped.
+- **`false`** is literal (no pairing, no filtering): the escape hatch for a remapper
+  that leaves no link — kanata/keyd/evremap mark nothing, and kanata sets no `phys` —
+  and the only value that can fight input-remapper for a grab, so `_warn_empty_groups`
+  advises once (`warned_fronted`) when it aims at fronted hardware.
+
+Grabbing fronted hardware is not just impolite: `_reconcile_grabs()` retries a failed
+grab on every key event, so a kill held across an input-remapper restart would poll
+until the physical device came free and then steal it. The value is group-wide, so one
+group can't mix physical and virtual targets — use two groups sharing a combo (they
+toggle together). `virtual` was renamed from `virtual_keyboard` (still accepted as a
+deprecated alias) since it now applies to pointers too.
 
 **Grab-deferral invariant:** grabbing a device with keys currently held would swallow
 their key-ups and leave them stuck down at the OS. So `_reconcile_grabs()` defers

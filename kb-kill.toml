@@ -24,12 +24,14 @@
 #     a matcher field. Their kill_combo/wake_combo also act as DEFAULTS inherited
 #     by every [groups.*] table (`virtual` is per-group, never inherited).
 #   * Each [groups.<name>] table adds another group, inheriting kill_combo /
-#     wake_combo it doesn't set. `virtual` defaults to false per group.
+#     wake_combo it doesn't set. `virtual` defaults to "auto" per group.
 #   * A group is matched by up to three name fields (case-insensitive; each a
-#     string or list of strings). An entry matches as a substring OR a glob
-#     (fnmatch: * ? [seq]) of the whole device name — so "razer" matches by
-#     substring, "logitech mx*" globs, and a bare "*" matches every device of
-#     that class. At least ONE is required — set several to target them together:
+#     string or list of strings). An entry is matched against the WHOLE device
+#     name: EXACTLY if it has no wildcard, otherwise as a bash-style glob
+#     (* ? [seq] [!seq] {a,b}) — so "Logitech USB Keyboard" matches only that
+#     device, "*razer*" is the substring match, "logitech mx*" globs, and a bare
+#     "*" matches every device of that class.
+#     At least ONE is required — set several to target them together:
 #       keyboards = ...   → keyboard-class devices only
 #       pointers  = ...   → pointing devices only (mice, trackballs, touchpads)
 #       devices   = ...   → ANY input device, regardless of class
@@ -47,15 +49,21 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─── Default group (uncomment + edit to enable) ───────────────────────────────
-# keyboards  = "AT Translated Set 2 keyboard"   # your keyboard (see `detect`)
+# keyboards  = "AT Translated Set 2 keyboard"   # exact name (see `detect`)
 # kill_combo = "ctrl+alt+shift+k"               # required — no default
 # wake_combo = "ctrl+alt+shift+w"               # required — no default
 #
-# Set true only if this device is fronted by an input-remapper "forwarded"
-# virtual device: kb-kill then targets that virtual device and never the
-# physical one, so input-remapper keeps/regrabs the physical device. Leave false
-# (the default) for an ordinary device, which kb-kill grabs directly.
-# virtual = false
+# `virtual` says what to do about a remapper that "fronts" a device (grabs it and
+# re-emits its events through a virtual "forwarded" copy):
+#   "auto"  the DEFAULT — leave it out. Per device: kb-kill targets the forwarded
+#           copy if input-remapper fronts this device, else the device itself. So
+#           the name above keeps working whether input-remapper runs or not.
+#   true    virtual devices ONLY — never a physical one, so a group that must
+#           never touch hardware grabs nothing while the remapper is stopped.
+#   false   literal: grab exactly what the matcher named. The escape hatch for a
+#           remapper kb-kill can't detect (kanata/keyd/evremap mark nothing), and
+#           the only value that can fight input-remapper for a grab.
+# virtual = "auto"
 
 # ─── A pointer group (optional) ───────────────────────────────────────────────
 # Disable mice/touchpads; wake with a mouse-button combo so the pointer can wake
@@ -71,7 +79,7 @@
 # One hotkey kills a keyboard AND a mouse together.
 #
 # [groups.externals]
-# keyboards  = ["KBDfans", "some-other-keyboard"]
-# pointers   = "Logitech"
+# keyboards  = ["KBDfans*", "some-other-keyboard"]   # glob / exact name
+# pointers   = "Logitech*"
 # kill_combo = "ctrl+alt+shift+j"
 # wake_combo = "ctrl+alt+shift+n"
