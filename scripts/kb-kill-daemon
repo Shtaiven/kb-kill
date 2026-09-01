@@ -56,6 +56,7 @@ import struct
 import sys
 import time
 import tomllib
+from collections.abc import Iterable
 from pathlib import Path
 
 try:
@@ -806,10 +807,42 @@ def is_pointer(dev: InputDevice) -> bool:
 
 
 def is_virtual(dev: InputDevice) -> bool:
-    """True for uinput / forwarded devices (e.g. input-remapper output)."""
+    """True for uinput / forwarded devices (e.g. input-remapper output).
+
+    input-remapper changed its forwarded-device naming in 2.2.1 (commit
+    91f9753). Before: name "input-remapper <orig> forwarded", phys left unset
+    so python-evdev's default "py-evdev-uinput" applied. Since: name is the
+    bare original (truncated to 80 chars) and the marker moved to phys as
+    "input-remapper/<orig phys>". Checking phys for the marker as well as for
+    "uinput" covers both layouts; without it, forwarded devices on 2.2.1+ are
+    classified as physical and a `virtual` group silently grabs nothing.
+    """
     phys = (dev.phys or "").lower()
     name = (dev.name or "").lower()
-    return "uinput" in phys or "forwarded" in name or "input-remapper" in name
+    return (
+        "uinput" in phys
+        or "input-remapper" in phys
+        or "forwarded" in name
+        or "input-remapper" in name
+    )
+
+
+def fronted_phys(devices: Iterable[InputDevice]) -> set[str]:
+    """phys values of physical devices that an input-remapper forwarded device
+    currently fronts.
+
+    Since input-remapper 2.2.1 a forwarded device carries the phys of the
+    hardware it fronts, prefixed with "input-remapper/". That gives a direct
+    link back to the physical device, so we can decline to target hardware
+    that something else is already responsible for grabbing.
+    """
+    out: set[str] = set()
+    for dev in devices:
+        phys = (dev.phys or "").lower()
+        prefix = "input-remapper/"
+        if phys.startswith(prefix) and len(phys) > len(prefix):
+            out.add(phys[len(prefix) :])
+    return out
 
 
 def grabbed_elsewhere(dev: InputDevice) -> bool:
@@ -929,12 +962,29 @@ class KbKill:
         For a `virtual` group (one fronted by an input-remapper "forwarded"
         device), target only the virtual device(s) and never the physical one,
         so input-remapper can always keep/regrab the physical device. For an
-        ordinary group, grab whatever matches directly.
+        ordinary group, grab whatever matches, minus any physical device that a
+        forwarded device is currently fronting.
         """
         matched = {p: d for p, d in self.devices.items() if self._dev_matches(group, d)}
         if group.virtual:
             return {p: d for p, d in matched.items() if is_virtual(d)}
-        return matched
+
+        # Even without an explicit `virtual`, never target hardware that an
+        # input-remapper forwarded device fronts. Grabbing it would break
+        # input-remapper, and _reconcile_grabs() retries failed grabs on every
+        # key event — so a kill held across an input-remapper restart would
+        # poll until the physical device came free and then take it. The check
+        # is per-device via phys, not "prefer virtual whenever any virtual
+        # matched", so a `keyboards = "*"` group still grabs unmanaged
+        # keyboards normally.
+        fronted = fronted_phys(self.devices.values())
+        if not fronted:
+            return matched
+        return {
+            p: d
+            for p, d in matched.items()
+            if is_virtual(d) or (d.phys or "").lower() not in fronted
+        }
 
     # -- device lifecycle ---------------------------------------------------- #
     def _add_device(self, path: str, dev: InputDevice) -> None:
