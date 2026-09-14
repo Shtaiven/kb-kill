@@ -52,7 +52,7 @@ except ImportError:
     sys.exit(1)
 
 # Rewritten by packaging/bump-version.sh from the repo-root VERSION file.
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 
 _CTRL = frozenset({ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL})
 _ALT = frozenset({ecodes.KEY_LEFTALT, ecodes.KEY_RIGHTALT})
