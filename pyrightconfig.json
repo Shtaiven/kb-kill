@@ -1,6 +1,8 @@
 {
   "include": [
     "scripts/kb-kill-daemon",
+    "scripts/kb-kill-detect",
+    "scripts/kb-kill-monitor",
     "scripts/kb-kill-push",
     "scripts/kb-kill-tray"
   ],

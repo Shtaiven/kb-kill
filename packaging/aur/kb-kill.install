@@ -6,7 +6,7 @@ _notice() {
 
 kb-kill installed. To activate it:
 
-  # the root daemon (system-wide):
+  # the daemon (system-wide, runs unprivileged as a dynamic user):
   sudo systemctl enable --now kb-kill-daemon.service
 
   # the per-user config pusher (+ optional tray) for every user, at next login:
@@ -16,7 +16,7 @@ kb-kill installed. To activate it:
   systemctl --user enable --now kb-kill-push.service kb-kill-tray.service
 
 Edit your config at ~/.config/kb-kill/kb-kill.toml (falls back to
-/etc/kb-kill/kb-kill.toml). See `kb-kill-daemon detect` and the README.
+/etc/kb-kill/kb-kill.toml). See `kb-kill-detect` and the README.
 EOF
 }
 

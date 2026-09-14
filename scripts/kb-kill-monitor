@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""kb-kill-monitor - print raw key events and the daemon's real kill/wake state.
+
+Reads /dev/input directly (needs group `input`, so usually `sudo`) and connects
+to the daemon's control socket for the live combos and state. A `<<<` tag marks
+the instant the held keys form a group's combo; a `>>>` line is a state change
+reported by the daemon itself. --debug also streams the daemon's key-rate
+diagnostics (root only). Nothing is written anywhere but this terminal.
+
+A device the daemon (or a remapper) has grabbed shows no events here: the
+kernel delivers them to the grabber only.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import selectors
+import socket
+import struct
+import sys
+
+try:
+    from evdev import (  # pyright: ignore[reportMissingImports]
+        InputDevice,
+        ecodes,
+        list_devices,
+    )
+except ImportError:
+    sys.exit("kb-kill-monitor: python-evdev is required (python3-evdev / python-evdev)")
+
+# Rewritten by packaging/bump-version.sh from the repo-root VERSION file.
+VERSION = "0.4.1"
+_EVIOCSMASK = 0x40104593
+_MASKED_TYPES = (
+    ecodes.EV_REL,
+    ecodes.EV_ABS,
+    ecodes.EV_MSC,
+    ecodes.EV_SW,
+    ecodes.EV_LED,
+    ecodes.EV_SND,
+    ecodes.EV_FF,
+)
+CTRL = object()
+
+
+def socket_path() -> str:
+    candidates = ["/run/kb-kill/control.sock"]
+    if base := os.environ.get("XDG_RUNTIME_DIR"):
+        candidates.append(os.path.join(base, "kb-kill.sock"))
+    candidates.append(f"/tmp/kb-kill-{os.getuid()}.sock")
+    return next((c for c in candidates if os.path.exists(c)), candidates[0])
+
+
+def is_key_device(dev: InputDevice) -> bool:
+    """Keyboards and pointers (anything with keys or buttons we care about)."""
+    keys = dev.capabilities().get(ecodes.EV_KEY, [])
+    return (
+        ecodes.KEY_ENTER in keys or ecodes.BTN_LEFT in keys or ecodes.BTN_MOUSE in keys
+    )
+
+
+def mask_to_keys(fd: int) -> None:
+    for ev_type in _MASKED_TYPES:
+        try:
+            fcntl.ioctl(fd, _EVIOCSMASK, struct.pack("IIQ", ev_type, 0, 0))
+        except OSError:
+            return
+
+
+def keyname(code: int) -> str:
+    name = ecodes.KEY.get(code, ecodes.BTN.get(code, str(code)))
+    return name[0] if isinstance(name, (list, tuple)) else name
+
+
+def combo_held(codes: list[list[int]], pressed: set[int]) -> bool:
+    return all(pressed.intersection(tok) for tok in codes)
+
+
+def state_word(killed: bool) -> str:
+    return "KILLED" if killed else "AWAKE"
+
+
+class Monitor:
+    def __init__(self, sock_path: str, debug: bool) -> None:
+        self.sel = selectors.DefaultSelector()
+        self.devices: dict[str, InputDevice] = {}
+        self.pressed: dict[str, set[int]] = {}
+        self.groups: dict[str, dict] = {}  # name -> last state entry
+        self.latched: dict[tuple[str, str], bool] = {}
+        self.sock: socket.socket | None = None
+        self.buf = b""
+        for path in sorted(list_devices()):
+            try:
+                dev = InputDevice(path)
+                if not is_key_device(dev):
+                    dev.close()
+                    continue
+                held = set(dev.active_keys())
+            except (OSError, SystemError):
+                continue
+            mask_to_keys(dev.fd)
+            self.devices[path] = dev
+            self.pressed[path] = held
+            self.sel.register(dev, selectors.EVENT_READ, path)
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect(sock_path)
+            s.setblocking(False)
+            s.sendall(b'{"cmd":"status"}\n' + (b'{"cmd":"debug"}\n' if debug else b""))
+            self.sock = s
+            self.sel.register(s, selectors.EVENT_READ, CTRL)
+        except OSError:
+            self.sock = None
+
+    def union(self) -> set[int]:
+        return set().union(*self.pressed.values()) if self.pressed else set()
+
+    def on_daemon(self) -> None:
+        assert self.sock is not None
+        try:
+            chunk = self.sock.recv(65536)
+        except OSError:
+            chunk = b""
+        if not chunk:
+            print(">>> daemon: connection closed")
+            self.sel.unregister(self.sock)
+            self.sock.close()
+            self.sock = None
+            return
+        self.buf += chunk
+        while b"\n" in self.buf:
+            line, self.buf = self.buf.split(b"\n", 1)
+            if not line.strip():
+                continue
+            msg = json.loads(line)
+            kind = msg.get("type")
+            if kind == "state":
+                for g in msg.get("groups", []):
+                    old = self.groups.get(g["name"])
+                    if old is None:
+                        print(
+                            f">>> daemon: [{g['name']}] {state_word(g['killed'])}  kill={g.get('kill', '?')}  wake={g.get('wake', '?')}"
+                        )
+                    elif old["killed"] != g["killed"]:
+                        print(f">>> daemon: [{g['name']}] -> {state_word(g['killed'])}")
+                    self.groups[g["name"]] = g
+            elif kind == "debug":
+                print(f">>> daemon debug: {msg.get('msg')}")
+            elif kind == "error":
+                print(f">>> daemon: {msg.get('error')}")
+
+    def on_device(self, path: str) -> None:
+        dev = self.devices[path]
+        try:
+            events = list(dev.read())
+        except OSError:
+            return
+        for ev in events:
+            if ev.type != ecodes.EV_KEY or ev.value == 2:
+                continue
+            (self.pressed[path].add if ev.value == 1 else self.pressed[path].discard)(
+                ev.code
+            )
+            held = self.union()
+            tags = []
+            for name, g in self.groups.items():
+                for kind, codes in (
+                    ("kill", g.get("kill_codes")),
+                    ("wake", g.get("wake_codes")),
+                ):
+                    if not codes:
+                        continue
+                    now = combo_held(codes, held)
+                    if now and not self.latched.get((name, kind), False):
+                        tags.append(f"{kind} combo held [{name}]")
+                    self.latched[(name, kind)] = now
+            tag = f"  <<< {', '.join(tags)}" if tags else ""
+            action = "DOWN" if ev.value == 1 else "UP  "
+            print(f"{path:20} {dev.name[:34]:34} {keyname(ev.code):16} {action}{tag}")
+
+    def run(self) -> int:
+        if not self.devices:
+            print(
+                "no readable input devices: run with sudo (or as a member of group input)"
+            )
+            return 1
+        print(
+            "kb-kill-monitor: raw key events from every readable device. Ctrl+C to stop."
+        )
+        print(
+            f"daemon: {'CONNECTED' if self.sock else 'NOT RUNNING (raw events only, no state)'}\n"
+        )
+        try:
+            while True:
+                for key, _ in self.sel.select():
+                    if key.data is CTRL:
+                        self.on_daemon()
+                    else:
+                        self.on_device(key.data)
+        except KeyboardInterrupt:
+            return 0
+        finally:
+            for dev in self.devices.values():
+                dev.close()
+            if self.sock is not None:
+                self.sock.close()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="kb-kill-monitor",
+        description="Print raw key events and the kb-kill daemon's real KILLED/AWAKE state.",
+    )
+    parser.add_argument(
+        "-s", "--socket", default=socket_path(), help="daemon control socket"
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="also stream the daemon's key-rate diagnostics (root only)",
+    )
+    parser.add_argument(
+        "-V", "--version", action="version", version=f"kb-kill-monitor {VERSION}"
+    )
+    args = parser.parse_args()
+    return Monitor(args.socket, args.debug).run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

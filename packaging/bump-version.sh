@@ -12,9 +12,7 @@
 #
 # Synced locations:
 #   VERSION                    the source of truth
-#   scripts/kb-kill-daemon     VERSION = "..."   (--version output)
-#   scripts/kb-kill-push       VERSION = "..."
-#   scripts/kb-kill-tray       VERSION = "..."
+#   scripts/*                  VERSION = "..."   (--version output; every script)
 #   packaging/aur/PKGBUILD     pkgver=  (pkgrel reset to 1, sha256sums to SKIP)
 #
 # The release workflow runs `--check "${GITHUB_REF_NAME#v}"` before building,
@@ -25,7 +23,7 @@ set -euo pipefail
 
 cd "$(dirname "$(readlink -f "$0")")/.."
 
-SCRIPTS=(scripts/kb-kill-daemon scripts/kb-kill-push scripts/kb-kill-tray)
+SCRIPTS=(); for s in scripts/*; do [[ -f "$s" ]] && SCRIPTS+=("$s"); done
 PKGBUILD=packaging/aur/PKGBUILD
 
 die() { echo "error: $*" >&2; exit 1; }

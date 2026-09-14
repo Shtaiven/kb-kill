@@ -1,57 +1,33 @@
 #!/usr/bin/env python3
-"""kb-kill-daemon - disable/enable target input devices on a global hotkey.
+"""kb-kill-daemon - disable/enable input devices on a global hotkey.
 
-Runs as a long-lived root service. Any keyboard can press the configured *kill*
-hotkey to disable (grab + eat all events from) the target device(s) - keyboards,
-mice, or touchpads. While killed, every event from the target is swallowed
-EXCEPT the *wake* hotkey, so a killed keyboard can always wake itself - there is
-no way to lock yourself out. (A killed pointer self-wakes only if its wake combo
-uses its own buttons, e.g. "mouseleft+mouseright"; otherwise wake it from the
-keyboard.)
-
-Config arrives by PUSH, not from a file path: the daemon starts config-less and
-each logged-in user's `kb-kill-push` sends their config (TOML text) over the
-control socket. The daemon honours only the config of the user who currently
-controls a seat (logind's ACTIVE_UID, graphical or TTY), and switches when the
-active user switches - so it always follows whoever is actually at the machine.
-`-c PATH` pins a file config live for ad-hoc testing; detect/monitor read a file.
-
-Design notes
+How it works
 ------------
-* "Disable" means EVIOCGRAB on the target device: the kernel routes its events
-  exclusively to us and we drop them. We only grab *while killed* - when awake
-  the target is merely monitored (read, never grabbed), so normal typing is
-  100% native and a crash of this service cannot break the keyboard.
-* We never re-inject events, so there is no virtual device and no awake-path
-  latency.
-* Coexistence with input-remapper: input-remapper grabs the physical keyboard
-  (e.g. /dev/input/event3) and re-emits its events through a virtual forwarded
-  device. By default (`virtual = "auto"`) kb-kill detects that pairing per
-  device and targets the forwarded copy, leaving the physical device for
-  input-remapper to (re)grab - including across a restart - so a matcher naming
-  the hardware keeps working either way. `virtual = true` restricts a group to
-  virtual devices; `virtual = false` opts out of the pairing entirely, for a
-  remapper kb-kill cannot detect. See `fronting_map` / `_resolve_targets`.
-* Targets are chosen per group by name matchers, one per device class:
-  `keyboards` (keyboard-class), `pointers` (mice/trackballs/touchpads), and
-  `devices` (any class). Each entry matches the WHOLE device name, case-
-  insensitively: exactly, unless it holds a bash-style glob metacharacter
-  (`*`/`?`/`[seq]`/`{a,b}`), in which case it is globbed - so "*razer*" is the
-  substring match and a bare "*" matches everything. A group needs at least
-  one field; set several to kill, e.g., a keyboard and a mouse together.
-  See `_dev_matches`.
+* "Disable" is an exclusive EVIOCGRAB on each target device; its events are
+  read here and dropped. A grab is held only while a group is killed. Awake,
+  devices are only read, so a crash cannot break input, and the kernel releases
+  every grab when the process exits. No virtual device, no re-injection.
+* Config arrives over the control socket from each user's kb-kill-push. Only
+  the config of the user who controls the seat (logind ACTIVE_UID) is live.
+* A combo matches on the union of keys held across all monitored devices and
+  fires on the rising edge only (per-group latch), so holding it cannot re-fire.
+* Under `virtual = "auto"` a matched device that input-remapper fronts is
+  swapped for its forwarded copy, leaving the hardware to the remapper.
+* Needs read/write on /dev/input/event* (group `input`) and nothing else.
+  The systemd unit runs it as a dynamic user with that supplementary group.
 
-Requires: python-evdev and read access to /dev/input/event*. The daemon runs as
-root (the systemd service); `detect`/`monitor` therefore need `sudo`.
+Development: `kb-kill-daemon -c FILE` pins a config live without a pusher.
+Diagnostics: kb-kill-detect (what is matched) and kb-kill-monitor (raw events).
 """
 
 import argparse
 import ctypes
 import errno
+import fcntl
 import fnmatch
 import json
+import math
 import os
-import pwd
 import re
 import selectors
 import signal
@@ -70,179 +46,82 @@ try:
     )
 except ImportError:
     sys.stderr.write(
-        "kb-kill: python-evdev is required. Install it from your distro's\n"
-        "packages (pip is NOT the supported install method — the daemon runs as\n"
-        "a root system service against the system interpreter):\n"
-        "  Debian/Ubuntu : sudo apt install python3-evdev\n"
-        "  Fedora        : sudo dnf install python3-evdev\n"
-        "  Arch          : sudo pacman -S python-evdev\n"
+        "kb-kill: python-evdev is required (Debian/Ubuntu/Fedora: python3-evdev, "
+        "Arch: python-evdev).\n"
     )
     sys.exit(1)
 
-
-# Suite version. Source of truth is the VERSION file at the repo root; this
-# constant is rewritten by packaging/bump-version.sh — don't edit it by hand.
+# Rewritten by packaging/bump-version.sh from the repo-root VERSION file.
 VERSION = "0.4.1"
 
-
-# --------------------------------------------------------------------------- #
-# Modifier aliases
-#
-# A combo is written as `+`-joined tokens, e.g. "ctrl+alt+shift+k". Each token
-# resolves to an "any-of" GROUP of acceptable keycodes; the combo matches when
-# every group has at least one of its keycodes currently held.
-#
-# Bare modifier names match EITHER side; prefix with l/r to pin a side.
-#
-#   token                         matches (evdev KEY_*, code)
-#   ----------------------------  -------------------------------------------
-#   ctrl  / control               KEY_LEFTCTRL  (29)  or KEY_RIGHTCTRL  (97)
-#   lctrl / rctrl                  left-only           / right-only
-#   alt                           KEY_LEFTALT   (56)  or KEY_RIGHTALT  (100, AltGr)
-#   lalt  / ralt                   left-only           / right-only
-#   shift                         KEY_LEFTSHIFT (42)  or KEY_RIGHTSHIFT (54)
-#   lshift / rshift                left-only           / right-only
-#   super / meta / win / cmd      KEY_LEFTMETA  (125) or KEY_RIGHTMETA (126)
-#   lsuper/lmeta / rsuper/rmeta    left-only           / right-only
-#   mouseleft / mouseright        BTN_LEFT            / BTN_RIGHT
-#   mousemiddle                   BTN_MIDDLE
-#
-# Any other token resolves to a single keycode: a letter a-z -> KEY_A..KEY_Z,
-# a raw evdev name like KEY_SCROLLLOCK or BTN_SIDE (mouse buttons let a killed
-# pointer self-wake), or a numeric keycode.
-# --------------------------------------------------------------------------- #
-MODIFIER_ALIASES = {
-    "ctrl": frozenset({ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL}),
-    "control": frozenset({ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL}),
+_CTRL = frozenset({ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL})
+_ALT = frozenset({ecodes.KEY_LEFTALT, ecodes.KEY_RIGHTALT})
+_SHIFT = frozenset({ecodes.KEY_LEFTSHIFT, ecodes.KEY_RIGHTSHIFT})
+_META = frozenset({ecodes.KEY_LEFTMETA, ecodes.KEY_RIGHTMETA})
+MODIFIER_ALIASES: dict[str, frozenset[int]] = {
+    "ctrl": _CTRL,
+    "control": _CTRL,
     "lctrl": frozenset({ecodes.KEY_LEFTCTRL}),
     "rctrl": frozenset({ecodes.KEY_RIGHTCTRL}),
-    "alt": frozenset({ecodes.KEY_LEFTALT, ecodes.KEY_RIGHTALT}),
+    "alt": _ALT,
     "lalt": frozenset({ecodes.KEY_LEFTALT}),
     "ralt": frozenset({ecodes.KEY_RIGHTALT}),
     "altgr": frozenset({ecodes.KEY_RIGHTALT}),
-    "shift": frozenset({ecodes.KEY_LEFTSHIFT, ecodes.KEY_RIGHTSHIFT}),
+    "shift": _SHIFT,
     "lshift": frozenset({ecodes.KEY_LEFTSHIFT}),
     "rshift": frozenset({ecodes.KEY_RIGHTSHIFT}),
-    "super": frozenset({ecodes.KEY_LEFTMETA, ecodes.KEY_RIGHTMETA}),
-    "meta": frozenset({ecodes.KEY_LEFTMETA, ecodes.KEY_RIGHTMETA}),
-    "win": frozenset({ecodes.KEY_LEFTMETA, ecodes.KEY_RIGHTMETA}),
-    "cmd": frozenset({ecodes.KEY_LEFTMETA, ecodes.KEY_RIGHTMETA}),
+    "super": _META,
+    "meta": _META,
+    "win": _META,
+    "cmd": _META,
     "lsuper": frozenset({ecodes.KEY_LEFTMETA}),
     "lmeta": frozenset({ecodes.KEY_LEFTMETA}),
     "rsuper": frozenset({ecodes.KEY_RIGHTMETA}),
     "rmeta": frozenset({ecodes.KEY_RIGHTMETA}),
-    # Mouse-button aliases (for pointer self-wake, e.g. wake_combo =
-    # "mouseleft+mouseright"). Raw BTN_* names also work via the fallback below.
     "mouseleft": frozenset({ecodes.BTN_LEFT}),
     "mouseright": frozenset({ecodes.BTN_RIGHT}),
     "mousemiddle": frozenset({ecodes.BTN_MIDDLE}),
 }
 
-
-def _invoking_home() -> Path:
-    """Home directory of the user who invoked us, even under sudo/pkexec.
-
-    A root `kb-kill detect`/`monitor` run via sudo gets HOME=/root, so a plain
-    Path.home() would miss the user's config and force an explicit --config.
-    Recover the real user from SUDO_USER (sudo) or PKEXEC_UID (polkit) and take
-    their home from the passwd db; fall back to Path.home() when unprivileged or
-    when there's no caller to recover (e.g. a bare systemd service, which passes
-    --config anyway).
-    """
-    if os.geteuid() == 0:
-        name = os.environ.get("SUDO_USER")
-        if not name:
-            uid = os.environ.get("PKEXEC_UID", "")
-            if uid.isdigit():
-                try:
-                    name = pwd.getpwuid(int(uid)).pw_name
-                except KeyError:
-                    name = None
-        if name and name != "root":
-            try:
-                return Path(pwd.getpwnam(name).pw_dir)
-            except KeyError:
-                pass
-    return Path.home()
-
-
-_HOME = _invoking_home()
-CONFIG_SEARCH = [
-    _HOME / ".config" / "kb-kill" / "kb-kill.toml",
-    _HOME / ".kb-kill",
-    Path("/etc/kb-kill/kb-kill.toml"),
-]
-
-# No built-in default hotkey on purpose: a keyboard can only ever be disabled by
-# a combo the user explicitly set, so a fresh/empty config has no shortcut that
-# can kill a keyboard. Combos are still inherited top-level -> [groups.*]; what's
-# gone is a module-level fallback when nobody set one (that would be a hidden
-# shortcut). A group with a target but no resolvable combo is a config error.
-
-# How often (seconds) to rescan for hotplugged / recreated devices. Also the
-# backstop interval for re-checking the active seat user (the inotify watch on
-# the seats dir makes switches near-instant; this only covers a missed event).
-RESCAN_INTERVAL = 2.0
-
-# Control-socket DoS bounds. The socket is connectable by any local user (the
-# SO_PEERCRED uid is the real gate), so the bounds are per-uid as well as global.
-MAX_CLIENTS = 16  # concurrent control connections (global)
-# Per-uid cap, so one user cannot starve the global pool. A single active user's
-# NORMAL footprint is already 2 persistent connections (kb-kill-push + kb-kill-tray
-# each hold one for their whole lifetime), so this must sit comfortably above 2:
-# during a redeploy/login both restart, and the daemon still holds each dying
-# client's connection until it reaps the EOF on its next loop iteration, so uid N
-# can transiently need old-push + old-tray + new-push + new-tray = 4 at once. Set
-# to 8 (push+tray, plus restart overlap, plus a stray/dev pusher) — still half the
-# global pool. A cap of 2 here left zero headroom and wedged the reconnecting
-# client in a refusal loop ("tray fails to connect" on install).
-MAX_CONNS_PER_UID = 8
-MAX_LINE = 65536  # bytes buffered per client before a newline; drop if exceeded
-# (a full set_config TOML payload, JSON-escaped, must fit)
-HANDSHAKE_SECONDS = 10  # drop a connection that sends no valid command in this long
-
-# Group names and labels are echoed into the system log and the tray, so restrict
-# them to a boring charset. TOML allows quoted keys with escapes, so
-# [groups."x\nJul 27 00:00:00 host sshd[1]: Accepted password for root"] is a
-# legal group name - without this, any local uid could forge journal records under
-# kb-kill's identifier. (log() sanitizes too; this rejects at the door so the name
-# shown in the tray and in error text is sane as well.) This is a charset check
-# only - there is deliberately NO cap on how many groups a config may define.
+RESCAN_INTERVAL = 10.0  # backstop only; inotify on /dev/input drives rescans
+FRONTED_GRACE = 10.0  # leave fronted hardware alone this long after its copy vanishes
+MAX_CLIENTS = 16
+MAX_CONNS_PER_UID = 8  # push + tray, plus restart overlap
+MAX_LINE = 65536  # bytes buffered per client before a newline
+HANDSHAKE_SECONDS = 10  # drop a connection that never sends a command
 GROUP_NAME_RE = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9 ._-]{0,31}\Z")
-# A `label` is free display text ("Mouse & touchpad"), so it is only bounded and
-# checked for control characters, not restricted to the name charset.
 LABEL_MAX_LEN = 64
-
-# logind exposes the foreground session's user per seat here, as ACTIVE_UID=.
-# We read this file (systemd marks it "do not parse", so we parse defensively and
-# tolerate any field being absent) rather than dlopen libsystemd for
-# sd_seat_get_active(), which would risk tripping MemoryDenyWriteExecute.
 SEATS_DIR = "/run/systemd/seats"
+INPUT_DIR = "/dev/input"
 
-# inotify event masks (we only need "something in the seats dir changed").
-_IN_MODIFY = 0x00000002
-_IN_CLOSE_WRITE = 0x00000008
-_IN_MOVED_TO = 0x00000080
-_IN_CREATE = 0x00000100
-_IN_DELETE = 0x00000200
-_SEAT_MASK = _IN_MODIFY | _IN_CLOSE_WRITE | _IN_MOVED_TO | _IN_CREATE | _IN_DELETE
+_IN_ATTRIB, _IN_CLOSE_WRITE, _IN_MOVED_TO, _IN_CREATE, _IN_DELETE = (
+    0x4,
+    0x8,
+    0x80,
+    0x100,
+    0x200,
+)
+_SEAT_MASK = 0x2 | _IN_CLOSE_WRITE | _IN_MOVED_TO | _IN_CREATE | _IN_DELETE
+_INPUT_MASK = _IN_ATTRIB | _IN_CREATE | _IN_DELETE | _IN_MOVED_TO
+# EVIOCSMASK = _IOW('E', 0x93, struct input_mask{u32 type; u32 codes_size; u64 codes_ptr})
+_EVIOCSMASK = 0x40104593
+_MASKED_TYPES = (
+    ecodes.EV_REL,
+    ecodes.EV_ABS,
+    ecodes.EV_MSC,
+    ecodes.EV_SW,
+    ecodes.EV_LED,
+    ecodes.EV_SND,
+    ecodes.EV_FF,
+)
 
-# Selector tag for the control socket's listening fd (devices use their path
-# string as the tag; clients use ("client", conn); the seat inotify fd uses
-# _SEATWATCH).
-_LISTEN = object()
-_SEATWATCH = object()
+_LISTEN, _SEATWATCH, _INPUTWATCH = object(), object(), object()
 
 
 def control_socket_path() -> str:
-    """Where the control socket lives.
-
-    As the root system daemon it lives in /run/kb-kill (created by the unit's
-    RuntimeDirectory=); when run unprivileged (e.g. for testing) it falls back to
-    the user's runtime dir.
-    """
-    if os.geteuid() == 0:
-        return "/run/kb-kill/control.sock"
+    runtime = os.environ.get("RUNTIME_DIRECTORY")  # set by systemd RuntimeDirectory=
+    if runtime:
+        return os.path.join(runtime.split(":")[0], "control.sock")
     base = os.environ.get("XDG_RUNTIME_DIR")
     if base:
         return os.path.join(base, "kb-kill.sock")
@@ -250,31 +129,13 @@ def control_socket_path() -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Journal hygiene
+# Logging. The journal is readable by group adm/wheel and any local uid can push
+# a config, so: nothing at key-event rate, state lines through a global token
+# bucket, and all text flattened to one printable line.
 # --------------------------------------------------------------------------- #
-# Everything the SERVICE writes to stderr lands in the system journal, which on a
-# stock Debian/Ubuntu/Pop!_OS desktop is readable by group `adm` (the primary user
-# is in it) and is mirrored into /var/log/syslog (root:adm 0640) when journald
-# forwards to syslog. Because `set_config` is accepted from ANY local uid by
-# design, every log site is a channel an unprivileged, otherwise-sandboxed process
-# can shape - push a config with one group per key, named after that key, and the
-# daemon's own log becomes a keylogger. Three rules, enforced here rather than at
-# 40-odd call sites:
-#   1. Nothing that fires at per-key-event rate may reach the journal - even with
-#      no key identity, the TIMING is a password side channel. Those lines go
-#      through log_keys(), off unless KB_KILL_DEBUG_KEYS=1, and marked <7>/debug.
-#   2. State/config/control lines go through a token bucket, so a hostile config
-#      cannot turn KILLED/WOKEN into a per-keystroke record.
-#   3. Attacker-supplied text (group names, labels, device names, parse errors) is
-#      flattened to one printable, length-capped line: a TOML quoted key may
-#      legally contain "\n", which would otherwise forge journal records.
 LOG_MAX_LEN = 400
 _LOG_UNSAFE = re.compile(r"[\x00-\x1f\x7f]")
-
-# syslog priorities. systemd parses a leading "<N>" on stderr (SyslogLevelPrefix=yes
-# is the default), which is what lets the unit's LogLevelMax= drop a whole class.
-# Suppressed on a tty so `-c` dev runs and detect/monitor stay readable.
-PRI_ERR, PRI_WARN, PRI_NOTICE, PRI_INFO, PRI_DEBUG = 3, 4, 5, 6, 7
+PRI_ERR, PRI_WARN, PRI_NOTICE, PRI_INFO = 3, 4, 5, 6
 try:
     _LOG_PREFIX = not sys.stderr.isatty()
 except (AttributeError, ValueError):
@@ -282,7 +143,6 @@ except (AttributeError, ValueError):
 
 
 def _safe(text: object) -> str:
-    """One printable, length-capped line - no journal injection."""
     out = _LOG_UNSAFE.sub("?", str(text))
     return out if len(out) <= LOG_MAX_LEN else out[: LOG_MAX_LEN - 1] + "…"
 
@@ -297,47 +157,17 @@ def log_warn(msg: str) -> None:
     log(msg, PRI_WARN)
 
 
-# Per-key diagnostics (wake progress, deferred/failed grabs, grab/release). OFF
-# unless the root operator opts in, because these fire at key-event rate and the
-# journal is readable by group `adm`. THIS is the gate: with it unset the lines
-# are never written at all, so there is nothing for journald to filter. The
-# unit's LogLevelMax=info is only belt-and-braces against a future regression
-# that emits a <7> line ungated - do not rely on it, since journald was measured
-# NOT to apply LogLevelMax to stderr-derived priorities on every systemd version.
-# Setting it is root-only either way (see README, "Turning on the per-key
-# diagnostics").
-DEBUG_KEYS = os.environ.get("KB_KILL_DEBUG_KEYS") == "1"
-
-
-def log_keys(msg: str) -> None:
-    """Key-event-rate diagnostics. Emits nothing unless DEBUG_KEYS is set."""
-    if DEBUG_KEYS:
-        log(msg, PRI_DEBUG)
-
-
-# Token bucket for journal lines an attacker can trigger. The sustained rate is
-# far too slow to carry typing - 12 wpm is ~1 key/100 ms, and 0.2 lines/s cannot
-# encode that. There is deliberately no cap on group count, so this bucket is the
-# sole bound on the KILLED/WOKEN channel; two consequences:
-#   * It MUST stay global, never per-group, or N groups would leak a burst per
-#     keystroke.
-#   * The BURST is what an attacker gets for free, so keep it tight. A real toggle
-#     costs one line, and the only legitimate way to spend several at once is
-#     several groups sharing a combo, so 4 is already generous. Config/device
-#     chatter has its own bucket (CTRL_LOG) and does not compete for these.
-LOG_STATE_BURST = 4
-LOG_STATE_REFILL = 0.2  # tokens/sec -> 1 line per 5 s sustained
-LOG_SUPPRESS_NOTICE = 60.0  # at most one "N suppressed" summary per minute
-
-
 class _RateLimiter:
+    """Token bucket. Global on purpose: it is the only bound on the KILLED/AWAKE
+    channel, and there is no cap on group count."""
+
     def __init__(self, burst: int, refill: float) -> None:
-        self.burst: float = float(burst)
-        self.refill: float = refill
-        self.tokens: float = float(burst)
-        self.last: float = time.monotonic()
-        self.dropped: int = 0
-        self.next_notice: float = 0.0
+        self.burst = float(burst)
+        self.refill = refill
+        self.tokens = float(burst)
+        self.last = time.monotonic()
+        self.dropped = 0
+        self.next_notice = 0.0
 
     def emit(self, msg: str, pri: int = PRI_INFO) -> None:
         now = time.monotonic()
@@ -348,17 +178,14 @@ class _RateLimiter:
             log(msg, pri)
             return
         self.dropped += 1
-        # Residual, disclosed channel: a COUNT at a fixed 60 s cadence. No
-        # identity, no per-event timing.
         if now >= self.next_notice:
-            self.next_notice = now + LOG_SUPPRESS_NOTICE
+            self.next_notice = now + 60.0
             n, self.dropped = self.dropped, 0
             log(f"suppressed {n} further log line(s) (rate limit)", PRI_NOTICE)
 
 
-# Two buckets, so a config-push flood cannot starve legitimate KILLED/WOKEN lines.
-STATE_LOG = _RateLimiter(LOG_STATE_BURST, LOG_STATE_REFILL)  # kill/wake
-CTRL_LOG = _RateLimiter(8, 0.2)  # config pushes + control-socket refusals
+STATE_LOG = _RateLimiter(4, 0.2)  # kill/wake transitions
+CTRL_LOG = _RateLimiter(8, 0.2)  # config, devices, control-socket refusals
 
 
 def log_state(msg: str, pri: int = PRI_INFO) -> None:
@@ -366,17 +193,11 @@ def log_state(msg: str, pri: int = PRI_INFO) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Active seat user (logind)
+# logind seat + inotify
 # --------------------------------------------------------------------------- #
 def active_uids() -> set[int]:
-    """Set of uids that own a *foreground* session, one per seat.
-
-    Read from /run/systemd/seats/* (ACTIVE_UID=). This is how we decide whose
-    pushed config governs the keyboard: only the user currently in control of a
-    seat (graphical or TTY) is "live". Returns an empty set when logind exposes
-    no seats (headless / container) - callers then fall back to idle.
-    """
-    uids = set()
+    """uids owning a foreground session, one per seat (empty when headless)."""
+    uids: set[int] = set()
     try:
         names = os.listdir(SEATS_DIR)
     except OSError:
@@ -395,42 +216,29 @@ def active_uids() -> set[int]:
     return uids
 
 
-class SeatWatch:
-    """inotify watch on the seats dir so active-user switches are near-instant.
+class InotifyWatch:
+    """Non-blocking inotify fd on one directory (pure ctypes over libc; the
+    stdlib has no inotify). fd is -1 when unavailable; callers then poll."""
 
-    Pure-ctypes over libc (no extra shared object is dlopen'd, so this stays
-    clear of MemoryDenyWriteExecute; inotify_init1/add_watch/read are all in the
-    unit's @system-service syscall set). Best-effort: if inotify is unavailable
-    the daemon still re-checks the active user every RESCAN_INTERVAL.
-    """
-
-    def __init__(self) -> None:
+    def __init__(self, path: str, mask: int) -> None:
         self.fd = -1
         try:
             libc = ctypes.CDLL(None, use_errno=True)
             fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
             if fd < 0:
                 raise OSError(ctypes.get_errno(), "inotify_init1")
-            wd = libc.inotify_add_watch(fd, SEATS_DIR.encode(), _SEAT_MASK)
-            if wd < 0:
+            if libc.inotify_add_watch(fd, path.encode(), mask) < 0:
+                err = ctypes.get_errno()
                 os.close(fd)
-                raise OSError(ctypes.get_errno(), "inotify_add_watch")
+                raise OSError(err, "inotify_add_watch")
             self.fd = fd
         except (OSError, AttributeError) as e:
-            log_warn(
-                f"seat inotify unavailable ({e}); polling active user every "
-                f"{RESCAN_INTERVAL:g}s instead"
-            )
+            log_warn(f"cannot watch {path} ({e}); polling every {RESCAN_INTERVAL:g}s")
 
     def drain(self) -> None:
-        """Consume pending events; their content is irrelevant (we just re-read
-        the seat files afterwards)."""
-        if self.fd < 0:
-            return
         try:
-            while True:
-                if not os.read(self.fd, 4096):
-                    break
+            while self.fd >= 0 and os.read(self.fd, 4096):
+                pass
         except OSError:
             pass
 
@@ -443,113 +251,68 @@ class SeatWatch:
             self.fd = -1
 
 
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
 class ConfigError(Exception):
     pass
 
 
-# --------------------------------------------------------------------------- #
-# Config
-# --------------------------------------------------------------------------- #
-# The tri-state `virtual` as written in the config. None is "auto" (the
-# default): pair each matched device with its forwarded copy if a remapper
-# fronts it. See Group.virtual and KbKill._resolve_targets.
 VIRTUAL_LABELS: dict[bool | None, str] = {None: "auto", True: "true", False: "false"}
 
 
 class Group:
-    """One target set with its own kill/wake hotkeys."""
+    """A set of target devices with its own kill/wake combo."""
 
     def __init__(
         self,
         name: str,
+        label: str | None,
         keyboards: list[str],
         pointers: list[str],
         devices: list[str],
-        kill_combo: list[frozenset[int]],
-        wake_combo: list[frozenset[int]],
-        virtual: bool | None,
         kill_raw: str,
         wake_raw: str,
-        label: str | None,
+        virtual: bool | None,
     ) -> None:
-        self.name = name  # identity: logs, control commands, killed-state preserve
-        self.label = label  # optional display name (config 'label'); tray shows it
-        # Name matchers, one per device class (any may be empty). Each entry is
-        # a lowercased pattern, matched exactly unless it is a glob:
-        #   keyboards -> keyboard-class devices, pointers -> pointing devices,
-        #   devices   -> any input device regardless of class. A device is a
-        # target when it matches at least one applicable field. See _dev_matches.
-        self.keyboards = keyboards  # lowercase patterns (keyboard-class only)
-        self.pointers = pointers  # lowercase patterns (pointer-class only)
-        self.devices = devices  # lowercase patterns (any class)
-        self.kill_combo = kill_combo
-        self.wake_combo = wake_combo
-        # How to treat a device that a remapper fronts (grabs and re-emits).
-        # Tri-state, so None is meaningful — see VIRTUAL_LABELS:
-        #   None  ("auto", the default) pair per device: target the forwarded
-        #         copy of any matched device something fronts, else the device
-        #         itself. Handles a mixed group and a remapper coming and going.
-        #   True  ("virtual") target only virtual devices — the forwarded copy
-        #         of a matched device, and any virtual device matched by name.
-        #         Never a physical device, even an unfronted one.
-        #   False literal: target exactly what the matchers named, fronted or
-        #         not. The escape hatch for a remapper kb-kill cannot detect
-        #         (kanata/keyd/evremap leave no link between output and source),
-        #         and the only setting that can fight input-remapper for a grab.
-        self.virtual = virtual
-        self.kill_raw = kill_raw  # original strings (for display)
+        self.name = name
+        self.label = label
+        self.keyboards = keyboards  # lowercased patterns per device class
+        self.pointers = pointers
+        self.devices = devices
+        self.kill_raw = kill_raw
         self.wake_raw = wake_raw
-        # wake token names, aligned index-for-index with wake_combo (used by
-        # the wake-progress debug log to name missing tokens)
-        self.wake_tokens = [t.strip() for t in wake_raw.split("+") if t.strip()]
-        # runtime state (managed by KbKill)
-        self.targets: dict[str, InputDevice] = {}  # path -> InputDevice
+        self.kill_combo = _parse_combo(kill_raw)
+        self.wake_combo = _parse_combo(wake_raw)
+        self.virtual = virtual  # None = "auto" (pair with a fronting remapper copy)
+        # runtime
+        self.targets: dict[str, InputDevice] = {}
         self.killed = False
-        # Edge-trigger latches: was this combo fully held as of the previous key
-        # event? A combo fires only on the rising edge (not-held -> held), so
-        # holding it while pressing anything else can't re-fire it. See
-        # KbKill._toggle_groups.
-        self.kill_held = False
+        self.kill_held = False  # edge latches; see KbKill._toggle_groups
         self.wake_held = False
-        self.warned_empty = False  # zero-match warning emitted (reset on match)
-        # Lockout advisories emitted once per config install, so a toggle loop
-        # can't multiply journal lines. See _log_kill.
-        self.warned_kill = False
-        # Advisory latch: virtual=false aimed at a device a remapper fronts.
-        self.warned_fronted = False
-        self.wake_progress: tuple[bool, ...] | None = None  # last logged (debug)
 
     @property
     def virtual_label(self) -> str:
-        """`virtual` as the user wrote it (`self.virtual` is a tri-state)."""
         return VIRTUAL_LABELS[self.virtual]
 
 
 class Config:
     def __init__(self, groups: list[Group], source: str) -> None:
         self.groups = groups
-        self.source = source  # where it came from (path or "uid N")
+        self.source = source
 
 
 def _parse_token(token: str) -> frozenset[int]:
-    """Resolve one combo token to a frozenset of acceptable keycodes."""
     t = token.strip().lower()
     if not t:
         raise ConfigError("empty key in combo")
     if t in MODIFIER_ALIASES:
         return MODIFIER_ALIASES[t]
-    if len(t) == 1 and t.isalnum():
-        name = f"KEY_{t.upper()}"
-        code = getattr(ecodes, name, None)
+    upper = t.upper()
+    for name in (f"KEY_{upper}", upper if upper.startswith(("KEY_", "BTN_")) else ""):
+        code = getattr(ecodes, name, None) if name else None
         if code is not None:
             return frozenset({code})
-    # raw evdev name, e.g. KEY_SCROLLLOCK / SCROLLLOCK / BTN_LEFT (mouse button)
-    upper = t.upper()
-    name = upper if upper.startswith(("KEY_", "BTN_")) else f"KEY_{upper}"
-    code = getattr(ecodes, name, None)
-    if code is not None:
-        return frozenset({code})
-    # numeric keycode
     if t.isdigit():
         return frozenset({int(t)})
     raise ConfigError(
@@ -565,38 +328,7 @@ def _parse_combo(spec: str) -> list[frozenset[int]]:
     return [_parse_token(tok) for tok in tokens]
 
 
-def find_config(explicit: str | None = None) -> Path:
-    if explicit:
-        p = Path(explicit).expanduser()
-        if not p.is_file():
-            raise ConfigError(f"config not found: {p}")
-        return p
-    env = os.environ.get("KB_KILL_CONFIG")
-    if env:
-        p = Path(env).expanduser()
-        if not p.is_file():
-            raise ConfigError(f"$KB_KILL_CONFIG points at a missing file: {p}")
-        return p
-    for p in CONFIG_SEARCH:
-        # ~/.kb-kill may be a directory holding kb-kill.toml
-        if p.is_dir():
-            inner = p / "kb-kill.toml"
-            if inner.is_file():
-                return inner
-        elif p.is_file():
-            return p
-    raise ConfigError(
-        "no config file found. Create ~/.config/kb-kill/kb-kill.toml with:\n"
-        '  keyboards  = "AT Translated Set 2 keyboard"   # or pointers = / devices =\n'
-        '  kill_combo = "ctrl+alt+shift+k"\n'
-        '  wake_combo = "ctrl+alt+shift+u"'
-    )
-
-
-# The device-matcher fields a group may set (at least one required).
 _MATCH_KEYS = ("keyboards", "pointers", "devices")
-# Keys allowed in a group table / the top-level default group. `virtual_keyboard`
-# is the deprecated alias for `virtual` (kept for backward compatibility).
 _GROUP_KEYS = {
     *_MATCH_KEYS,
     "label",
@@ -605,43 +337,23 @@ _GROUP_KEYS = {
     "virtual",
     "virtual_keyboard",
 }
-
-
-# A glob metacharacter: `*`, `?`, or a bracket class (`[seq]`, `[!seq]`,
-# `[^seq]`). A pattern containing one is matched as a glob; a pattern without
-# one is matched EXACTLY (see _dev_matches). An unclosed `[` is literal, as in
-# bash/fnmatch, so it does not turn a pattern into a glob.
 _GLOB_META_RE = re.compile(r"[*?]|\[[!^]?\]?[^]]*\]")
-# `[^seq]` is bash's negated class; fnmatch spells it `[!seq]`. Rewritten at
-# parse time so both work.
 _NEG_CLASS_RE = re.compile(r"\[\^([^]]*\])")
-# Cap on the patterns one matcher entry may expand to. Brace alternation
-# multiplies ("{a,b}{c,d}" -> 4), and a config is accepted from any local uid,
-# so an unbounded expansion would be a cheap memory/CPU DoS.
-MAX_PATTERNS_PER_ENTRY = 256
+MAX_PATTERNS_PER_ENTRY = 256  # brace expansion cap; configs come from any local uid
 
 
 def _is_glob(pattern: str) -> bool:
-    """True if `pattern` carries a glob metacharacter (so fnmatch it rather
-    than compare it exactly)."""
     return _GLOB_META_RE.search(pattern) is not None
 
 
 def _split_braces(pattern: str) -> list[str] | None:
-    """Expand the first bash-style brace alternation: "a{b,c}d" -> ["abd","acd"].
-
-    Returns None when there is nothing left to expand. Braces may nest, and the
-    alternatives are re-scanned by the caller. As in bash, a `{` with no `}` and
-    a group with no top-level comma are literal.
-    """
+    """Expand the first bash-style `{a,b}`; None when nothing is left to expand."""
     start = -1
     while True:
         start = pattern.find("{", start + 1)
         if start == -1:
             return None
-        depth = 0
-        parts: list[str] = []
-        chunk = start + 1
+        depth, parts, chunk = 0, [], start + 1
         for i in range(start, len(pattern)):
             c = pattern[i]
             if c == "{":
@@ -649,30 +361,22 @@ def _split_braces(pattern: str) -> list[str] | None:
             elif c == "}":
                 depth -= 1
                 if depth == 0:
-                    if not parts:  # comma-less group: literal braces
-                        break
+                    if not parts:
+                        break  # comma-less group is literal
                     parts.append(pattern[chunk:i])
-                    prefix, suffix = pattern[:start], pattern[i + 1 :]
-                    return [prefix + part + suffix for part in parts]
+                    return [pattern[:start] + p + pattern[i + 1 :] for p in parts]
             elif c == "," and depth == 1:
                 parts.append(pattern[chunk:i])
                 chunk = i + 1
-        # unmatched `{` or comma-less group: keep it literal, try the next one
 
 
 def _expand_entry(pattern: str, where: str, field: str) -> list[str]:
-    """Turn one matcher entry into the fnmatch-ready patterns it stands for.
-
-    fnmatch has no braces, so bash brace alternation is expanded here, once at
-    parse time, and `[^seq]` is rewritten to fnmatch's `[!seq]`.
-    """
     done: list[str] = []
     pending = [pattern]
     while pending:
         if len(done) + len(pending) > MAX_PATTERNS_PER_ENTRY:
             raise ConfigError(
-                f"{where}: '{field}' entry expands to more than "
-                f"{MAX_PATTERNS_PER_ENTRY} patterns"
+                f"{where}: '{field}' entry expands to more than {MAX_PATTERNS_PER_ENTRY} patterns"
             )
         alternatives = _split_braces(pending[0])
         if alternatives is None:
@@ -683,9 +387,6 @@ def _expand_entry(pattern: str, where: str, field: str) -> list[str]:
 
 
 def _as_names(value: object, where: str, field: str) -> list[str]:
-    """Coerce a matcher field (string or list of strings) to a list of
-    lowercased patterns (each matched exactly, or as an fnmatch glob when it
-    holds a glob metacharacter)."""
     if isinstance(value, str):
         value = [value]
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
@@ -695,19 +396,13 @@ def _as_names(value: object, where: str, field: str) -> list[str]:
         v = v.strip().lower()
         if v:
             names.extend(_expand_entry(v, where, field))
-    names = list(dict.fromkeys(names))  # de-dup, keep order (for `detect`)
+    names = list(dict.fromkeys(names))
     if not names:
         raise ConfigError(f"{where}: '{field}' is empty")
     return names
 
 
-def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
-    """Build a Group from a TOML table, inheriting unset combos from the
-    top-level defaults. There is no built-in fallback: a group with a target
-    keyboard but no kill_combo/wake_combo (here or inherited) is an error, so no
-    keyboard can ever be disabled by a hotkey the user didn't explicitly set."""
-    # Summarise past a handful: a pushed config is attacker-supplied, so a table
-    # with thousands of stray keys must not become thousands of journal lines.
+def _warn_unknown_keys(table: dict, where: str) -> None:
     unknown = [key for key in table if key not in _GROUP_KEYS]
     for key in unknown[:4]:
         CTRL_LOG.emit(f"warning: {where}: unknown key {key!r} (ignored)", PRI_WARN)
@@ -717,217 +412,137 @@ def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
             PRI_WARN,
         )
 
-    # Each of keyboards/pointers/devices is optional, but at least one must be
-    # present (a group with no matcher has nothing to grab).
-    matchers = {
-        field: _as_names(table[field], where, field)
-        for field in _MATCH_KEYS
-        if field in table
-    }
+
+def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
+    _warn_unknown_keys(table, where)
+    matchers = {f: _as_names(table[f], where, f) for f in _MATCH_KEYS if f in table}
     if not matchers:
         raise ConfigError(
-            f"{where}: a group needs at least one of "
-            f"{', '.join(_MATCH_KEYS)} (device-name matchers)."
+            f"{where}: a group needs at least one of {', '.join(_MATCH_KEYS)}"
         )
-    kbs = matchers.get("keyboards", [])
-    pointers = matchers.get("pointers", [])
-    devs = matchers.get("devices", [])
-    kill_raw = table.get("kill_combo", defaults["kill_combo"])
-    wake_raw = table.get("wake_combo", defaults["wake_combo"])
-    # `virtual` describes a target's nature, so it is per-group only (default
-    # "auto") and never inherited from the top-level defaults. `virtual_keyboard`
-    # is the deprecated alias (applied to all classes now, not just keyboards).
+
     if "virtual" in table and "virtual_keyboard" in table:
         raise ConfigError(
-            f"{where}: set either 'virtual' or 'virtual_keyboard' (its deprecated "
-            "alias), not both."
+            f"{where}: set 'virtual' or its deprecated alias 'virtual_keyboard', not both"
         )
     if "virtual_keyboard" in table:
         CTRL_LOG.emit(
-            f"warning: {where}: 'virtual_keyboard' is deprecated — use 'virtual'",
+            f"warning: {where}: 'virtual_keyboard' is deprecated, use 'virtual'",
             PRI_WARN,
         )
     virtual = table.get("virtual", table.get("virtual_keyboard", "auto"))
     if isinstance(virtual, str) and virtual.strip().lower() == "auto":
-        virtual = None  # the tri-state's third value; see Group.virtual
-    # bool first: a TOML integer is not a valid `virtual`, but 1 == True would
-    # sail through any equality-based check.
-    elif not isinstance(virtual, bool):
+        virtual = None
+    elif not isinstance(virtual, bool):  # bool check first: 1 == True
         raise ConfigError(f"{where}: 'virtual' must be true, false, or \"auto\"")
-    # Optional display label, shown by the tray instead of the group's table key.
-    # Purely cosmetic: identity (control commands, killed-state preservation
-    # across a re-push) stays the group name.
+
     label = table.get("label")
     if label is not None:
         if not isinstance(label, str) or not label.strip():
             raise ConfigError(f"{where}: 'label' must be a non-empty string")
         label = label.strip()
-        # A label is free display text ("Mouse & touchpad"), so it gets a looser
-        # rule than a group name: any printable string, bounded, but no control
-        # characters — a TOML quoted value may contain "\n", and the label reaches
-        # both the tray and (via a rejection message) the journal. See
-        # GROUP_NAME_RE and the journal-hygiene note above log().
         if len(label) > LABEL_MAX_LEN or _LOG_UNSAFE.search(label):
             raise ConfigError(
-                f"{where}: invalid 'label' {_safe(label)!r} — up to "
-                f"{LABEL_MAX_LEN} printable characters, no control characters"
+                f"{where}: invalid 'label' {_safe(label)!r}: up to {LABEL_MAX_LEN} printable characters"
             )
-    for combo_key, val in (("kill_combo", kill_raw), ("wake_combo", wake_raw)):
+
+    kill_raw = table.get("kill_combo", defaults["kill_combo"])
+    wake_raw = table.get("wake_combo", defaults["wake_combo"])
+    for key, val in (("kill_combo", kill_raw), ("wake_combo", wake_raw)):
         if val is None:
             raise ConfigError(
-                f"{where}: '{combo_key}' is required (no built-in default) — a "
-                "keyboard can only be disabled by a combo you set explicitly."
+                f"{where}: '{key}' is required (there is no built-in hotkey)"
             )
-    if not isinstance(kill_raw, str) or not isinstance(wake_raw, str):
-        raise ConfigError(f"{where}: 'kill_combo'/'wake_combo' must be strings")
+        if not isinstance(val, str):
+            raise ConfigError(f"{where}: '{key}' must be a string")
     try:
-        kill_combo = _parse_combo(kill_raw)
-        wake_combo = _parse_combo(wake_raw)
+        return Group(
+            name,
+            label,
+            matchers.get("keyboards", []),
+            matchers.get("pointers", []),
+            matchers.get("devices", []),
+            kill_raw,
+            wake_raw,
+            virtual,
+        )
     except ConfigError as e:
         raise ConfigError(f"{where}: {e}")
-    return Group(
-        name,
-        kbs,
-        pointers,
-        devs,
-        kill_combo,
-        wake_combo,
-        virtual,
-        kill_raw,
-        wake_raw,
-        label,
-    )
 
 
-def parse_config(doc: dict, source: str) -> Config:
-    """Build a Config from an already-parsed TOML document.
-
-    Shared by load_config (a file, for detect/monitor and `-c` dev runs) and
-    load_config_text (the TOML pushed over the control socket). Authorization is
-    not carried in the config: the daemon binds each pushed config to the
-    SO_PEERCRED uid that pushed it.
-    """
+def parse_config(doc: object, source: str) -> Config:
+    """Top-level keys form the "default" group (if they include a matcher) and
+    supply combo defaults for every [groups.*] table."""
     if not isinstance(doc, dict):
         raise ConfigError(f"{source}: top level must be a table")
-
-    # Top-level keys form the default group (if they include a matcher field:
-    # keyboards/pointers/devices) and supply defaults inherited by [groups.*].
     sections = doc.pop("groups", {})
     if not isinstance(sections, dict):
         raise ConfigError(f"{source}: 'groups' must be a table ([groups.<name>])")
-
-    # No module-level fallback: an unset combo stays None and is inherited by
-    # [groups.*]; if nothing sets it, _build_group rejects the group rather than
-    # conjuring a hidden default hotkey.
     defaults = {
         "kill_combo": doc.get("kill_combo"),
         "wake_combo": doc.get("wake_combo"),
     }
 
     groups = []
-    if any(field in doc for field in _MATCH_KEYS):
+    if any(f in doc for f in _MATCH_KEYS):
         groups.append(_build_group("default", doc, defaults, f"{source} [top-level]"))
     else:
-        # No top-level group: validate stray top-level keys are known defaults.
-        unknown = [key for key in doc if key not in _GROUP_KEYS]
-        for key in unknown[:4]:
-            CTRL_LOG.emit(
-                f"warning: {source}: unknown top-level key {key!r} (ignored)", PRI_WARN
-            )
-        if len(unknown) > 4:
-            CTRL_LOG.emit(
-                f"warning: {source}: {len(unknown) - 4} further unknown top-level "
-                "key(s) ignored",
-                PRI_WARN,
-            )
-
+        _warn_unknown_keys(doc, source)
     for name, table in sections.items():
         if not GROUP_NAME_RE.match(name):
             raise ConfigError(
-                f"{source}: invalid group name {_safe(name)!r} — up to 32 chars of "
-                "letters, digits, space, '.', '_' or '-' (group names are echoed "
-                "into the system log and the tray)"
+                f"{source}: invalid group name {_safe(name)!r}: up to 32 letters, digits, "
+                "space, '.', '_' or '-'"
             )
         if not isinstance(table, dict):
             raise ConfigError(f"{source}: [groups.{name}] must be a table")
-        if not any(field in table for field in _MATCH_KEYS):
-            raise ConfigError(
-                f"{source}: [groups.{name}] needs one of "
-                f"{', '.join(_MATCH_KEYS)} (device-name matchers)"
-            )
         groups.append(_build_group(name, table, defaults, f"{source} [groups.{name}]"))
-
     if not groups:
-        # An empty config is VALID and INERT: with no group there is no target
-        # and no kill/wake combo, so the daemon only monitors and can never grab
-        # a keyboard. This is the shipped default — a user must explicitly add a
-        # group (top-level 'keyboards = ...' and/or a [groups.<name>] table)
-        # before any hotkey can disable a keyboard.
-        CTRL_LOG.emit(
-            f"{source}: no groups defined — inert (monitor only, nothing can be killed)"
-        )
+        CTRL_LOG.emit(f"{source}: no groups defined; inert (monitor only)")
     return Config(groups, source)
 
 
-def load_config(explicit: str | None = None) -> Config:
-    """Load a config from a file (detect/monitor and `-c` dev runs)."""
-    path = find_config(explicit)
+def load_config_file(path: str) -> Config:
+    p = Path(path).expanduser()
     try:
-        with open(path, "rb") as fh:
-            doc = tomllib.load(fh)
+        with open(p, "rb") as fh:
+            return parse_config(tomllib.load(fh), str(p))
     except tomllib.TOMLDecodeError as e:
-        raise ConfigError(f"{path}: invalid TOML: {e}")
+        raise ConfigError(f"{p}: invalid TOML: {e}")
     except OSError as e:
-        raise ConfigError(f"{path}: {e}")
-    return parse_config(doc, str(path))
+        raise ConfigError(f"{p}: {e}")
 
 
 def load_config_text(text: str, source: str) -> Config:
-    """Load a config from TOML text pushed over the control socket."""
     try:
-        doc = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as e:
-        raise ConfigError(f"{source}: invalid TOML: {e}")
-    except (TypeError, ValueError) as e:
+        return parse_config(tomllib.loads(text), source)
+    except (tomllib.TOMLDecodeError, TypeError, ValueError) as e:
         raise ConfigError(f"{source}: {e}")
-    return parse_config(doc, source)
 
 
 # --------------------------------------------------------------------------- #
-# Device helpers
+# Devices
 # --------------------------------------------------------------------------- #
 def is_keyboard(dev: InputDevice) -> bool:
-    """True for real typing keyboards (filters mice, power buttons, etc.)."""
     keys = dev.capabilities().get(ecodes.EV_KEY, [])
     return ecodes.KEY_A in keys and ecodes.KEY_Z in keys and ecodes.KEY_ENTER in keys
 
 
 def is_pointer(dev: InputDevice) -> bool:
-    """True for pointing devices: mice, trackballs, and touchpads.
-
-    A pointer has a mouse button plus motion — relative (mice/trackballs) or
-    an absolute touch surface (touchpads). This is the `pointers` field's class.
-    """
+    """A mouse button plus relative motion (mouse) or a touch surface (touchpad)."""
     caps = dev.capabilities()
     keys = caps.get(ecodes.EV_KEY, [])
-    has_button = ecodes.BTN_LEFT in keys or ecodes.BTN_MOUSE in keys
     rel = caps.get(ecodes.EV_REL, [])
-    has_rel = ecodes.REL_X in rel and ecodes.REL_Y in rel
-    has_abs_touch = ecodes.BTN_TOUCH in keys  # touchpads report an absolute surface
-    return has_button and (has_rel or has_abs_touch)
+    has_button = ecodes.BTN_LEFT in keys or ecodes.BTN_MOUSE in keys
+    has_motion = (
+        ecodes.REL_X in rel and ecodes.REL_Y in rel
+    ) or ecodes.BTN_TOUCH in keys
+    return has_button and has_motion
 
 
 def is_virtual(dev: InputDevice) -> bool:
-    """True for uinput / forwarded devices (e.g. input-remapper output).
-
-    input-remapper changed its forwarded-device naming in 2.2.1 (commit
-    91f9753). Before: name "input-remapper <orig> forwarded", phys left unset
-    so python-evdev's default "py-evdev-uinput" applied. Since: name is the
-    bare original (truncated to 80 chars) and the marker moved to phys as
-    "input-remapper/<orig phys>". Checking phys for the marker as well as for
-    "uinput" covers both layouts; without it, forwarded devices on 2.2.1+ are
-    classified as physical and a `virtual` group silently grabs nothing.
-    """
+    """uinput / remapper output. input-remapper <= 2.2.0 marked the name,
+    >= 2.2.1 marks phys as "input-remapper/<orig phys>"."""
     phys = (dev.phys or "").lower()
     name = (dev.name or "").lower()
     return (
@@ -938,46 +553,29 @@ def is_virtual(dev: InputDevice) -> bool:
     )
 
 
-_IR_PHYS_PREFIX = "input-remapper/"
-_IR_NAME_PREFIX = "input-remapper "
-_IR_NAME_SUFFIX = " forwarded"
+def device_class(dev: InputDevice) -> str:
+    return "kbd" if is_keyboard(dev) else "ptr" if is_pointer(dev) else "other"
 
 
 def fronting_map(devices: dict[str, InputDevice]) -> dict[str, tuple[str, InputDevice]]:
-    """Map the path of each fronted physical device to its forwarded copy.
-
-    input-remapper "fronts" a device: it grabs the hardware and re-emits the
-    events through a virtual forwarded device. Pairing the two lets kb-kill
-    target the copy instead of fighting for the original (see
-    KbKill._resolve_targets).
-
-    Two pairings, because input-remapper 2.2.1 (commit 91f9753) moved the
-    marker. Since 2.2.1 the forwarded device carries the fronted hardware's
-    phys as "input-remapper/<orig phys>" — the reliable link, and the only one
-    that survives 2.2.1 truncating the copied name to 80 characters. Up to
-    2.2.0 phys was left unset, so fall back to the name it used then,
-    "input-remapper <orig name> forwarded".
-
-    Pairing is strictly per device. "Prefer a virtual device whenever any
-    virtual device matched" would be simpler and wrong: with `keyboards = "*"`
-    it silently drops every unmanaged physical keyboard from the group.
-    """
+    """physical path -> (path, dev) of the input-remapper copy that fronts it.
+    Pairs by phys ("input-remapper/<phys>", 2.2.1+) or by the older name
+    ("input-remapper <name> forwarded"). Strictly per device."""
     by_phys: dict[str, tuple[str, InputDevice]] = {}
     by_name: dict[str, tuple[str, InputDevice]] = {}
     for path, dev in devices.items():
         phys = (dev.phys or "").lower()
-        if phys.startswith(_IR_PHYS_PREFIX) and len(phys) > len(_IR_PHYS_PREFIX):
-            by_phys[phys[len(_IR_PHYS_PREFIX) :]] = (path, dev)
         name = (dev.name or "").lower()
-        if name.startswith(_IR_NAME_PREFIX) and name.endswith(_IR_NAME_SUFFIX):
-            fronted = name[len(_IR_NAME_PREFIX) : -len(_IR_NAME_SUFFIX)]
+        if phys.startswith("input-remapper/") and len(phys) > len("input-remapper/"):
+            by_phys[phys[len("input-remapper/") :]] = (path, dev)
+        if name.startswith("input-remapper ") and name.endswith(" forwarded"):
+            fronted = name[len("input-remapper ") : -len(" forwarded")]
             if fronted:
                 by_name[fronted] = (path, dev)
-
     out: dict[str, tuple[str, InputDevice]] = {}
     for path, dev in devices.items():
         if is_virtual(dev):
-            continue  # a forwarded device is never itself fronted
+            continue
         front = by_phys.get((dev.phys or "").lower()) or by_name.get(
             (dev.name or "").lower()
         )
@@ -987,125 +585,79 @@ def fronting_map(devices: dict[str, InputDevice]) -> dict[str, tuple[str, InputD
 
 
 def active_keys_safe(dev: InputDevice) -> set[int] | None:
-    """The keys the kernel says are held on `dev`, or None if it has gone away.
-
-    python-evdev's ioctl_EVIOCG_bits helper returns NULL *without setting a Python
-    exception* when the ioctl fails on an unplugged device, and CPython surfaces
-    that as SystemError, not OSError. Catching OSError alone is therefore not
-    enough - it took the daemon down in 0.4.0 when a device vanished in the window
-    between open_devices() and the active_keys() call in _add_device().
-
-    None means "don't know", never "nothing held": callers must skip the device
-    rather than substitute an empty set, or _reconcile_grabs() would grab a device
-    with keys still down and strand them (see the grab-deferral invariant).
-    """
+    """Keys the kernel reports held, or None if the device is gone (python-evdev
+    raises SystemError, not OSError, when the ioctl fails on an unplugged node).
+    None means "unknown", never "nothing held"."""
     try:
         return set(dev.active_keys())
     except (OSError, SystemError):
         return None
 
 
-def grabbed_elsewhere(dev: InputDevice) -> bool:
-    """True when another process holds an exclusive grab on `dev` (probed by
-    attempting a grab: EBUSY means someone else has it). That process may be
-    input-remapper (it grabs the physical device it fronts) or the kb-kill
-    daemon itself while a group is killed. Skipped while keys are held so the
-    momentary probe grab can't swallow a key-up and leave a key stuck down."""
-    try:
-        held = active_keys_safe(dev)
-        if held is None or held:
-            return False
-        dev.grab()
-        dev.ungrab()
-    except OSError as e:
-        return e.errno == errno.EBUSY
-    return False
-
-
-def open_devices(want_pointers: bool = False) -> dict[str, InputDevice]:
-    """Return {path: InputDevice} for every readable device we might target.
-
-    Keyboards are always opened (so a killed pointer can be woken from the
-    keyboard, and combos match globally). Pointers are only opened when the live
-    config actually references them — keeping monitoring minimal for the common
-    keyboard-only case.
-    """
-    found = {}
-    for path in list_devices():
+def mask_to_keys(fd: int) -> None:
+    """Ask the kernel to deliver only EV_KEY (and EV_SYN) on this fd. Motion
+    never reaches the process and cannot overflow the client buffer."""
+    for ev_type in _MASKED_TYPES:
         try:
-            dev = InputDevice(path)
+            fcntl.ioctl(fd, _EVIOCSMASK, struct.pack("IIQ", ev_type, 0, 0))
         except OSError:
-            continue
-        if is_keyboard(dev) or (want_pointers and is_pointer(dev)):
-            found[path] = dev
-        else:
-            dev.close()
-    return found
+            return  # old kernel: fall back to filtering in _process
 
 
 def combo_held(combo: list[frozenset[int]], pressed: set[int]) -> bool:
-    """True when every token group has >=1 of its keycodes in `pressed`."""
     return all(group & pressed for group in combo)
 
 
 # --------------------------------------------------------------------------- #
-# Service
+# Daemon
 # --------------------------------------------------------------------------- #
 class KbKill:
     def __init__(self, config: Config | None = None) -> None:
         self.sel = selectors.DefaultSelector()
-        self.devices: dict[str, InputDevice] = {}  # path -> InputDevice (monitored)
-        self.pressed: dict[str, set[int]] = {}  # path -> set[int]
-        self.grabbed: set[str] = set()  # paths currently EVIOCGRAB'd by us
+        self.devices: dict[str, InputDevice] = {}  # path -> monitored device
+        self.pressed: dict[str, set[int]] = {}  # path -> keys currently held
+        self.grabbed: set[str] = set()
         self.running = True
         self.need_rescan = False
-
-        # Dedup sets. _reconcile_grabs() runs on EVERY key event, so an
-        # un-deduped log line inside it is a per-keystroke journal record naming
-        # a device — see the journal-hygiene note above log().
-        self._deferred: set[str] = set()  # paths whose grab is deferred (keys held)
-        self._grab_failed: set[str] = set()  # paths whose last grab attempt failed
-        self._read_errored: set[str] = set()  # paths that errored on read
-
-        # Pure-push model: the daemon starts with no config and is told what to
-        # do over the control socket. `pushed[uid]` holds the Config most
-        # recently pushed by each uid; only the config of the uid that currently
-        # controls a seat (active_uids()) is *live* and governs the keyboard.
-        self.pushed: dict[int, Config] = {}  # uid -> Config (dropped on disconnect)
-        self.live_uid: int | None = None  # uid whose config is governing, or None
-        self.groups: list[Group] = []  # the live config's groups (empty when idle)
-
-        # `-c PATH` dev mode: a file config forced live, bypassing seat
-        # arbitration (so the daemon is usable for ad-hoc testing without a
-        # pusher). Treated as if the invoking user pushed it and is always active.
-        self.forced = config is not None
+        self.pushed: dict[int, Config] = {}  # uid -> most recent config
+        self.live_uid: int | None = None
+        self.groups: list[Group] = []
+        self.forced = config is not None  # -c: pinned live, no arbitration
         if config is not None:
             self.pushed[os.getuid()] = config
             self.live_uid = os.getuid()
             self.groups = config.groups
-
-        # control socket (now mandatory: it is how config arrives)
+        self.clients: dict[
+            socket.socket, dict
+        ] = {}  # conn -> {buf, uid, born, hello, debug}
         self._listen: socket.socket | None = None
         self._sock_path: str | None = None
-        # conn -> {"buf": bytes, "uid": int, "born": monotonic, "hello": bool}
-        self.clients: dict[socket.socket, dict] = {}
+        self._watches: list[InotifyWatch] = []
         self._last_sig: tuple | None = None
-        # seats inotify watch (best-effort; falls back to periodic polling)
-        self._seatwatch: SeatWatch | None = None
+        self._said: set[str] = set()  # keys of one-shot log lines already emitted
+        self._fronting: dict[str, tuple[str, InputDevice]] = {}
+        self._fronted_until: dict[
+            str, float
+        ] = {}  # physical path -> inf while fronted, else grace deadline
 
-    # -- device matching ----------------------------------------------------- #
+    # -- one-shot / debug logging ------------------------------------------- #
+    def _once(self, key: str, msg: str, pri: int = PRI_INFO) -> None:
+        if key not in self._said:
+            self._said.add(key)
+            CTRL_LOG.emit(msg, pri)
+
+    def _forget(self, *keys: str) -> None:
+        self._said.difference_update(keys)
+
+    def _debug(self, msg: str) -> None:
+        """Key-rate diagnostics, sent only to root clients that subscribed."""
+        for conn, info in list(self.clients.items()):
+            if info["debug"]:
+                self._send(conn, {"type": "debug", "msg": _safe(msg)})
+
+    # -- matching ------------------------------------------------------------- #
     @staticmethod
     def _dev_matches(group: Group, dev: InputDevice) -> bool:
-        """True if `dev` is a target of `group`.
-
-        A device matches when its name matches an applicable matcher field:
-        `keyboards` (keyboard-class only), `pointers` (pointer-class only), or
-        `devices` (any class). Matching is case-insensitive and against the
-        WHOLE name: an entry holding a glob metacharacter (`*`, `?`, `[seq]`;
-        `{a,b}` was already expanded at parse time) is matched with fnmatch — so
-        a bare `*` matches every device — and any other entry must match
-        exactly. There is no substring matching: wrap it in `*` for that.
-        """
         low = (dev.name or "").lower()
 
         def hit(patterns: list[str]) -> bool:
@@ -1114,303 +666,192 @@ class KbKill:
                 for p in patterns
             )
 
-        if hit(group.keyboards) and is_keyboard(dev):
-            return True
-        if hit(group.pointers) and is_pointer(dev):
-            return True
-        if hit(group.devices):
-            return True
-        return False
+        return (
+            (hit(group.keyboards) and is_keyboard(dev))
+            or (hit(group.pointers) and is_pointer(dev))
+            or hit(group.devices)
+        )
+
+    def _update_fronting(self) -> None:
+        """Recompute remapper pairs. A physical device whose copy just vanished
+        stays off-limits for FRONTED_GRACE so a restarting remapper can re-grab
+        it; grabbing it ourselves would make the remapper give up on it."""
+        now = time.monotonic()
+        self._fronting = fronting_map(self.devices)
+        for path in self._fronting:
+            self._fronted_until[path] = math.inf
+        for path, until in list(self._fronted_until.items()):
+            if path in self._fronting:
+                continue
+            if until == math.inf:
+                self._fronted_until[path] = now + FRONTED_GRACE
+                dev = self.devices.get(path)
+                if dev is not None:
+                    CTRL_LOG.emit(
+                        f"{dev.name}: remapper copy vanished; leaving it alone for {FRONTED_GRACE:g}s"
+                    )
+            elif until <= now:
+                del self._fronted_until[path]
 
     def _resolve_targets(self, group: Group) -> dict[str, InputDevice]:
-        """Pick the devices to grab for a group, honouring `virtual`.
-
-        Under "auto" (the default) each matched device is swapped for the
-        forwarded copy of it that a remapper fronts, if there is one — so a
-        matcher naming the physical keyboard keeps working when input-remapper
-        starts, stops, or restarts, and the physical device is left for
-        input-remapper to (re)grab. Never targeting fronted hardware matters
-        beyond politeness: _reconcile_grabs() retries a failed grab on every key
-        event, so a kill held across an input-remapper restart would poll until
-        the physical device came free and then steal it.
-
-        `virtual = true` narrows that to virtual devices only, never a physical
-        one — including an unfronted match, which auto would still grab.
-        `virtual = false` disables the swap: the group targets exactly what its
-        matchers named. See Group.virtual.
-        """
-        matched = {p: d for p, d in self.devices.items() if self._dev_matches(group, d)}
-        if group.virtual is False:
-            return matched  # escape hatch: no pairing, no filtering
-
-        fronting = fronting_map(self.devices)
+        now = time.monotonic()
         out: dict[str, InputDevice] = {}
-        for path, dev in matched.items():
-            front = fronting.get(path)
-            if front is None:
-                out[path] = dev  # nothing fronts it: the device itself
-            else:
-                out[front[0]] = front[1]  # its forwarded copy instead
-        if group.virtual:
-            return {p: d for p, d in out.items() if is_virtual(d)}
+        for path, dev in self.devices.items():
+            if not self._dev_matches(group, dev):
+                continue
+            if group.virtual is False:
+                out[path] = dev
+            elif (front := self._fronting.get(path)) is not None:
+                out[front[0]] = front[1]  # the remapper's copy instead of the hardware
+            elif self._fronted_until.get(path, 0.0) <= now:
+                out[path] = dev
+        if group.virtual is True:
+            out = {p: d for p, d in out.items() if is_virtual(d)}
         return out
 
-    # -- device lifecycle ---------------------------------------------------- #
-    def _add_device(self, path: str, dev: InputDevice) -> bool:
-        """Start monitoring `dev`. False if it vanished before we could read it.
+    # -- device lifecycle ----------------------------------------------------- #
+    def _wanted(self, dev: InputDevice) -> bool:
+        want_pointers = any(g.pointers or g.devices for g in self.groups)
+        return is_keyboard(dev) or (want_pointers and is_pointer(dev))
 
-        The device can disappear between open_devices() and here, so seeding
-        `pressed` may fail; when it does we register nothing and drop the handle.
-        The next rescan (2s) picks the device up again if it comes back.
-        """
-        held = active_keys_safe(dev)
+    def _add_device(self, path: str) -> None:
+        try:
+            dev = InputDevice(path)
+        except OSError:
+            return  # not (yet) readable; the next inotify event retries
+        held = active_keys_safe(dev) if self._wanted(dev) else None
         if held is None:
-            try:
-                dev.close()
-            except OSError:
-                pass
-            return False
+            dev.close()
+            return
+        mask_to_keys(dev.fd)
         self.devices[path] = dev
         self.pressed[path] = held
         self.sel.register(dev, selectors.EVENT_READ, path)
-        return True
+        CTRL_LOG.emit(f"watching: {path} ({dev.name})")
 
     def _remove_device(self, path: str) -> None:
         dev = self.devices.pop(path, None)
-        if dev is not None:
-            try:
-                self.sel.unregister(dev)
-            except (KeyError, ValueError):
-                pass
-            try:
-                dev.close()
-            except OSError:
-                pass
+        if dev is None:
+            return
+        try:
+            self.sel.unregister(dev)
+        except (KeyError, ValueError):
+            pass
+        try:
+            dev.close()
+        except OSError:
+            pass
         self.pressed.pop(path, None)
-        for group in self.groups:
-            group.targets.pop(path, None)
         self.grabbed.discard(path)
-        # Clear the log-dedup state, so a device that comes back and genuinely
-        # fails again is reported again.
-        self._deferred.discard(path)
-        self._grab_failed.discard(path)
-        self._read_errored.discard(path)
+        self._fronted_until.pop(path, None)
+        for g in self.groups:
+            g.targets.pop(path, None)
+        self._forget(f"grab:{path}", f"read:{path}", f"defer:{path}")
+
+    @staticmethod
+    def _stale(path: str, dev: InputDevice) -> bool:
+        """True when the node was re-created since we opened it (same path,
+        new inode), as input-remapper does on every preset apply."""
+        try:
+            return os.stat(path).st_ino != os.fstat(dev.fd).st_ino
+        except OSError:
+            return True
 
     def rescan(self) -> None:
         self.need_rescan = False
-        want_pointers = any(g.pointers or g.devices for g in self.groups)
-        current = open_devices(want_pointers)
-
-        # Drop devices that vanished.
-        for path in list(self.devices):
-            if path not in current:
-                CTRL_LOG.emit(f"device gone: {path}")
-                self._remove_device(path)
-
-        # Add newly appeared devices.
-        for path, dev in current.items():
-            if path in self.devices:
-                dev.close()  # already monitored; discard the duplicate handle
-            elif self._add_device(path, dev):
-                CTRL_LOG.emit(f"watching: {path} ({dev.name})")
-
-        for group in self.groups:
-            group.targets = self._resolve_targets(group)
-        self._reassert_registrations()
-        self._release_stale_keys()
-        self._reconcile_grabs()
-        self._warn_empty_groups()
-
-    def _reassert_registrations(self) -> None:
-        """Re-arm any monitored device whose selector (epoll) watch was silently
-        dropped. INVARIANT: every device in `self.devices` must be registered for
-        read, or the loop never polls it — the device then goes deaf with no error
-        (no ENODEV, so _read_device never removes it) and only a daemon restart
-        recovers. Observed after a keyboard re-enumerates (USB<->Bluetooth): the
-        churn of removing/closing other devices desyncs the epoll fd table and an
-        unrelated fd loses its watch. This heals it by re-registering the fd we
-        still hold — it does NOT re-open (so an active grab is untouched), and
-        epoll is level-triggered, so a pending event is seen on the very next
-        loop pass. A truly dead fd re-registers, then errors on read and is
-        dropped normally; either way the deaf-forever state cannot persist."""
-        try:
-            registered = set(self.sel.get_map())
-        except Exception:  # noqa: BLE001 - a broken map must never crash rescan
-            return
+        present = set(list_devices())
         for path, dev in list(self.devices.items()):
-            try:
-                fd = dev.fileno()
-            except (OSError, ValueError):
-                continue  # fd already gone; a read error / next rescan drops it
-            if fd in registered:
-                continue
-            try:
-                self.sel.register(dev, selectors.EVENT_READ, path)
-            except (KeyError, OSError, ValueError):
-                continue
-            CTRL_LOG.emit(f"re-armed dropped watch: {path} ({dev.name})")
-
-    def _release_stale_keys(self) -> None:
-        """Drop keys the kernel says are no longer held.
-
-        `pressed` is seeded from active_keys() when a device is opened and then
-        maintained purely from that device's event stream — so a device we cannot
-        read leaves its entry frozen. That happens for real: another process
-        (input-remapper) can take an exclusive grab on a device we already
-        monitor, after which our reads yield nothing and any key held at that
-        moment stays "held" forever. A permanently non-empty entry is not
-        cosmetic: it defers that device's grab indefinitely (_reconcile_grabs), so
-        a kill silently never takes effect, and it pins a combo latched so the
-        wake hotkey can never edge-fire (_toggle_groups) — i.e. a lockout.
-
-        This only ever INTERSECTS with the kernel's view, never adds, which is
-        what makes it safe to run on a timer: it cannot complete a combo, so it
-        can never fire a hotkey, and re-latching afterwards can only *re-arm* a
-        combo, never suppress a real press. An unread event queued behind us is
-        likewise safe — a pending key-up we drop early is just discarded twice.
-        """
-        for path, dev in self.devices.items():
-            held = self.pressed.get(path)
-            if not held:
-                continue
-            live = active_keys_safe(dev)
-            if live is None:
-                continue  # device is going away; rescan will drop it
-            held -= held - live  # drop only: keys the kernel no longer reports held
-        # Re-derive the latches from ground truth UNCONDITIONALLY (not only when a
-        # key was dropped above). A latch can be pinned True while `pressed` is
-        # already correct — e.g. a lost key-up was processed as a drop on an
-        # earlier pass, or a grab/ungrab swallowed it — and a guard on "did we
-        # drop something this time" would then leave the latch stuck, so the next
-        # press finds no rising edge and is silently eaten. Deriving from the
-        # current union every time costs nothing when it agrees and heals the
-        # latch when it does not. It STILL only ever re-arms, never fires: it
-        # does not call _toggle_groups, and since the correction above only drops
-        # keys, the derived latch can only go True→False (re-arm) or stay put —
-        # it can never complete a combo.
-        now_held = self._global_pressed()
-        for group in self.groups:
-            group.kill_held = combo_held(group.kill_combo, now_held)
-            group.wake_held = combo_held(group.wake_combo, now_held)
-
-    def _warn_empty_groups(self) -> None:
-        """Warn once per group while it matches zero devices.
-
-        A zero-match group is silent otherwise and looks exactly like a config
-        that was never picked up (bad matcher, typo, or virtual=true filtering
-        out every physical match). Runs after every rescan — i.e. right after a
-        config push lands (pointer devices are only opened by that rescan, so
-        checking earlier would false-positive) — and logs only on transitions:
-        once when a group goes empty, once when a device appears for it.
-
-        Also advises once when `virtual = false` aims a group at hardware a
-        remapper fronts: that is the one setting that opts out of the pairing
-        in _resolve_targets, so the grab will fight input-remapper for it.
-        """
-        fronting = fronting_map(self.devices)
-        for group in self.groups:
-            if group.virtual is False and not group.warned_fronted:
-                fronted = [d for p, d in group.targets.items() if p in fronting]
-                if fronted:
-                    group.warned_fronted = True
-                    CTRL_LOG.emit(
-                        f"[{group.name}] warning: virtual=false targets "
-                        f"{len(fronted)} device(s) a remapper already fronts — "
-                        'the grab will fight it (use "auto" unless you mean to)',
-                        PRI_WARN,
-                    )
-            if group.targets:
-                if group.warned_empty:
-                    group.warned_empty = False
-                    CTRL_LOG.emit(
-                        f"[{group.name}] now matches {len(group.targets)} device(s)"
-                    )
-                continue
-            if group.warned_empty:
-                continue
-            group.warned_empty = True
-            if group.virtual is True and any(
-                self._dev_matches(group, d) for d in self.devices.values()
-            ):
-                CTRL_LOG.emit(
-                    f"[{group.name}] warning: matches only physical devices and "
-                    "virtual=true skips them — nothing will be grabbed (use "
-                    '"auto" unless input-remapper fronts this device)',
-                    PRI_WARN,
-                )
-            else:
-                CTRL_LOG.emit(
-                    f"[{group.name}] warning: matches no present device — "
-                    "nothing will be grabbed until one appears (check the "
-                    "matchers against `kb-kill-daemon detect`; an entry with no "
-                    "wildcard must equal the whole name — wrap it in * to match "
-                    "part of one)",
-                    PRI_WARN,
-                )
-
-    # -- live config (which pushed config governs the keyboard) -------------- #
-    def _install_groups(self, groups: list[Group], preserve: dict[str, bool]) -> None:
-        """Make `groups` the live set, releasing any prior grab first.
-
-        We unconditionally ungrab everything before switching so a grab can never
-        outlive the config that asked for it (the core no-lockout invariant). New
-        groups start with killed taken from `preserve` (name -> killed), default
-        False -- so a session switch (preserve={}) always lands AWAKE: a
-        backgrounded user can never pre-arm a kill that fires on the incoming
-        user or the login greeter. A re-push from the live uid passes its current
-        killed map so a config edit doesn't surprise-enable/disable a keyboard.
-        """
-        for path in list(self.grabbed):
-            self._ungrab(path)
-        held = self._global_pressed()
-        for g in groups:
-            g.killed = preserve.get(g.name, False)
-            # Seed the edge latches from what is held right now, so a config that
-            # arrives while you happen to be holding a combo doesn't fire it on
-            # the next unrelated key event. Releasing re-arms it normally.
-            g.kill_held = combo_held(g.kill_combo, held)
-            g.wake_held = combo_held(g.wake_combo, held)
-        self.groups = groups
+            if path not in present or self._stale(path, dev) or not self._wanted(dev):
+                CTRL_LOG.emit(f"dropped: {path} ({dev.name})")
+                self._remove_device(path)
+        for path in sorted(present - self.devices.keys()):
+            self._add_device(path)
+        self._update_fronting()
         for g in self.groups:
             g.targets = self._resolve_targets(g)
+        self._release_stale_keys()
         self._reconcile_grabs()
-        # The new config may need pointer devices the previous one didn't (they
-        # are only opened when a live group references them), so re-enumerate on
-        # the next loop tick to pick them up promptly.
-        self.need_rescan = True
-        self._last_sig = None  # force a fresh state broadcast
+        self._warn_groups()
+        self._maybe_broadcast()
+
+    def _release_stale_keys(self) -> None:
+        """Intersect `pressed` with the kernel's view. Drop-only, so it can only
+        re-arm a combo, never complete one: a device another process has grabbed
+        delivers us nothing, and a key held at that moment would stay "held"."""
+        for path, dev in self.devices.items():
+            held = self.pressed[path]
+            if held:
+                live = active_keys_safe(dev)
+                if live is not None:
+                    held &= live
+        self._sync_latches(self._global_pressed())
+
+    def _warn_groups(self) -> None:
+        for g in self.groups:
+            if g.virtual is False and any(p in self._fronting for p in g.targets):
+                self._once(
+                    f"fights:{g.name}",
+                    f"[{g.name}] warning: virtual=false targets hardware a remapper fronts; the grab will fight it",
+                    PRI_WARN,
+                )
+            if g.targets:
+                if f"empty:{g.name}" in self._said:
+                    self._forget(f"empty:{g.name}")
+                    CTRL_LOG.emit(f"[{g.name}] now matches {len(g.targets)} device(s)")
+                continue
+            if g.virtual is True and any(
+                self._dev_matches(g, d) for d in self.devices.values()
+            ):
+                why = "virtual=true skips the physical devices it matches"
+            else:
+                why = "check names with kb-kill-detect; an entry without a wildcard must equal the whole name"
+            self._once(
+                f"empty:{g.name}",
+                f"[{g.name}] warning: matches no device, nothing will be grabbed ({why})",
+                PRI_WARN,
+            )
+
+    # -- live config ---------------------------------------------------------- #
+    def _install_groups(self, groups: list[Group], preserve: dict[str, bool]) -> None:
+        """Make `groups` live. Ungrabs everything first (a grab never outlives its
+        config); killed state comes from `preserve`, so a user switch (empty map)
+        always starts awake."""
+        for path in list(self.grabbed):
+            self._ungrab(path)
+        for g in groups:
+            g.killed = preserve.get(g.name, False)
+        self.groups = groups
+        self._said = {
+            k
+            for k in self._said
+            if k.split(":", 1)[0] not in ("empty", "fights", "selfwake", "notarget")
+        }
+        self._sync_latches(self._global_pressed())
+        self.rescan()
 
     def _set_live(self, uid: int | None) -> None:
-        """Switch which uid's pushed config governs the keyboard (starts awake)."""
         self.live_uid = uid
         cfg = self.pushed.get(uid) if uid is not None else None
         self._install_groups(cfg.groups if cfg else [], preserve={})
         if cfg:
             CTRL_LOG.emit(
-                f"live config: uid {uid} -> {len(self.groups)} group(s) "
-                f"[{', '.join(g.name for g in self.groups)}]"
+                f"live config: uid {uid} -> {len(self.groups)} group(s) [{', '.join(g.name for g in self.groups)}]"
             )
         else:
             CTRL_LOG.emit(
-                "live config: none (idle) - no active user has pushed a config"
+                "live config: none (idle); no active user has pushed a config"
             )
 
     def _reevaluate_live(self) -> None:
-        """Pick the live uid from the active seat user(s) and swap if it changed.
-
-        Live uid = an active-seat uid that has pushed a config (deterministic by
-        lowest uid when several seats are active). None -> idle. `-c` dev mode is
-        pinned live and never re-evaluated.
-        """
         if self.forced:
             return
-        active = active_uids()
-        desired = next((uid for uid in sorted(active) if uid in self.pushed), None)
+        desired = next(
+            (uid for uid in sorted(active_uids()) if uid in self.pushed), None
+        )
         if desired != self.live_uid:
             self._set_live(desired)
 
     def _on_set_config(self, uid: int, text: str) -> None:
-        """Handle a set_config push from `uid`: store it, apply if it's live."""
         try:
             cfg = load_config_text(text, f"uid {uid}")
         except ConfigError as e:
@@ -1418,323 +859,200 @@ class KbKill:
             return
         self.pushed[uid] = cfg
         if uid == self.live_uid:
-            # The live user edited their config: re-apply, preserving killed state.
-            preserve = {g.name: g.killed for g in self.groups}
-            self._install_groups(cfg.groups, preserve)
+            self._install_groups(cfg.groups, {g.name: g.killed for g in self.groups})
             CTRL_LOG.emit(
                 f"live config updated by uid {uid}: {len(self.groups)} group(s)"
             )
         else:
-            # A (possibly newly-active) user pushed: maybe it should go live now.
             self._reevaluate_live()
 
-    # -- grab / ungrab ------------------------------------------------------- #
+    # -- grabs ---------------------------------------------------------------- #
     def _grab(self, path: str) -> bool:
-        """Grab `path`. Return True iff a new exclusive grab was actually taken
-        (so the caller can re-sync held keys, since acquiring the grab changes
-        this device's event routing and can drop an in-flight key-up)."""
         dev = self.devices.get(path)
         if dev is None or path in self.grabbed:
             return False
         try:
             dev.grab()
-            self.grabbed.add(path)
-            self._grab_failed.discard(path)
-            # 1:1 with a kill, so its information is already in the KILLED line's
-            # device count; keep the per-device detail for debug runs only.
-            log_keys(f"grabbed (eating): {dev.name}")
-            return True
         except OSError as e:
-            # _reconcile_grabs runs on every key event and re-attempts a failed
-            # grab each time, so an un-deduped failure here is a per-keystroke
-            # journal line naming the device — and "busy" is the NORMAL state when
-            # input-remapper holds the physical device. Log once per path.
-            if path in self._grab_failed:
-                return False
-            self._grab_failed.add(path)
-            if e.errno == errno.EBUSY:
-                log_warn(f"cannot grab {dev.name}: busy (held by another process)")
-            else:
-                log_warn(f"cannot grab {dev.name}: {e}")
-        return False
+            why = "busy (held by another process)" if e.errno == errno.EBUSY else str(e)
+            self._once(f"grab:{path}", f"cannot grab {dev.name}: {why}", PRI_WARN)
+            return False
+        self.grabbed.add(path)
+        self._forget(f"grab:{path}", f"defer:{path}")
+        self._debug(f"grabbed: {dev.name}")
+        return True
 
     def _ungrab(self, path: str) -> bool:
-        """Release `path`. Return True iff we actually held it (so the caller can
-        re-sync held keys: dropping the grab hands routing back and, like taking
-        it, can swallow the key-up that would otherwise clear a combo latch)."""
-        released = False
         dev = self.devices.get(path)
+        released = False
         if dev is not None and path in self.grabbed:
             try:
                 dev.ungrab()
             except OSError:
                 pass
-            log_keys(f"released: {dev.name}")
+            self._debug(f"released: {dev.name}")
             released = True
         self.grabbed.discard(path)
-        self._grab_failed.discard(path)
+        self._forget(f"grab:{path}")
         return released
 
-    # -- state transitions --------------------------------------------------- #
-    def _global_pressed(self) -> set[int]:
-        """Union of keys held across every monitored device.
+    def _reconcile_grabs(self) -> None:
+        """Grabbed set := union of every killed group's targets. A device with
+        keys held is not grabbed until idle (its key-ups would be swallowed and
+        stay stuck at the OS); each key-up re-runs this."""
+        desired: set[str] = set()
+        for g in self.groups:
+            if g.killed:
+                desired.update(g.targets)
+        changed = False
+        for path in desired - self.grabbed:
+            if self.pressed.get(path):
+                if f"defer:{path}" not in self._said:
+                    self._said.add(f"defer:{path}")
+                    self._debug(
+                        f"deferring grab of {self.devices[path].name} until its keys are released"
+                    )
+                continue
+            changed |= self._grab(path)
+        for path in self.grabbed - desired:
+            changed |= self._ungrab(path)
+        if changed:
+            self._release_stale_keys()  # a routing change can swallow an in-flight key-up
 
-        Combos are matched against this union, not a single device, because
-        input-remapper fans one physical keyboard's keys out across several
-        virtual devices (e.g. remapped keys on "input-remapper keyboard", the
-        rest on the "...forwarded" device). Per-device matching would never see
-        the whole combo. The trade-off - holding a modifier on one keyboard and
-        a key on another would match - is harmless for hotkeys this size.
-        """
-        held = set()
+    # -- state ---------------------------------------------------------------- #
+    def _global_pressed(self) -> set[int]:
+        """Union across devices: input-remapper splits one keyboard's keys over
+        several virtual devices, so per-device matching would never see a combo."""
+        held: set[int] = set()
         for keys in self.pressed.values():
             held |= keys
         return held
 
-    def _reconcile_grabs(self) -> None:
-        """Make the set of grabbed devices match the union of every killed
-        group's targets.
-
-        A device is grabbed once no matter how many killed groups want it, and
-        stays grabbed while any of them is killed. Grabbing a device that
-        currently has keys held would swallow their key-ups and leave them stuck
-        down at the OS, so we defer grabbing such a device until it is idle
-        (unless it is already grabbed). Each key-up re-runs this, which is what
-        eventually grabs a deferred device once released.
-        """
-        desired = set()
-        for group in self.groups:
-            if group.killed:
-                desired.update(group.targets)
-
-        grabs_changed = False
-        for path in desired:
-            if path in self.grabbed:
-                self._deferred.discard(path)
-                continue
-            if self.pressed.get(path):
-                # Deduped AND debug-only: this fires on every key event while a
-                # kill is pending and keys are held.
-                if path not in self._deferred:
-                    self._deferred.add(path)
-                    log_keys(
-                        f"deferring grab of {self.devices[path].name} "
-                        "until keys released"
-                    )
-                continue
-            self._deferred.discard(path)
-            if self._grab(path):
-                grabs_changed = True
-
-        for path in list(self.grabbed):
-            if path not in desired:
-                if self._ungrab(path):
-                    grabs_changed = True
-
-        # A grab or ungrab just changed a device's event routing, which can
-        # swallow an in-flight key-up. A lost key-up leaves a phantom key stuck
-        # in `pressed`, and because combos match the GLOBAL union that phantom
-        # pins a kill/wake latch — so the NEXT hotkey press sees no rising edge
-        # and is silently eaten until the periodic sweep clears it (up to
-        # RESCAN_INTERVAL later). Re-sync now instead of waiting: it only ever
-        # drops keys and never fires (see _release_stale_keys), so it cannot
-        # create a hotkey, only re-arm one.
-        if grabs_changed:
-            self._release_stale_keys()
+    def _sync_latches(self, held: set[int]) -> None:
+        for g in self.groups:
+            g.kill_held = combo_held(g.kill_combo, held)
+            g.wake_held = combo_held(g.wake_combo, held)
 
     def _toggle_groups(self, held: set[int]) -> None:
-        """Flip each group's killed state on the RISING EDGE of its kill/wake combo.
+        """Rising edge only: a combo fires when it goes from not-held to held and
+        re-arms once any part is released. Level-triggering would re-fire on every
+        key-down while held (k->l roll-over, kill==wake toggles, a device readable
+        both directly and via its remapper copy)."""
+        for g in self.groups:
+            kill_edge = combo_held(g.kill_combo, held) and not g.kill_held
+            wake_edge = combo_held(g.wake_combo, held) and not g.wake_held
+            if not g.killed and kill_edge:
+                self._set_killed(g, True, "hotkey")
+            elif g.killed and wake_edge:
+                self._set_killed(g, False, "hotkey")
+        self._sync_latches(held)
 
-        Edge- not level-triggered, and this is load-bearing. Called on every key
-        event (down *and* up); a combo fires only when it goes from not-fully-held
-        to fully-held, and the latch clears once you release any part of it. If it
-        fired whenever the combo merely *was* held, every later key-down while you
-        keep holding it would fire it again, which breaks three real cases:
-
-          * Rolling over from one group's hotkey to another's (ctrl+alt+shift down,
-            tap k then p without fully releasing k): the `p` down still sees k held,
-            so the keyboard group's combo would fire a second time and silently
-            undo the kill you just made.
-          * A `kill_combo == wake_combo` toggle config: any unrelated key pressed
-            while the combo is still down would flip the group straight back.
-          * One physical press seen twice, e.g. when both a device and its
-            input-remapper forwarded copy are readable: two key-downs, two fires,
-            net nothing, so the hotkey looks dead.
-
-        The latch is per group per combo, so groups stay independent. Key-ups can
-        only ever clear a latch, never produce an edge -- so this adds no journal
-        traffic (see the journal-hygiene note above log()).
-        """
-        for group in self.groups:
-            kill_now = combo_held(group.kill_combo, held)
-            wake_now = combo_held(group.wake_combo, held)
-            kill_edge = kill_now and not group.kill_held
-            wake_edge = wake_now and not group.wake_held
-            # Latch before acting: when kill_combo == wake_combo a kill marks the
-            # wake combo held too, so the same hold can't immediately wake it.
-            group.kill_held = kill_now
-            group.wake_held = wake_now
-            if not group.killed:
-                if kill_edge:
-                    group.killed = True
-                    self._log_kill(group)
-                    self._notify_transition(group)
-            elif wake_edge:
-                group.killed = False
-                log_state(f"[{group.name}] WOKEN")
-                self._notify_transition(group)
-
-    @staticmethod
-    def _combo_satisfiable(combo: list[frozenset[int]], devs) -> bool:
-        """True if `devs` can, between them, produce every token of `combo`."""
+    def _can_self_wake(self, group: Group) -> bool:
         caps: set[int] = set()
-        for d in devs:
+        for d in group.targets.values():
             caps |= set(d.capabilities().get(ecodes.EV_KEY, []))
-        return all(token & caps for token in combo)
+        return all(token & caps for token in group.wake_combo)
 
-    def _log_kill(self, group: Group) -> None:
-        # Lockout guard: warn (never refuse). A killed keyboard can always wake
-        # itself (you type the wake combo on it). A killed pointer can only
-        # self-wake if the wake combo is producible on the pointer (e.g. a
-        # mouse-button combo); otherwise it must be woken from another device.
-        #
-        # The advisories are emitted at most once per group per config install, so
-        # a toggle loop can't multiply them (warned_kill resets when
-        # _install_groups rebuilds the Group objects).
-        if not group.warned_kill:
-            group.warned_kill = True
-            non_targets = [p for p in self.devices if p not in group.targets]
-            self_wakeable = self._combo_satisfiable(
-                group.wake_combo, group.targets.values()
-            )
+    def _set_killed(self, group: Group, killed: bool, how: str) -> None:
+        group.killed = killed
+        via = " (via control)" if how == "control" else ""
+        if killed:
             if not group.targets:
-                log_state(
-                    f"[{group.name}] kill: no target device present yet "
-                    "(will grab when it appears)",
+                self._once(
+                    f"notarget:{group.name}",
+                    f"[{group.name}] no target device present; will grab one when it appears",
                     PRI_WARN,
                 )
-            elif not non_targets and not self_wakeable:
-                log_state(
-                    f"[{group.name}] warning: killing the only device(s) present and "
-                    "the wake combo can't be produced on them — wake needs another "
-                    "device, a config re-push, or a daemon restart",
+            elif not self._can_self_wake(group):
+                self._once(
+                    f"selfwake:{group.name}",
+                    f"[{group.name}] note: cannot wake itself; use the wake hotkey on another device",
                     PRI_WARN,
                 )
-            elif not non_targets:
-                log_state(
-                    f"[{group.name}] warning: killing the only device(s) present "
-                    "(wake hotkey on them still works)",
-                    PRI_WARN,
-                )
-            elif not self_wakeable:
-                log_state(
-                    f"[{group.name}] note: this group can't self-wake — use the wake "
-                    "hotkey on another device (e.g. your keyboard)",
-                    PRI_WARN,
-                )
-        # The device count carries what the (now debug-only) per-device "grabbed
-        # (eating)" lines used to say, so a toggle costs exactly one journal record.
-        log_state(f"[{group.name}] KILLED ({len(group.targets)} device(s))")
+            log_state(f"[{group.name}] KILLED ({len(group.targets)} device(s)){via}")
+        else:
+            log_state(f"[{group.name}] AWAKE{via}")
+        self._maybe_broadcast()
 
-    # -- event handling ------------------------------------------------------ #
+    # -- events --------------------------------------------------------------- #
     def _process(self, path: str, event) -> None:
-        if event.type != ecodes.EV_KEY:
+        if event.type == ecodes.EV_SYN:
+            if event.code == ecodes.SYN_DROPPED:
+                self._resync(path)
+            return
+        if event.type != ecodes.EV_KEY or event.value == 2:  # ignore autorepeat
             return
         pressed = self.pressed[path]
-        if event.value == 1:  # key down
+        if event.value == 1:
             pressed.add(event.code)
-        elif event.value == 0:  # key up
+        else:
             pressed.discard(event.code)
-        else:  # autorepeat (2) - ignore for combos
-            return
-        # Runs on up as well as down: _toggle_groups is edge-triggered, and a
-        # release is what re-arms a combo's latch.
-        self._toggle_groups(self._global_pressed())
-        self._log_wake_progress(path)
+        held = self._global_pressed()
+        self._toggle_groups(held)  # on up as well as down: a release re-arms the latch
+        self._debug_progress(held, path)
         self._reconcile_grabs()
 
-    def _log_wake_progress(self, path: str) -> None:
-        """Debug aid for "wake doesn't fire": while a group is killed, log how
-        much of its wake combo is currently held whenever that changes, plus
-        which device delivered the deciding event.
+    def _resync(self, path: str) -> None:
+        """The kernel dropped queued events: reload this device's held keys and
+        re-latch, so the loss can neither strand a key nor fire a combo."""
+        held = active_keys_safe(self.devices[path])
+        if held is not None:
+            self.pressed[path] = held
+        self._sync_latches(self._global_pressed())
+        self._debug(f"SYN_DROPPED on {path}; resynced held keys")
 
-        Security: this runs on EVERY key event, so it is not merely logged at a
-        low level — with DEBUG_KEYS unset it is not written at all. It is NOT
-        enough that the text holds no raw keycodes: the combo token names, the
-        held counts and the source device name are each sufficient to rebuild
-        what was typed when sampled at key rate, and the timing alone is a
-        password side channel. Any local uid can push a config, so a group per
-        key would otherwise make this a keylogger readable by group `adm`. See
-        the journal-hygiene note above log().
-        """
-        if not DEBUG_KEYS:
+    def _debug_progress(self, held: set[int], path: str) -> None:
+        if not any(info["debug"] for info in self.clients.values()):
             return
-        held: set[int] | None = None
-        for group in self.groups:
-            if not group.killed:
-                group.wake_progress = None
-                continue
-            if held is None:
-                held = self._global_pressed()
-            progress = tuple(bool(tok & held) for tok in group.wake_combo)
-            if progress == group.wake_progress:
-                continue
-            group.wake_progress = progress
-            missing = [t for t, ok in zip(group.wake_tokens, progress) if not ok]
-            dev = self.devices.get(path)
-            src = dev.name if dev is not None else path
-            log_keys(
-                f"[{group.name}] wake progress: {sum(progress)}/{len(progress)} "
-                f"tokens held"
-                + (f" (missing: {'+'.join(missing)})" if missing else "")
-                + f" - last event from {src!r}"
-            )
+        dev = self.devices.get(path)
+        src = dev.name if dev is not None else path
+        for g in self.groups:
+            if g.killed:
+                names = [t.strip() for t in g.wake_raw.split("+") if t.strip()]
+                missing = [n for n, tok in zip(names, g.wake_combo) if not (tok & held)]
+                self._debug(
+                    f"[{g.name}] wake: {len(names) - len(missing)}/{len(names)} tokens held"
+                    + (f", missing {'+'.join(missing)}" if missing else "")
+                    + f" (last event from {src!r})"
+                )
 
     def _read_device(self, dev: InputDevice, path: str) -> None:
         try:
             for event in dev.read():
                 self._process(path, event)
-            self._read_errored.discard(path)
+            self._forget(f"read:{path}")
         except OSError as e:
             if e.errno in (errno.ENODEV, errno.EBADF):
-                log_warn(f"device removed mid-read: {path}")
+                CTRL_LOG.emit(f"device removed mid-read: {path}")
                 self._remove_device(path)
                 self.need_rescan = True
-            elif e.errno == errno.EAGAIN:
-                self._read_errored.discard(path)  # healthy, just drained
-            else:
-                # A wedged fd stays readable, so this would otherwise spin the
-                # event loop and flood the journal. Log once per path.
-                if path not in self._read_errored:
-                    self._read_errored.add(path)
-                    log_warn(f"read error on {path}: {e}")
+            elif e.errno != errno.EAGAIN:
+                self._once(f"read:{path}", f"read error on {path}: {e}", PRI_WARN)
 
-    # -- control socket (config push + tray) --------------------------------- #
+    # -- control socket ------------------------------------------------------- #
     def _open_control_socket(self) -> None:
-        """Open the control socket. MANDATORY now - it is how config arrives, so
-        a failure to open is fatal (caller exits, systemd restarts us).
-
-        The socket is connectable by any local user (mode 0666): a pusher must be
-        able to bootstrap the daemon before any config (and therefore any allowed
-        uid) exists. SO_PEERCRED is the real gate - see _accept_client /
-        _apply_command - so this is not a weakening; it just moves the check from
-        connect-time to per-command. No chown is needed (hence no CAP_CHOWN)."""
+        """0666 socket: any local user may connect (a pusher must be able to
+        bootstrap); SO_PEERCRED gates every command."""
         path = control_socket_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         if os.path.exists(path):
-            os.unlink(path)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                try:
+                    probe.connect(path)
+                except OSError:
+                    os.unlink(path)  # stale file from a dead daemon
+                else:
+                    raise OSError(
+                        errno.EADDRINUSE, f"another daemon is listening on {path}"
+                    )
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.bind(path)
         os.chmod(path, 0o666)
         s.listen(MAX_CLIENTS)
         s.setblocking(False)
-        self._listen = s
-        self._sock_path = path
+        self._listen, self._sock_path = s, path
         self.sel.register(s, selectors.EVENT_READ, _LISTEN)
-        log(
-            f"control socket: {path} (any local user may connect; "
-            "SO_PEERCRED gates every command)"
-        )
+        log(f"control socket: {path}")
 
     def _state_dict(self) -> dict:
         return {
@@ -1745,10 +1063,42 @@ class KbKill:
                     "label": g.label or g.name,
                     "killed": g.killed,
                     "targets": len(g.targets),
+                    "kill": g.kill_raw,
+                    "wake": g.wake_raw,
+                    "kill_codes": [sorted(tok) for tok in g.kill_combo],
+                    "wake_codes": [sorted(tok) for tok in g.wake_combo],
                 }
                 for g in self.groups
             ],
         }
+
+    def _device_entry(self, path: str, dev: InputDevice, monitored: bool) -> dict:
+        front = self._fronting.get(path)
+        return {
+            "path": path,
+            "name": dev.name,
+            "class": device_class(dev),
+            "virtual": is_virtual(dev),
+            "monitored": monitored,
+            "grabbed": path in self.grabbed,
+            "held_keys": len(self.pressed.get(path, ())),
+            "targets": [g.name for g in self.groups if path in g.targets],
+            "fronted_by": front[0] if front else None,
+        }
+
+    def _devices_dict(self, everything: bool) -> dict:
+        entries = [
+            self._device_entry(p, d, True) for p, d in sorted(self.devices.items())
+        ]
+        if everything:
+            for path in sorted(set(list_devices()) - self.devices.keys()):
+                try:
+                    dev = InputDevice(path)
+                except OSError:
+                    continue
+                entries.append(self._device_entry(path, dev, False))
+                dev.close()
+        return {"type": "devices", "devices": entries}
 
     def _send(self, conn: socket.socket, obj: dict) -> None:
         try:
@@ -1756,40 +1106,33 @@ class KbKill:
         except OSError:
             self._drop_client(conn)
 
-    def _peer_uid(self, conn: socket.socket) -> int | None:
+    @staticmethod
+    def _peer_uid(conn: socket.socket) -> int | None:
         try:
             creds = conn.getsockopt(
                 socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
             )
-            _pid, uid, _gid = struct.unpack("3i", creds)
-            return uid
+            return struct.unpack("3i", creds)[1]
         except OSError:
             return None
 
     def _accept_client(self) -> None:
-        assert self._listen is not None  # registered in the selector => open
+        assert self._listen is not None
         try:
             conn, _ = self._listen.accept()
         except OSError:
             return
         uid = self._peer_uid(conn)
-        if uid is None:
-            conn.close()
-            return
-        # Per-uid cap so one user can't starve the global pool; then the global cap.
+        per_uid = sum(1 for c in self.clients.values() if c["uid"] == uid)
         if (
-            uid != 0
-            and sum(1 for c in self.clients.values() if c["uid"] == uid)
-            >= MAX_CONNS_PER_UID
+            uid is None
+            or (uid != 0 and per_uid >= MAX_CONNS_PER_UID)
+            or len(self.clients) >= MAX_CLIENTS
         ):
-            CTRL_LOG.emit(
-                f"control: per-uid connection cap reached for uid {uid}, refusing",
-                PRI_WARN,
-            )
-            conn.close()
-            return
-        if len(self.clients) >= MAX_CLIENTS:
-            CTRL_LOG.emit("control: client cap reached, refusing connection", PRI_WARN)
+            if uid is not None:
+                CTRL_LOG.emit(
+                    f"control: connection cap reached (uid {uid}), refusing", PRI_WARN
+                )
             conn.close()
             return
         conn.setblocking(False)
@@ -1798,9 +1141,9 @@ class KbKill:
             "uid": uid,
             "born": time.monotonic(),
             "hello": False,
+            "debug": False,
         }
         self.sel.register(conn, selectors.EVENT_READ, ("client", conn))
-        # Send current state only to someone allowed to see it (the live user/root).
         if uid in (0, self.live_uid):
             self._send(conn, self._state_dict())
 
@@ -1814,25 +1157,22 @@ class KbKill:
             conn.close()
         except OSError:
             pass
-        # If the disconnecting client was a pushing user's only remaining
-        # connection, drop their pushed config and revert (idle or next active).
-        # In forced (-c) dev mode the config is pinned and never dropped.
-        if info is not None and not self.forced:
-            uid = info["uid"]
-            if uid != 0 and not any(c["uid"] == uid for c in self.clients.values()):
-                if self.pushed.pop(uid, None) is not None:
-                    CTRL_LOG.emit(f"uid {uid} disconnected; dropping its pushed config")
-                    if uid == self.live_uid:
-                        self._reevaluate_live()
+        if info is None or self.forced:
+            return
+        uid = info["uid"]
+        if not any(c["uid"] == uid for c in self.clients.values()) and self.pushed.pop(
+            uid, None
+        ):
+            CTRL_LOG.emit(f"uid {uid} disconnected; dropping its pushed config")
+            if uid == self.live_uid:
+                self._reevaluate_live()
 
     def _sweep_handshake(self) -> None:
-        """Drop connections that never sent a valid command in time (anti-DoS)."""
         now = time.monotonic()
         for conn, info in list(self.clients.items()):
-            if not info["hello"] and (now - info["born"]) > HANDSHAKE_SECONDS:
+            if not info["hello"] and now - info["born"] > HANDSHAKE_SECONDS:
                 CTRL_LOG.emit(
-                    f"control: dropping idle connection from uid {info['uid']} "
-                    "(no command within handshake window)",
+                    f"control: dropping idle connection from uid {info['uid']}",
                     PRI_WARN,
                 )
                 self._drop_client(conn)
@@ -1844,98 +1184,65 @@ class KbKill:
         try:
             data = conn.recv(65536)
         except OSError:
-            self._drop_client(conn)
-            return
+            data = b""
         if not data:
             self._drop_client(conn)
             return
-        buf = info["buf"] + data
-        *lines, rest = buf.split(b"\n")
-        # DoS bound: drop a client that floods bytes without a newline.
+        *lines, rest = (info["buf"] + data).split(b"\n")
         if len(rest) > MAX_LINE:
             CTRL_LOG.emit("control: dropping client (over-long line)", PRI_WARN)
             self._drop_client(conn)
             return
         info["buf"] = rest
         for line in lines:
-            line = line.strip()
-            if not line:
-                continue
             try:
-                obj = json.loads(line)
+                obj = json.loads(line) if line.strip() else None
             except ValueError:
                 continue
-            if not isinstance(obj, dict):
-                continue
-            info["hello"] = True
-            self._apply_command(obj, conn, info["uid"])
+            if isinstance(obj, dict):
+                info["hello"] = True
+                self._apply_command(obj, conn, info["uid"])
 
     def _apply_command(self, obj: dict, conn: socket.socket, uid: int) -> None:
         cmd = obj.get("cmd")
-
-        # set_config: accepted from ANY uid, stored under that uid; it only
-        # governs the keyboard while that uid is the active seat user.
-        if cmd == "set_config":
-            text = obj.get("toml")
-            if isinstance(text, str):
-                self._on_set_config(uid, text)
+        if cmd == "set_config":  # any uid; governs only while that uid is live
+            if isinstance(obj.get("toml"), str):
+                self._on_set_config(uid, obj["toml"])
             return
-
-        # status: only the live user (or root) may read live state.
-        if cmd == "status":
-            if uid in (0, self.live_uid):
-                self._send(conn, self._state_dict())
-            return
-
-        # devices: dump what the daemon is monitoring/grabbing right now
-        # (debug aid). Names, classes, and held-key COUNTS only — never
-        # keycodes — so no key data crosses the socket.
-        if cmd == "devices":
-            if uid in (0, self.live_uid):
-                self._send(
-                    conn,
-                    {
-                        "type": "devices",
-                        "devices": [
-                            {
-                                "path": p,
-                                "name": d.name,
-                                "class": "ptr" if is_pointer(d) else "kbd",
-                                "virtual": is_virtual(d),
-                                "grabbed": p in self.grabbed,
-                                "held_keys": len(self.pressed.get(p, ())),
-                            }
-                            for p, d in sorted(self.devices.items())
-                        ],
-                    },
-                )
-            return
-
-        # kill/wake/toggle: only the user whose config is currently live (or root).
         if uid not in (0, self.live_uid):
             CTRL_LOG.emit(
                 f"control: rejected {cmd!r} from uid {uid} (not the live user)",
                 PRI_WARN,
             )
+            self._send(conn, {"type": "error", "error": "not the live user"})
             return
-        group = next((g for g in self.groups if g.name == obj.get("group")), None)
-        if group is None:
-            return
-        if cmd == "kill":
-            group.killed = True
-        elif cmd == "wake":
-            group.killed = False
-        elif cmd == "toggle":
-            group.killed = not group.killed
+        if cmd == "status":
+            self._send(conn, self._state_dict())
+        elif cmd == "devices":
+            self._send(conn, self._devices_dict(bool(obj.get("all"))))
+        elif cmd == "debug":
+            if uid != 0:
+                self._send(conn, {"type": "error", "error": "debug is root only"})
+                return
+            self.clients[conn]["debug"] = True
+            self._send(
+                conn, {"type": "debug", "msg": "subscribed to key-rate diagnostics"}
+            )
+        elif cmd in ("kill", "wake", "toggle"):
+            group = next((g for g in self.groups if g.name == obj.get("group")), None)
+            if group is None:
+                self._send(conn, {"type": "error", "error": "no such group"})
+                return
+            want = {"kill": True, "wake": False, "toggle": not group.killed}[cmd]
+            if want != group.killed:
+                self._set_killed(group, want, "control")
+                self._reconcile_grabs()
         else:
-            return
-        log_state(
-            f"[{group.name}] {'KILLED' if group.killed else 'WOKEN'} (via control)"
-        )
-        self._notify_transition(group)
-        self._reconcile_grabs()
+            self._send(conn, {"type": "error", "error": f"unknown command {cmd!r}"})
 
     def _maybe_broadcast(self) -> None:
+        """Send state to the live user's clients whenever it changed. Called on
+        every kill/wake edge, so no transition is ever coalesced away."""
         sig = tuple((g.killed, len(g.targets)) for g in self.groups)
         if sig == self._last_sig:
             return
@@ -1945,86 +1252,66 @@ class KbKill:
             if info["uid"] in (0, self.live_uid):
                 self._send(conn, state)
 
-    def _notify_transition(self, group: "Group") -> None:
-        """Tell connected clients about ONE kill/wake transition the instant it
-        happens — distinct from _maybe_broadcast, which sends only the coalesced
-        NET state once per loop pass. When several presses are read together the
-        state message collapses them (kill+wake+kill -> one "killed"), so a client
-        watching state alone cannot tell "processed all, coalesced" from "dropped
-        some". These per-edge notices are never coalesced, so `monitor` can show
-        every real toggle. The tray ignores them and follows the state message.
+    # -- main loop ------------------------------------------------------------ #
+    def _watch(self, path: str, mask: int, tag: object) -> None:
+        w = InotifyWatch(path, mask)
+        if w.fd >= 0:
+            self.sel.register(w.fd, selectors.EVENT_READ, tag)
+            self._watches.append(w)
 
-        Same audience (live uid / root) and same fields (validated group name +
-        killed flag) as the state broadcast, so no new disclosure; emitted only on
-        a kill/wake EDGE, so bounded by press rate, never key-event rate."""
-        msg = {"type": "transition", "group": group.name, "killed": group.killed}
-        for conn, info in list(self.clients.items()):
-            if info["uid"] in (0, self.live_uid):
-                self._send(conn, msg)
+    def _drain(self, tag: object) -> None:
+        for w in self._watches:
+            if self.sel.get_key(w.fd).data is tag:
+                w.drain()
 
-    # -- main loop ----------------------------------------------------------- #
     def run(self) -> int:
         def _stop(signum: int, frame: object) -> None:
             raise KeyboardInterrupt
 
         signal.signal(signal.SIGTERM, _stop)
-
-        # Mandatory: without the socket the daemon can never receive a config.
         try:
             self._open_control_socket()
         except OSError as e:
             log(f"FATAL: cannot open control socket: {e}", PRI_ERR)
             return 1
-
         if self.forced:
-            assert self.live_uid is not None  # forced => live_uid set in __init__
-            log(f"forced config (-c): {self.pushed[self.live_uid].source}")
+            log(f"pinned config (-c): {self.pushed[os.getuid()].source}")
         else:
             log("waiting for a config push from the active user's kb-kill-push")
-
-        # Watch the seats dir so active-user switches apply near-instantly; the
-        # periodic rescan re-checks as a backstop if inotify is unavailable.
-        self._seatwatch = SeatWatch()
-        if self._seatwatch.fd >= 0:
-            self.sel.register(self._seatwatch.fd, selectors.EVENT_READ, _SEATWATCH)
-
-        self.rescan()
+        self._watch(SEATS_DIR, _SEAT_MASK, _SEATWATCH)
+        self._watch(INPUT_DIR, _INPUT_MASK, _INPUTWATCH)
         self._reevaluate_live()
-        # Seed the broadcast signature so newly-connected clients get state only
-        # via the initial send, not a spurious startup broadcast.
-        self._last_sig = tuple((g.killed, len(g.targets)) for g in self.groups)
-
+        self.rescan()
         last_scan = time.monotonic()
         try:
             while self.running:
-                events = self.sel.select(timeout=RESCAN_INTERVAL)
-                for key, _ in events:
+                now = time.monotonic()
+                deadline = min(
+                    [
+                        last_scan + RESCAN_INTERVAL,
+                        *(t for t in self._fronted_until.values() if t != math.inf),
+                    ]
+                )
+                for key, _ in self.sel.select(timeout=max(0.0, deadline - now)):
                     tag = key.data
                     if tag is _LISTEN:
                         self._accept_client()
                     elif tag is _SEATWATCH:
-                        self._seatwatch.drain()
+                        self._drain(tag)
                         self._reevaluate_live()
-                    elif isinstance(tag, tuple) and tag[0] == "client":
+                    elif tag is _INPUTWATCH:
+                        self._drain(tag)
+                        self.need_rescan = True
+                    elif isinstance(tag, tuple):
                         self._read_client(tag[1])
                     else:
-                        assert isinstance(tag, str)  # a device fd: data is its path
-                        self._read_device(key.fileobj, tag)
-                # Broadcast a hotkey-driven state change BEFORE the rescan, not
-                # after: rescan() re-opens every input device and can block the
-                # loop for a few hundred ms, and a broadcast queued behind it
-                # makes the tray visibly lag the keypress (the daemon, not the
-                # panel — a plain socket client sees the same delay). The
-                # post-rescan call below still catches state changes the rescan
-                # itself produces (e.g. a target device appearing/vanishing).
-                self._maybe_broadcast()
+                        self._read_device(key.fileobj, tag)  # type: ignore[arg-type]
                 now = time.monotonic()
-                if self.need_rescan or (now - last_scan) >= RESCAN_INTERVAL:
+                if self.need_rescan or now >= deadline:
                     self.rescan()
-                    self._reevaluate_live()  # backstop for a missed inotify event
+                    self._reevaluate_live()
                     self._sweep_handshake()
                     last_scan = now
-                self._maybe_broadcast()
         except KeyboardInterrupt:
             pass
         finally:
@@ -2038,354 +1325,37 @@ class KbKill:
             self._remove_device(path)
         for conn in list(self.clients):
             self._drop_client(conn)
-        if self._seatwatch is not None:
+        for w in self._watches:
             try:
-                self.sel.unregister(self._seatwatch.fd)
+                self.sel.unregister(w.fd)
             except (KeyError, ValueError):
                 pass
-            self._seatwatch.close()
+            w.close()
         if self._listen is not None:
             try:
                 self.sel.unregister(self._listen)
-            except (KeyError, ValueError):
-                pass
-            try:
                 self._listen.close()
-            except OSError:
+            except (KeyError, ValueError, OSError):
                 pass
             if self._sock_path and os.path.exists(self._sock_path):
                 try:
                     os.unlink(self._sock_path)
                 except OSError:
                     pass
-        log("stopped; keyboards restored")
-
-
-# --------------------------------------------------------------------------- #
-# Commands
-# --------------------------------------------------------------------------- #
-def cmd_run(config: Config | None) -> int:
-    # config is None for the normal service (config arrives via push); a file
-    # config from `-c` is pinned live for ad-hoc dev testing.
-    return KbKill(config).run()
-
-
-def cmd_detect(config: Config) -> int:
-    print("=== kb-kill detect ===")
-    print(f"session : {os.environ.get('XDG_SESSION_TYPE', 'unknown')}")
-    print(f"config  : {config.source}")
-    print()
-    print("Groups:")
-    if not config.groups:
-        print("  (none) - config is INERT: kb-kill only monitors and can never")
-        print("          disable a keyboard. Add a group (with kill/wake combos)")
-        print("          to enable it; see the comments in kb-kill.toml.")
-    for g in config.groups:
-        matchers = ", ".join(
-            f"{field}={getattr(g, field)}"
-            for field in ("keyboards", "pointers", "devices")
-            if getattr(g, field)
-        )
-        shown = f' (shown as "{g.label}")' if g.label else ""
-        print(f"  [{g.name}]{shown}  {matchers}")
-        print(
-            f"  {'':9}kill={g.kill_raw}  wake={g.wake_raw}  virtual={g.virtual_label}"
-        )
-    print()
-
-    if os.geteuid() != 0:
-        print("WARNING: not running as root - reading keyboards will fail.")
-        print("  Re-run with sudo:  sudo kb-kill-daemon detect")
-        print()
-
-    devices = open_devices(want_pointers=True)
-    if not devices:
-        print("No input devices found (permission problem?).")
-        return 1
-
-    svc = KbKill(config)
-    svc.devices = devices
-    svc.pressed = {p: set() for p in devices}
-    for g in config.groups:
-        g.targets = svc._resolve_targets(g)
-
-    fronting = fronting_map(devices)
-    print("Devices:")
-    for path in sorted(devices):
-        dev = devices[path]
-        cls = "ptr" if is_pointer(dev) else "kbd"
-        virt = "virtual " if is_virtual(dev) else "physical"
-        target_of = [g.name for g in config.groups if path in g.targets]
-        matched_of = [g.name for g in config.groups if svc._dev_matches(g, dev)]
-        front = fronting.get(path)
-        if target_of:
-            mark = f"TARGET of {', '.join(target_of)} (grabbed when killed)"
-        elif matched_of and front is not None:
-            mark = (
-                f"matches {', '.join(matched_of)}, but a remapper fronts it — "
-                f"the group targets {front[0]} instead"
-            )
-        elif matched_of:
-            mark = (
-                f"matches {', '.join(matched_of)}, but skipped "
-                "(virtual=true ignores a device nothing fronts)"
-            )
-        else:
-            mark = "monitored only (can trigger any hotkey)"
-        grab = (
-            " [GRABBED by another process right now]" if grabbed_elsewhere(dev) else ""
-        )
-        print(f"  {path:24} [{cls}/{virt}] {dev.name}{grab}")
-        print(f"  {'':24}   {mark}")
-
-    empty = [g for g in config.groups if not g.targets]
-    if empty:
-        print()
-        for g in empty:
-            if g.virtual is True and any(
-                svc._dev_matches(g, d) for d in devices.values()
-            ):
-                print(
-                    f"WARNING: [{g.name}] matches only physical devices and "
-                    'virtual=true skips them —\n  nothing will be grabbed. Use "auto" '
-                    "unless a remapper fronts this device."
-                )
-            else:
-                print(
-                    f"WARNING: [{g.name}] matches no present device — nothing "
-                    "will be grabbed until one appears. An entry with no "
-                    "wildcard must equal the whole device name; wrap it in * "
-                    "to match part of one."
-                )
-    for dev in devices.values():
-        dev.close()
-    return 0
-
-
-def _keyname(code: int) -> str:
-    name = ecodes.KEY.get(code, str(code))
-    if isinstance(name, (list, tuple)):
-        name = name[0]
-    return name
-
-
-def cmd_monitor(config: Config) -> int:
-    """Print every key event with its device + keycode, and — when the daemon is
-    running — its REAL kill/wake state from the control socket. Used to diagnose
-    how input-remapper routes the target keyboard's keys and whether a chord
-    actually reaches the daemon. monitor never simulates or guesses kill/wake
-    state; it either reports the daemon's broadcasts or says no daemon is up."""
-    devices = open_devices(want_pointers=True)
-    if not devices:
-        print("No input devices found.")
-        return 1
-
-    # An exclusive grab by another process routes a device's events away from
-    # this monitor entirely — the #1 "my keys don't show up" confusion. Two
-    # common grabbers: input-remapper (always grabs the physical device it
-    # fronts) and the kb-kill daemon itself (grabs a group's targets while
-    # that group is killed).
-    hidden = [
-        (path, dev.name) for path, dev in devices.items() if grabbed_elsewhere(dev)
-    ]
-    if hidden:
-        print("NOTE: exclusively grabbed by another process (input-remapper, or")
-        print("the kb-kill daemon while a group is killed) — events from these")
-        print("devices will NOT appear below:")
-        for path, name in sorted(hidden):
-            print(f"  {path:20} {name}")
-        print()
-
-    sel = selectors.DefaultSelector()
-    pressed: dict[str, set[int]] = {}
-    for path, dev in list(devices.items()):
-        held = active_keys_safe(dev)
-        if held is None:  # unplugged between listing and here
-            devices.pop(path, None)
-            continue
-        pressed[path] = held
-        sel.register(dev, selectors.EVENT_READ, path)
-
-    # Connect to the running daemon's control socket so we can print its REAL
-    # kill/wake state (the ">>> DAEMON" lines below). monitor reads evdev itself
-    # but does NOT drive the daemon, so it must never GUESS whether a press
-    # toggled anything -- a local simulation drifts out of sync with the daemon
-    # (different event timing, or state changed via the tray/socket) and lies.
-    # State therefore comes ONLY from the daemon's broadcasts; as root (or the
-    # live user) we receive every one. If no daemon is running we say so and show
-    # raw key events only -- no invented state.
-    CTRL = object()
-    ctrl_sock: socket.socket | None = None
-    ctrl_buf = b""
-    daemon_state: dict[str, bool] = {}
-    try:
-        ctrl_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        ctrl_sock.settimeout(1.0)
-        ctrl_sock.connect(control_socket_path())
-        ctrl_sock.sendall(b'{"cmd":"status"}\n')  # seed with the current state
-        while b"\n" not in ctrl_buf:
-            chunk = ctrl_sock.recv(4096)
-            if not chunk:
-                raise OSError("daemon closed the connection")
-            ctrl_buf += chunk
-        first, ctrl_buf = ctrl_buf.split(b"\n", 1)
-        msg = json.loads(first)
-        if msg.get("type") == "state":
-            daemon_state = {g["name"]: bool(g["killed"]) for g in msg["groups"]}
-        ctrl_sock.setblocking(False)
-        sel.register(ctrl_sock, selectors.EVENT_READ, CTRL)
-    except (OSError, ValueError, KeyError, TypeError):
-        if ctrl_sock is not None:
-            ctrl_sock.close()
-        ctrl_sock = None
-
-    print("Monitoring all input devices. Press a group's kill/wake combo.")
-    if ctrl_sock is not None:
-        print("Daemon: CONNECTED -- '>>> DAEMON' lines are its real kill/wake state.")
-        for g in config.groups:
-            st = "KILLED" if daemon_state.get(g.name, False) else "awake"
-            print(
-                f"  [{g.name}] kill={g.kill_raw} wake={g.wake_raw}  (daemon now: {st})"
-            )
-    else:
-        print("Daemon: NOT RUNNING -- raw key events only; no kill/wake state is")
-        print("shown (monitor never guesses it). Start kb-kill-daemon to see state.")
-        for g in config.groups:
-            print(f"  [{g.name}] kill={g.kill_raw} wake={g.wake_raw}")
-    print("A '<<< kill/wake combo held' tag marks the instant the keys actually")
-    print("form that chord on evdev. If it never appears, the chord never completed")
-    print("(e.g. a home-row-mod key emitting a modifier instead of its letter).")
-    print("Ctrl+C to stop.\n")
-
-    # Once we've seen any per-edge "transition" message, stop diffing the
-    # coalesced "state" message (which would double-print / hide rapid toggles).
-    saw_transition = False
-
-    # Factual "is this combo fully held right now" latch: reports the KEY union
-    # only (did the chord form on evdev?), never an assumption about daemon state.
-    held_combo: dict[tuple[str, str], bool] = {}
-    glob0 = set().union(*pressed.values()) if pressed else set()
-    for g in config.groups:
-        held_combo[(g.name, "kill")] = combo_held(g.kill_combo, glob0)
-        held_combo[(g.name, "wake")] = combo_held(g.wake_combo, glob0)
-
-    try:
-        while True:
-            for key, _ in sel.select():
-                if key.data is CTRL:
-                    try:
-                        chunk = ctrl_sock.recv(65536) if ctrl_sock else b""
-                    except OSError:
-                        chunk = b""
-                    if not chunk:
-                        print(">>> DAEMON: connection closed (service stopped?)")
-                        if ctrl_sock is not None:
-                            sel.unregister(ctrl_sock)
-                            ctrl_sock.close()
-                        ctrl_sock = None
-                        continue
-                    ctrl_buf += chunk
-                    while b"\n" in ctrl_buf:
-                        line, ctrl_buf = ctrl_buf.split(b"\n", 1)
-                        if not line.strip():
-                            continue
-                        try:
-                            msg = json.loads(line)
-                        except ValueError:
-                            continue
-                        mtype = msg.get("type")
-                        if mtype == "transition":
-                            # Per-edge notice: the authoritative "the daemon just
-                            # toggled" event, never coalesced — one line per real
-                            # kill/wake, so rapid presses can't hide in a net state.
-                            n = msg.get("group")
-                            k = bool(msg.get("killed"))
-                            print(f">>> DAEMON: [{n}] -> {'KILLED' if k else 'awake'}")
-                            daemon_state[n] = k
-                            saw_transition = True
-                            continue
-                        if mtype != "state":
-                            continue
-                        cur = {
-                            g["name"]: bool(g["killed"]) for g in msg.get("groups", [])
-                        }
-                        # A daemon that also sends per-edge "transition" messages
-                        # has already printed each change, so only sync silently;
-                        # an older daemon (state only) never sets saw_transition, so
-                        # fall back to diffing the coalesced state.
-                        if not saw_transition:
-                            for n, k in cur.items():
-                                if n in daemon_state and daemon_state[n] != k:
-                                    print(
-                                        f">>> DAEMON: [{n}] -> "
-                                        f"{'KILLED' if k else 'awake'}"
-                                    )
-                        daemon_state = cur
-                    continue
-
-                path = key.data
-                dev = devices[path]  # InputDevice (key.fileobj is loosely typed)
-                try:
-                    events = list(dev.read())
-                except OSError:
-                    continue
-                for ev in events:
-                    if ev.type != ecodes.EV_KEY:
-                        continue
-                    p = pressed[path]
-                    if ev.value == 1:
-                        p.add(ev.code)
-                    elif ev.value == 0:
-                        p.discard(ev.code)
-                    action = {1: "down", 0: "up", 2: "rept"}.get(ev.value, "?")
-                    short = dev.name[:34]
-                    glob = set().union(*pressed.values()) if pressed else set()
-                    flags = []
-                    for g in config.groups:
-                        for kind, combo in (
-                            ("kill", g.kill_combo),
-                            ("wake", g.wake_combo),
-                        ):
-                            now = combo_held(combo, glob)
-                            if now and not held_combo[(g.name, kind)]:
-                                flags.append(f"{kind} combo held[{g.name}]")
-                            held_combo[(g.name, kind)] = now
-                    tag = ("  <<< " + ", ".join(flags)) if flags else ""
-                    print(f"{path:20} {short:34} {_keyname(ev.code):16} {action}{tag}")
-    except KeyboardInterrupt:
-        pass
-    finally:
-        for dev in devices.values():
-            dev.close()
-        if ctrl_sock is not None:
-            ctrl_sock.close()
-    return 0
+        log("stopped; all devices released")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="kb-kill-daemon",
-        description="Disable/enable target input devices (keyboards, mice, "
-        "touchpads) on a global hotkey.",
+        description="Disable/enable input devices (keyboards, mice, touchpads) on a global hotkey.",
     )
-    parser.add_argument(
-        "command",
-        nargs="?",
-        default="run",
-        choices=["run", "detect", "monitor"],
-        help="run the service (default), detect input devices, "
-        "or monitor raw key/button events for debugging",
-    )
+    parser.add_argument("command", nargs="?", choices=["run"], help=argparse.SUPPRESS)
     parser.add_argument(
         "-c",
         "--config",
-        help="path to a config file. detect/monitor read it to "
-        "show your setup; for `run` it pins that config live "
-        "for ad-hoc testing (the service instead receives "
-        "config from the active user via kb-kill-push).",
+        help="pin this config file live (development; bypasses kb-kill-push and seat arbitration)",
     )
-    # The path disambiguates a package install (/usr/bin) from an install.sh
-    # deploy (/usr/local/bin) when both are present.
     parser.add_argument(
         "-V",
         "--version",
@@ -2393,22 +1363,14 @@ def main(argv: list[str] | None = None) -> int:
         version=f"kb-kill-daemon {VERSION} ({Path(__file__).resolve()})",
     )
     args = parser.parse_args(argv)
-
-    # The service (`run` without -c) starts config-less and is fed by kb-kill-push.
-    if args.command == "run" and not args.config:
-        return cmd_run(None)
-
-    try:
-        config = load_config(args.config)
-    except ConfigError as e:
-        log(str(e), PRI_ERR)
-        return 1
-
-    if args.command == "detect":
-        return cmd_detect(config)
-    if args.command == "monitor":
-        return cmd_monitor(config)
-    return cmd_run(config)
+    config = None
+    if args.config:
+        try:
+            config = load_config_file(args.config)
+        except ConfigError as e:
+            log(str(e), PRI_ERR)
+            return 1
+    return KbKill(config).run()
 
 
 if __name__ == "__main__":

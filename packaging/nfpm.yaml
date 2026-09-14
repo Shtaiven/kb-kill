@@ -1,10 +1,10 @@
-# nfpm spec for kb-kill — produces .deb and .rpm from one definition.
+# nfpm spec for kb-kill: one definition for .deb and .rpm.
 #   https://nfpm.goreleaser.com/
 #
-# Built via packaging/build-packages.sh, which stages systemd-unit and .desktop
-# copies with their /usr/local paths rewritten to /usr (packages own /usr, not
-# /usr/local) and exports KB_KILL_VERSION. Don't run nfpm against this file
-# directly — the `packaging/build/...` sources below won't exist yet.
+# Build via packaging/build-packages.sh, which stages the systemd units and
+# .desktop files with /usr/local paths rewritten to /usr and exports
+# KB_KILL_VERSION. This file is the canonical payload list: packaging/check-sync.sh
+# asserts install.sh, uninstall.sh and the AUR PKGBUILD agree with it.
 name: kb-kill
 arch: all                       # noarch: pure Python + shell + units + SVGs
 platform: linux
@@ -14,14 +14,13 @@ priority: optional
 maintainer: Steven Eisinger <steven.a.eisinger@gmail.com>
 description: |
   Disable/enable target input devices (keyboards, mice, touchpads) on a global
-  hotkey via a hardened root daemon. "Disable" is an exclusive EVIOCGRAB on the
-  device (no virtual device, no event re-injection); config is pushed per-user
-  over a control socket and follows the active seat user.
+  hotkey via a sandboxed, unprivileged daemon. "Disable" is an exclusive
+  EVIOCGRAB on the device (no virtual device, no event re-injection); config is
+  pushed per-user over a control socket and follows the active seat user.
 vendor: kb-kill
 homepage: https://github.com/Shtaiven/kb-kill
 license: MIT
 
-# Base deps (the daemon). Per-format names/operators differ — see overrides.
 depends:
   - python3
   - python3-evdev
@@ -30,6 +29,12 @@ contents:
   # --- executables (root-owned, on the global PATH) ---
   - src: scripts/kb-kill-daemon
     dst: /usr/bin/kb-kill-daemon
+    file_info: { mode: 0755 }
+  - src: scripts/kb-kill-detect
+    dst: /usr/bin/kb-kill-detect
+    file_info: { mode: 0755 }
+  - src: scripts/kb-kill-monitor
+    dst: /usr/bin/kb-kill-monitor
     file_info: { mode: 0755 }
   - src: scripts/kb-kill-push
     dst: /usr/bin/kb-kill-push
@@ -49,10 +54,7 @@ contents:
     dst: /usr/lib/systemd/user/kb-kill-tray.service
     file_info: { mode: 0644 }
 
-  # --- app-menu launchers (paths rewritten to /usr) ---
-  - src: packaging/build/desktop/kb-kill-push.desktop
-    dst: /usr/share/applications/kb-kill-push.desktop
-    file_info: { mode: 0644 }
+  # --- app-menu launcher (paths rewritten to /usr) ---
   - src: packaging/build/desktop/kb-kill-tray.desktop
     dst: /usr/share/applications/kb-kill-tray.desktop
     file_info: { mode: 0644 }

@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""kb-kill-detect - show what the running kb-kill daemon sees.
+
+Asks the daemon over its control socket for the live groups and every input
+device, and prints which device each group targets. Needs no device access:
+run it as the active user (or root). Stdlib only.
+"""
+
+import argparse
+import json
+import os
+import socket
+import sys
+
+# Rewritten by packaging/bump-version.sh from the repo-root VERSION file.
+VERSION = "0.4.1"
+
+
+def socket_path() -> str:
+    candidates = ["/run/kb-kill/control.sock"]
+    if base := os.environ.get("XDG_RUNTIME_DIR"):
+        candidates.append(os.path.join(base, "kb-kill.sock"))
+    candidates.append(f"/tmp/kb-kill-{os.getuid()}.sock")
+    return next((c for c in candidates if os.path.exists(c)), candidates[0])
+
+
+class Daemon:
+    """One request/reply connection. The daemon also sends an unsolicited state
+    message on connect, so replies are matched by type."""
+
+    def __init__(self, path: str) -> None:
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(3.0)
+        self.sock.connect(path)
+        self.buf = b""
+
+    def ask(self, want: str, **cmd: object) -> dict:
+        self.sock.sendall((json.dumps(cmd) + "\n").encode())
+        while True:
+            while b"\n" not in self.buf:
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    raise OSError("daemon closed the connection")
+                self.buf += chunk
+            line, self.buf = self.buf.split(b"\n", 1)
+            msg = json.loads(line)
+            if msg.get("type") in (want, "error"):
+                return msg
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="kb-kill-detect",
+        description="Show what the running kb-kill daemon sees: groups, devices, targets, grabs.",
+    )
+    parser.add_argument(
+        "-s", "--socket", default=socket_path(), help="daemon control socket"
+    )
+    parser.add_argument(
+        "-V", "--version", action="version", version=f"kb-kill-detect {VERSION}"
+    )
+    args = parser.parse_args()
+
+    try:
+        daemon = Daemon(args.socket)
+        state = daemon.ask("state", cmd="status")
+        devices = daemon.ask("devices", cmd="devices", all=True)
+    except OSError as e:
+        print(
+            f"cannot talk to the kb-kill daemon at {args.socket}: {e}", file=sys.stderr
+        )
+        print(
+            "is kb-kill-daemon running?  systemctl status kb-kill-daemon",
+            file=sys.stderr,
+        )
+        return 1
+    for msg in (state, devices):
+        if msg.get("type") == "error":
+            print(
+                f"daemon refused: {msg.get('error')} (run as the active user, or with sudo)",
+                file=sys.stderr,
+            )
+            return 1
+
+    print(f"kb-kill-detect  daemon: {args.socket}\n")
+    groups = state.get("groups", [])
+    print("Groups:")
+    if not groups:
+        print("  (none) - the live config defines no group, so nothing can be killed.")
+        print("  Edit ~/.config/kb-kill/kb-kill.toml; kb-kill-push applies it live.")
+    for g in groups:
+        label = (
+            f'  "{g["label"]}"' if g.get("label") and g["label"] != g["name"] else ""
+        )
+        print(
+            f"  [{g['name']}]{label}  {'KILLED' if g['killed'] else 'AWAKE'}  ({g['targets']} target device(s))"
+        )
+        print(f"  {'':10}kill = {g.get('kill', '?')}    wake = {g.get('wake', '?')}")
+
+    print("\nDevices:")
+    for d in devices.get("devices", []):
+        kind = f"{d['class']}/{'virtual' if d['virtual'] else 'physical'}"
+        flags = []
+        if d.get("targets"):
+            flags.append(f"TARGET of {', '.join(d['targets'])}")
+        if d.get("grabbed"):
+            flags.append("GRABBED by kb-kill")
+        if d.get("fronted_by"):
+            flags.append(
+                f"fronted by a remapper: the group targets {d['fronted_by']} instead"
+            )
+        if not d.get("monitored", True):
+            flags.append("not monitored (no live group needs this class)")
+        elif not flags:
+            flags.append("monitored (can press any hotkey)")
+        print(f"  {d['path']:22} {kind:14} {d['name']}")
+        print(f"  {'':22} {'':14} {'; '.join(flags)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

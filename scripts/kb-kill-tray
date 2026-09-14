@@ -1,19 +1,11 @@
 #!/usr/bin/env python3
-"""kb-kill-tray - StatusNotifierItem (tray) icon for the kb-kill service.
+"""kb-kill-tray - tray icon (StatusNotifierItem / AppIndicator) for kb-kill.
 
-Shows whether each kb-kill group is disabled (killed) or active, and lets you
-toggle a group by clicking its menu entry. Talks to the kb-kill service over its
-Unix control socket (see `control_socket_path` in `kb-kill-daemon`).
-
-Runs as its own process so a GUI hiccup can never affect input handling. Uses
-the AppIndicator / StatusNotifierItem D-Bus protocol, which works on COSMIC and
-KDE natively, and on GNOME with the AppIndicator shell extension installed.
-
-Requires: PyGObject (`gi`) with Gtk 3.0 and AyatanaAppIndicator3.
+Shows whether each group is KILLED or AWAKE and toggles a group from its menu
+entry, over the daemon's control socket. Runs as the user; needs PyGObject with
+Gtk 3 and AyatanaAppIndicator3 (or the legacy AppIndicator3).
 """
 
-# gi (PyGObject) ships no type stubs, so pyright cannot resolve it or the dynamic
-# gi.repository imports; turn off the missing-import check for this file.
 # pyright: reportMissingImports=false
 
 import json
@@ -23,10 +15,9 @@ import socket
 import subprocess
 import sys
 
-# Rewritten by packaging/bump-version.sh; the repo-root VERSION file is canonical.
+# Rewritten by packaging/bump-version.sh from the repo-root VERSION file.
 VERSION = "0.4.1"
 
-# Answer --version before the gi imports so it works without GTK/AppIndicator.
 if __name__ == "__main__" and sys.argv[1:] and sys.argv[1] in ("-V", "--version"):
     print(f"kb-kill-tray {VERSION} ({os.path.realpath(__file__)})")
     sys.exit(0)
@@ -42,32 +33,23 @@ except (ValueError, ImportError):
         gi.require_version("AppIndicator3", "0.1")
         from gi.repository import AppIndicator3
     except (ValueError, ImportError):
-        sys.stderr.write(
-            "kb-kill-tray: AppIndicator typelib not found.\n"
-            "  Debian/Ubuntu/Pop: sudo apt install gir1.2-ayatanaappindicator3-0.1\n"
-            "  Arch             : sudo pacman -S libayatana-appindicator\n"
+        sys.exit(
+            "kb-kill-tray: AppIndicator typelib not found "
+            "(Debian/Ubuntu: gir1.2-ayatanaappindicator3-0.1, Arch: libayatana-appindicator)"
         )
-        sys.exit(1)
-
 from gi.repository import GLib, Gtk  # noqa: E402
 
 APP_ID = "kb-kill"
-ICON_AWAKE = "kb-kill-awake"
-ICON_KILLED = "kb-kill-killed"
+ICON_AWAKE, ICON_KILLED = "kb-kill-awake", "kb-kill-killed"
 RECONNECT_SECONDS = 2
+HERE = os.path.dirname(os.path.realpath(__file__))
 
 
 def icon_dir() -> str | None:
-    """Locate the tray icons. Prefer icons shipped in the project tree (this
-    script lives in scripts/, the icons in the project root's icons/), then a
-    system install, then the user config."""
-    here = os.path.dirname(os.path.realpath(__file__))
     for candidate in (
-        os.path.join(here, "icons"),
-        os.path.join(here, os.pardir, "icons"),  # scripts/ -> ../icons
-        "/usr/local/share/kb-kill/icons",  # install.sh (local source install)
-        "/usr/share/kb-kill/icons",  # distro package (deb/rpm/AUR)
-        os.path.expanduser("~/.config/kb-kill/icons"),
+        os.path.join(HERE, os.pardir, "icons"),  # git checkout
+        "/usr/local/share/kb-kill/icons",  # install.sh
+        "/usr/share/kb-kill/icons",  # deb/rpm/AUR
     ):
         if os.path.isdir(candidate):
             return candidate
@@ -75,19 +57,17 @@ def icon_dir() -> str | None:
 
 
 def socket_path() -> str:
-    """Where the daemon's control socket lives. Must stay in sync with the
-    daemon's control_socket_path() and kb-kill-push's socket_path() - the same
-    candidate set in the same order."""
     candidates = ["/run/kb-kill/control.sock"]
-    base = os.environ.get("XDG_RUNTIME_DIR")
-    if base:
+    if base := os.environ.get("XDG_RUNTIME_DIR"):
         candidates.append(os.path.join(base, "kb-kill.sock"))
     candidates.append(f"/tmp/kb-kill-{os.getuid()}.sock")
-    for c in candidates:
-        if os.path.exists(c):
-            return c
-    # default to the system path even if not yet present (reconnect will retry)
-    return candidates[0]
+    return next((c for c in candidates if os.path.exists(c)), candidates[0])
+
+
+def user_config_path() -> str:
+    return os.path.expanduser(
+        os.environ.get("KB_KILL_CONFIG") or "~/.config/kb-kill/kb-kill.toml"
+    )
 
 
 class Tray:
@@ -95,89 +75,71 @@ class Tray:
         self.ind = AppIndicator3.Indicator.new(
             APP_ID, ICON_AWAKE, AppIndicator3.IndicatorCategory.HARDWARE
         )
-        icons = icon_dir()
-        if icons:
+        if icons := icon_dir():
             self.ind.set_icon_theme_path(icons)
         self.ind.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
-        self.ind.set_title("kb-kill")
         self.sock: socket.socket | None = None
         self.buf = b""
         self.groups: list[dict] = []
         self.connected = False
-        # Menu items are built once per group *list* and then updated in place -
-        # see _render() for why they are not rebuilt on every state change.
-        self._menu: Gtk.Menu | None = None
-        self._menu_key: tuple | None = None  # identity of the built menu
-        self._items: dict[str, Gtk.CheckMenuItem] = {}  # group name -> item
-        self._handlers: dict[str, int] = {}  # group name -> "toggled" handler id
-        self._icon: str | None = None  # last icon set (avoid redundant churn)
+        # Menu items are built once per group list and updated in place: replacing
+        # the Gtk.Menu re-exports the dbusmenu layout, and a shell mid-repaint can
+        # keep showing the old checkmarks.
+        self._menu_key: tuple | None = None
+        self._items: dict[str, Gtk.CheckMenuItem] = {}
+        self._handlers: dict[str, int] = {}
+        self._icon: str | None = None
         self._render_queued = False
-        self._render()  # initial "connecting" menu/icon (sync: before Gtk.main)
+        self._render()
         self._connect()
 
-    # -- connection ---------------------------------------------------------- #
+    # -- connection ----------------------------------------------------------- #
     def _connect(self) -> bool:
-        path = socket_path()
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            s.connect(path)
+            s.connect(socket_path())
         except OSError:
             s.close()
-            self.connected = False
-            self._schedule_render()
-            GLib.timeout_add_seconds(RECONNECT_SECONDS, self._reconnect)
+            self._drop()
             return False
         s.setblocking(False)
-        self.sock = s
-        self.buf = b""
-        self.connected = True
+        self.sock, self.buf, self.connected = s, b"", True
         GLib.io_add_watch(
             s.fileno(), GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self._on_readable
         )
         self._send({"cmd": "status"})
         return True
 
+    def _drop(self) -> None:
+        if self.sock is not None:
+            self.sock.close()
+        self.sock, self.connected = None, False
+        self._schedule_render()
+        GLib.timeout_add_seconds(RECONNECT_SECONDS, self._reconnect)
+
     def _reconnect(self) -> bool:
         if not self.connected:
             self._connect()
         return False  # one-shot timer
 
-    def _drop(self) -> None:
-        if self.sock is not None:
-            try:
-                self.sock.close()
-            except OSError:
-                pass
-        self.sock = None
-        self.connected = False
-        self._schedule_render()
-        GLib.timeout_add_seconds(RECONNECT_SECONDS, self._reconnect)
-
     def _on_readable(self, fd: int, condition: int) -> bool:
-        if condition & (GLib.IO_HUP | GLib.IO_ERR):
+        if condition & (GLib.IO_HUP | GLib.IO_ERR) or self.sock is None:
             self._drop()
-            return False
-        if self.sock is None:
             return False
         try:
             data = self.sock.recv(4096)
         except OSError:
-            self._drop()
-            return False
+            data = b""
         if not data:
             self._drop()
             return False
-        self.buf += data
-        *lines, self.buf = self.buf.split(b"\n")
+        *lines, self.buf = (self.buf + data).split(b"\n")
         for line in lines:
-            line = line.strip()
-            if not line:
-                continue
             try:
-                msg = json.loads(line)
+                msg = json.loads(line) if line.strip() else None
             except ValueError:
                 continue
-            if msg.get("type") == "state":
+            if isinstance(msg, dict) and msg.get("type") == "state":
                 self.groups = msg.get("groups", [])
                 self._schedule_render()
         return True
@@ -190,80 +152,52 @@ class Tray:
         except OSError:
             self._drop()
 
-    # -- UI ------------------------------------------------------------------ #
+    # -- UI ------------------------------------------------------------------- #
     def _schedule_render(self) -> None:
-        """Coalesce a burst of state messages into one UI update.
-
-        The daemon can broadcast several states in quick succession (killing two
-        groups with two hotkeys in rapid succession, say), and they often arrive
-        in a single recv(). Re-exporting the menu once per message races the
-        shell's own repaint; folding them into one idle callback means the shell
-        only ever sees the settled state."""
-        if self._render_queued:
-            return
-        self._render_queued = True
-        GLib.idle_add(self._render_idle)
+        """Coalesce a burst of state messages into one UI update."""
+        if not self._render_queued:
+            self._render_queued = True
+            GLib.idle_add(self._render_idle)
 
     def _render_idle(self) -> bool:
         self._render_queued = False
         self._render()
-        return False  # one-shot
+        return False
 
     def _render(self) -> None:
-        any_killed = any(g.get("killed") for g in self.groups)
-        icon = ICON_KILLED if any_killed else ICON_AWAKE
+        killed = [g.get("label") or g["name"] for g in self.groups if g.get("killed")]
+        icon = ICON_KILLED if killed else ICON_AWAKE
         if icon != self._icon:
             self._icon = icon
             self.ind.set_icon_full(icon, "kb-kill")
         if not self.connected:
             self.ind.set_title("kb-kill: connecting…")
-        elif any_killed:
-            killed = [
-                g.get("label") or g["name"] for g in self.groups if g.get("killed")
-            ]
-            self.ind.set_title("kb-kill: disabled (" + ", ".join(killed) + ")")
+        elif killed:
+            self.ind.set_title("kb-kill: KILLED " + ", ".join(killed))
         else:
-            self.ind.set_title("kb-kill: all active")
-
-        # Rebuild the menu only when its *structure* changes (connected state, or
-        # the set/order/labels of groups). A killed-state change just updates the
-        # existing items: replacing the Gtk.Menu re-exports the whole dbusmenu
-        # layout with fresh item ids, and a shell that is mid-repaint (or has the
-        # menu open) can keep rendering the old layout - leaving a checkmark
-        # showing the opposite of the truth. Stable items also mean a click can
-        # never land on an orphaned item from a superseded menu.
+            self.ind.set_title("kb-kill: AWAKE")
         key = (self.connected, tuple((g["name"], g.get("label")) for g in self.groups))
         if key != self._menu_key:
             self._menu_key = key
-            self._menu = self._build_menu()
-            self.ind.set_menu(self._menu)
+            self.ind.set_menu(self._build_menu())
         else:
             self._sync_items()
 
     def _sync_items(self) -> None:
-        """Point the existing check items at the daemon's state.
-
-        The handler is blocked around set_active() so a programmatic update can
-        never be mistaken for a user click and echoed back as a command - which
-        would fight the daemon instead of following it."""
+        """Point the check items at the daemon's state without echoing a command."""
         for g in self.groups:
             item = self._items.get(g["name"])
-            if item is None:
-                continue
             want = not g.get("killed")
-            if item.get_active() == want:
+            if item is None or item.get_active() == want:
                 continue
-            hid = self._handlers.get(g["name"])
-            if hid is not None:
-                item.handler_block(hid)
+            hid = self._handlers[g["name"]]
+            item.handler_block(hid)
             item.set_active(want)
-            if hid is not None:
-                item.handler_unblock(hid)
+            item.handler_unblock(hid)
 
     def _build_menu(self) -> Gtk.Menu:
         menu = Gtk.Menu()
-        self._items = {}
-        self._handlers = {}
+        self._items, self._handlers = {}, {}
         if not self.connected:
             item = Gtk.MenuItem(label="Connecting to kb-kill service…")
             item.set_sensitive(False)
@@ -272,22 +206,15 @@ class Tray:
             item = Gtk.MenuItem(label="No groups configured")
             item.set_sensitive(False)
             menu.append(item)
-        else:
-            for g in self.groups:
-                # A tray menu is exported over the dbusmenu D-Bus protocol and
-                # re-rendered by the shell, so it can't host arbitrary widgets
-                # (a Gtk.Switch is dropped). A CheckMenuItem maps to dbusmenu's
-                # checkmark toggle: it renders, and clicking anywhere on the row
-                # toggles it. The check (on = group active/awake) is the switch.
-                # Show the config's display label when set; commands still
-                # address the group by its real name.
-                item = Gtk.CheckMenuItem(label=g.get("label") or g["name"])
-                item.set_active(not g.get("killed"))
-                self._handlers[g["name"]] = item.connect(
-                    "toggled", self._on_toggle, g["name"]
-                )
-                self._items[g["name"]] = item
-                menu.append(item)
+        for g in self.groups if self.connected else []:
+            # dbusmenu renders a CheckMenuItem as a checkmark toggle: checked = AWAKE.
+            item = Gtk.CheckMenuItem(label=g.get("label") or g["name"])
+            item.set_active(not g.get("killed"))
+            self._handlers[g["name"]] = item.connect(
+                "toggled", self._on_toggle, g["name"]
+            )
+            self._items[g["name"]] = item
+            menu.append(item)
         menu.append(Gtk.SeparatorMenuItem())
         open_item = Gtk.MenuItem(label="Open config…")
         open_item.connect("activate", self._on_open_config)
@@ -299,77 +226,52 @@ class Tray:
         return menu
 
     def _on_toggle(self, item: Gtk.CheckMenuItem, name: str) -> None:
-        """Send the state the user just asked for - never a blind toggle.
-
-        `toggle` is relative, so if this checkmark ever disagrees with the daemon
-        (a dropped/coalesced update, or a shell that flipped it optimistically),
-        every click flips both and the disagreement survives forever. An absolute
-        kill/wake means one click always resyncs. The trailing status request
-        makes the daemon restate the truth even when the command was a no-op (a
-        no-op changes nothing, so it would not otherwise be broadcast)."""
+        # Absolute kill/wake (not toggle), so a checkmark that drifted from the
+        # daemon resyncs on the first click; status makes the daemon restate itself.
         self._send({"cmd": "wake" if item.get_active() else "kill", "group": name})
         self._send({"cmd": "status"})
 
     # -- config --------------------------------------------------------------- #
-    def _user_config_path(self) -> str:
-        """This user's config file. Mirrors kb-kill-push's preferred location
-        (KB_KILL_CONFIG override, else ~/.config/kb-kill/kb-kill.toml). We run
-        as the user, so the environment / home are authoritative."""
-        env = os.environ.get("KB_KILL_CONFIG")
-        if env:
-            return os.path.expanduser(env)
-        return os.path.expanduser("~/.config/kb-kill/kb-kill.toml")
-
-    def _default_config_source(self) -> str | None:
-        """Where to seed a new user config from: the system default, then the
-        example in the project tree (dev runs)."""
-        here = os.path.dirname(os.path.realpath(__file__))
-        for candidate in (
-            "/etc/kb-kill/kb-kill.toml",
-            os.path.join(here, os.pardir, "kb-kill.toml"),  # scripts/ -> ../
-            os.path.join(here, "kb-kill.toml"),
-        ):
-            if os.path.isfile(candidate):
-                return candidate
-        return None
-
     def _on_open_config(self, _item: object) -> None:
-        """Open the user's config in their default editor, creating it from the
-        system default first if it does not exist yet. kb-kill-push notices the
-        new/edited file and pushes it to the daemon on its own."""
-        path = self._user_config_path()
+        path = user_config_path()
         if not os.path.exists(path):
             try:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
-                src = self._default_config_source()
-                if src:
-                    shutil.copyfile(src, path)
+                seed = next(
+                    (
+                        c
+                        for c in (
+                            "/etc/kb-kill/kb-kill.toml",
+                            os.path.join(HERE, os.pardir, "kb-kill.toml"),
+                        )
+                        if os.path.isfile(c)
+                    ),
+                    None,
+                )
+                if seed:
+                    shutil.copyfile(seed, path)
                 else:
-                    open(path, "a").close()  # nothing to seed from; empty file
+                    open(path, "a").close()
             except OSError as e:
                 sys.stderr.write(f"kb-kill-tray: cannot create {path}: {e}\n")
                 return
         self._launch_editor(path)
 
-    def _launch_editor(self, path: str) -> None:
-        """Open path in the user's text editor. We resolve the handler ourselves
-        rather than trust xdg-open: a .toml is application/toml, which usually
-        has no association, and xdg-open's fallback can spuriously open the web
-        browser (and sometimes the editor too). Prefer the toml handler, then
-        the text/plain editor, and only fall back to xdg-open if neither is set.
-        gtk-launch ships with the GTK3 this tray already requires."""
+    @staticmethod
+    def _launch_editor(path: str) -> None:
+        """Resolve the editor ourselves: xdg-open has no association for
+        application/toml and may fall back to the browser."""
         desktop = ""
         for mime in ("application/toml", "text/plain"):
             try:
-                out = subprocess.run(
+                desktop = subprocess.run(
                     ["xdg-mime", "query", "default", mime],
                     capture_output=True,
                     text=True,
                 ).stdout.strip()
             except OSError:
-                out = ""
-            if out:
-                desktop = out
+                desktop = ""
+            if desktop:
                 break
         cmd = ["gtk-launch", desktop, path] if desktop else ["xdg-open", path]
         try:

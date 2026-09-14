@@ -6,12 +6,12 @@
 # here yourself. Until you uncomment and edit a group below, nothing happens.
 #
 # This file is picked up automatically: the kb-kill-push service in your session
-# reads it and hands it to the root daemon, which follows whichever user is
+# reads it and hands it to the daemon, which follows whichever user is
 # currently in control of the seat. There is nothing to point the daemon at — it
 # just uses the active user's config. Edits are re-pushed and applied live.
 #
 # ─── How to enable it ─────────────────────────────────────────────────────────
-# 1. Find your device's name:     sudo kb-kill-daemon detect
+# 1. Find your device's name:     kb-kill-detect
 # 2. Uncomment the default group below and set `keyboards` (or `pointers` /
 #    `devices`) to that name.
 # 3. Keep (or change) the kill/wake combos — both are REQUIRED; there is no
@@ -49,7 +49,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─── Default group (uncomment + edit to enable) ───────────────────────────────
-# keyboards  = "AT Translated Set 2 keyboard"   # exact name (see `detect`)
+# keyboards  = "AT Translated Set 2 keyboard"   # exact name (see kb-kill-detect)
 # kill_combo = "ctrl+alt+shift+k"               # required — no default
 # wake_combo = "ctrl+alt+shift+w"               # required — no default
 #
@@ -58,6 +58,10 @@
 #   "auto"  the DEFAULT — leave it out. Per device: kb-kill targets the forwarded
 #           copy if input-remapper fronts this device, else the device itself. So
 #           the name above keeps working whether input-remapper runs or not.
+#           Keys input-remapper REMAPS still pass while killed (they come from
+#           its shared output device); add devices = "input-remapper keyboard"
+#           to eat those too. Press the hotkey with the keys as they are AFTER
+#           remapping (CapsLock-as-Ctrl counts as ctrl; a remapped Ctrl does not).
 #   true    virtual devices ONLY — never a physical one, so a group that must
 #           never touch hardware grabs nothing while the remapper is stopped.
 #   false   literal: grab exactly what the matcher named. The escape hatch for a

@@ -1,7 +1,9 @@
 [Unit]
 Description=kb-kill-push - feed this user's config to the kb-kill daemon
-# Pushes config over the daemon's control socket and reconnects on its own, so
-# no ordering dependency on the system daemon is needed.
+# Pushes over the daemon's control socket and reconnects on its own, so no
+# ordering dependency on the system daemon is needed. Not for system accounts
+# (the login greeter has no config to push).
+ConditionUser=!@system
 
 [Service]
 Type=simple
@@ -10,6 +12,6 @@ Restart=on-failure
 RestartSec=2
 
 [Install]
-# default.target (not graphical-session.target) so it also runs for pure-TTY
-# logins - the daemon follows the active seat user whether graphical or on a VT.
+# default.target, not graphical-session.target: the daemon follows the active
+# seat user on a TTY too.
 WantedBy=default.target
