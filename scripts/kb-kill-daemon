@@ -1216,9 +1216,39 @@ class KbKill:
 
         for group in self.groups:
             group.targets = self._resolve_targets(group)
+        self._reassert_registrations()
         self._release_stale_keys()
         self._reconcile_grabs()
         self._warn_empty_groups()
+
+    def _reassert_registrations(self) -> None:
+        """Re-arm any monitored device whose selector (epoll) watch was silently
+        dropped. INVARIANT: every device in `self.devices` must be registered for
+        read, or the loop never polls it — the device then goes deaf with no error
+        (no ENODEV, so _read_device never removes it) and only a daemon restart
+        recovers. Observed after a keyboard re-enumerates (USB<->Bluetooth): the
+        churn of removing/closing other devices desyncs the epoll fd table and an
+        unrelated fd loses its watch. This heals it by re-registering the fd we
+        still hold — it does NOT re-open (so an active grab is untouched), and
+        epoll is level-triggered, so a pending event is seen on the very next
+        loop pass. A truly dead fd re-registers, then errors on read and is
+        dropped normally; either way the deaf-forever state cannot persist."""
+        try:
+            registered = set(self.sel.get_map())
+        except Exception:  # noqa: BLE001 - a broken map must never crash rescan
+            return
+        for path, dev in list(self.devices.items()):
+            try:
+                fd = dev.fileno()
+            except (OSError, ValueError):
+                continue  # fd already gone; a read error / next rescan drops it
+            if fd in registered:
+                continue
+            try:
+                self.sel.register(dev, selectors.EVENT_READ, path)
+            except (KeyError, OSError, ValueError):
+                continue
+            CTRL_LOG.emit(f"re-armed dropped watch: {path} ({dev.name})")
 
     def _release_stale_keys(self) -> None:
         """Drop keys the kernel says are no longer held.
