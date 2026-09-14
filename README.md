@@ -367,14 +367,16 @@ config-less and waits for `kb-kill-push`.
 
 ### Debugging a wake that won't fire
 
-`monitor` marks the moment a combo *fires* with `<<< KILLED[group]` or
-`<<< WOKEN[group]` — the one transition the daemon would make, not merely "this
-combo is held". That distinction matters for a **toggle config**
-(`kill_combo == wake_combo`), where every press flips the group: four taps of the
-hotkey while holding its modifiers is four transitions that net out to nothing,
-and only the label tells you which press was which. `monitor` is a separate
-process with its own state, so it reads the running daemon's killed flags on
-startup to get the labels the right way round (and says so if it can't).
+`monitor` prints every raw key event and, when the daemon is running, connects to
+its control socket and prints the daemon's **real** kill/wake transitions as
+`>>> DAEMON: [group] -> KILLED/awake`. It says `Daemon: CONNECTED` or `Daemon: NOT RUNNING` at the top so you know which. It never *simulates* or guesses kill/wake
+state — a standalone simulation drifts out of sync with the daemon (the classic
+"monitor said woken but the tray stayed killed"), so state comes only from the
+daemon. A `<<< kill/wake combo held[group]` tag on a key line marks the instant
+the keys actually **form** that chord on evdev; if you press the hotkey and that
+tag never appears, the chord never completed — e.g. a home-row-mod key (common on
+QMK/ZMK boards) emitting its *modifier* instead of its letter, so the daemon never
+sees the full combo.
 
 An exclusive grab routes a device's events to the grabber only, so **`monitor`
 cannot show events from a device the daemon (or input-remapper) has grabbed** —

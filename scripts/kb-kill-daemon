@@ -2149,45 +2149,12 @@ def _keyname(code: int) -> str:
     return name
 
 
-def daemon_group_states() -> dict[str, bool] | None:
-    """{group name: killed} from the running daemon, or None if unreachable.
-
-    `monitor` is a separate process with its own latches, so it can only *predict*
-    what the daemon would do. Seeding that prediction from the live daemon is what
-    keeps it honest: for a toggle config (kill_combo == wake_combo) a group that is
-    already killed would otherwise have every transition below labelled backwards.
-
-    Best effort by design - a dev run against no daemon simply starts awake. Reads
-    group names and killed flags only; never key data.
-    """
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(1.0)
-            s.connect(control_socket_path())
-            s.sendall(b'{"cmd":"status"}\n')
-            buf = b""
-            while b"\n" not in buf:
-                if len(buf) >= MAX_LINE:
-                    return None
-                chunk = s.recv(4096)
-                if not chunk:
-                    return None
-                buf += chunk
-            msg = json.loads(buf.split(b"\n", 1)[0].decode())
-    except (OSError, ValueError):
-        return None
-    if msg.get("type") != "state":
-        return None
-    try:
-        return {g["name"]: bool(g["killed"]) for g in msg["groups"]}
-    except (KeyError, TypeError):
-        return None
-
-
 def cmd_monitor(config: Config) -> int:
-    """Print every key event with its device + keycode, and flag when the
-    kill/wake combos match per-device or globally. Used to diagnose how
-    input-remapper routes the target keyboard's keys."""
+    """Print every key event with its device + keycode, and — when the daemon is
+    running — its REAL kill/wake state from the control socket. Used to diagnose
+    how input-remapper routes the target keyboard's keys and whether a chord
+    actually reaches the daemon. monitor never simulates or guesses kill/wake
+    state; it either reports the daemon's broadcasts or says no daemon is up."""
     devices = open_devices(want_pointers=True)
     if not devices:
         print("No input devices found.")
@@ -2219,36 +2186,102 @@ def cmd_monitor(config: Config) -> int:
         pressed[path] = held
         sel.register(dev, selectors.EVENT_READ, path)
 
-    # Mirror the daemon's edge latches (see KbKill._toggle_groups) so the flags
-    # below mark the moment a combo would actually FIRE, not merely every event
-    # while you keep holding it.
-    latched: dict[tuple[str, str], bool] = {}
-    glob0 = set().union(*pressed.values()) if pressed else set()
-    for g in config.groups:
-        latched[(g.name, "kill")] = combo_held(g.kill_combo, glob0)
-        latched[(g.name, "wake")] = combo_held(g.wake_combo, glob0)
-
-    # ...and mirror its killed state, so each press is reported as the ONE
-    # transition it actually causes. Reporting "this combo is held" per group
-    # would print KILL and WAKE together on every press of a toggle config
-    # (kill_combo == wake_combo), which is exactly the case where you need to
-    # know which of the two just happened.
-    live = daemon_group_states()
-    killed = {g.name: (live or {}).get(g.name, False) for g in config.groups}
+    # Connect to the running daemon's control socket so we can print its REAL
+    # kill/wake state (the ">>> DAEMON" lines below). monitor reads evdev itself
+    # but does NOT drive the daemon, so it must never GUESS whether a press
+    # toggled anything -- a local simulation drifts out of sync with the daemon
+    # (different event timing, or state changed via the tray/socket) and lies.
+    # State therefore comes ONLY from the daemon's broadcasts; as root (or the
+    # live user) we receive every one. If no daemon is running we say so and show
+    # raw key events only -- no invented state.
+    CTRL = object()
+    ctrl_sock: socket.socket | None = None
+    ctrl_buf = b""
+    daemon_state: dict[str, bool] = {}
+    try:
+        ctrl_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        ctrl_sock.settimeout(1.0)
+        ctrl_sock.connect(control_socket_path())
+        ctrl_sock.sendall(b'{"cmd":"status"}\n')  # seed with the current state
+        while b"\n" not in ctrl_buf:
+            chunk = ctrl_sock.recv(4096)
+            if not chunk:
+                raise OSError("daemon closed the connection")
+            ctrl_buf += chunk
+        first, ctrl_buf = ctrl_buf.split(b"\n", 1)
+        msg = json.loads(first)
+        if msg.get("type") == "state":
+            daemon_state = {g["name"]: bool(g["killed"]) for g in msg["groups"]}
+        ctrl_sock.setblocking(False)
+        sel.register(ctrl_sock, selectors.EVENT_READ, CTRL)
+    except (OSError, ValueError, KeyError, TypeError):
+        if ctrl_sock is not None:
+            ctrl_sock.close()
+        ctrl_sock = None
 
     print("Monitoring all input devices. Press a group's kill/wake combo.")
-    for g in config.groups:
-        state = "KILLED" if killed[g.name] else "awake"
-        print(f"  [{g.name}] kill={g.kill_raw} wake={g.wake_raw}  (now: {state})")
-    if live is None:
-        print()
-        print("NOTE: could not read the running daemon's state - assuming every")
-        print("group is awake. If one is in fact killed, its transitions below")
-        print("are labelled backwards; start from a known state to be sure.")
+    if ctrl_sock is not None:
+        print("Daemon: CONNECTED -- '>>> DAEMON' lines are its real kill/wake state.")
+        for g in config.groups:
+            st = "KILLED" if daemon_state.get(g.name, False) else "awake"
+            print(
+                f"  [{g.name}] kill={g.kill_raw} wake={g.wake_raw}  (daemon now: {st})"
+            )
+    else:
+        print("Daemon: NOT RUNNING -- raw key events only; no kill/wake state is")
+        print("shown (monitor never guesses it). Start kb-kill-daemon to see state.")
+        for g in config.groups:
+            print(f"  [{g.name}] kill={g.kill_raw} wake={g.wake_raw}")
+    print("A '<<< kill/wake combo held' tag marks the instant the keys actually")
+    print("form that chord on evdev. If it never appears, the chord never completed")
+    print("(e.g. a home-row-mod key emitting a modifier instead of its letter).")
     print("Ctrl+C to stop.\n")
+
+    # Factual "is this combo fully held right now" latch: reports the KEY union
+    # only (did the chord form on evdev?), never an assumption about daemon state.
+    held_combo: dict[tuple[str, str], bool] = {}
+    glob0 = set().union(*pressed.values()) if pressed else set()
+    for g in config.groups:
+        held_combo[(g.name, "kill")] = combo_held(g.kill_combo, glob0)
+        held_combo[(g.name, "wake")] = combo_held(g.wake_combo, glob0)
+
     try:
         while True:
             for key, _ in sel.select():
+                if key.data is CTRL:
+                    try:
+                        chunk = ctrl_sock.recv(65536) if ctrl_sock else b""
+                    except OSError:
+                        chunk = b""
+                    if not chunk:
+                        print(">>> DAEMON: connection closed (service stopped?)")
+                        if ctrl_sock is not None:
+                            sel.unregister(ctrl_sock)
+                            ctrl_sock.close()
+                        ctrl_sock = None
+                        continue
+                    ctrl_buf += chunk
+                    while b"\n" in ctrl_buf:
+                        line, ctrl_buf = ctrl_buf.split(b"\n", 1)
+                        if not line.strip():
+                            continue
+                        try:
+                            msg = json.loads(line)
+                        except ValueError:
+                            continue
+                        if msg.get("type") != "state":
+                            continue
+                        cur = {
+                            g["name"]: bool(g["killed"]) for g in msg.get("groups", [])
+                        }
+                        for n, k in cur.items():
+                            if n in daemon_state and daemon_state[n] != k:
+                                print(
+                                    f">>> DAEMON: [{n}] -> {'KILLED' if k else 'awake'}"
+                                )
+                        daemon_state = cur
+                    continue
+
                 path = key.data
                 dev = devices[path]  # InputDevice (key.fileobj is loosely typed)
                 try:
@@ -2268,27 +2301,23 @@ def cmd_monitor(config: Config) -> int:
                     glob = set().union(*pressed.values()) if pressed else set()
                     flags = []
                     for g in config.groups:
-                        kill_now = combo_held(g.kill_combo, glob)
-                        wake_now = combo_held(g.wake_combo, glob)
-                        kill_edge = kill_now and not latched[(g.name, "kill")]
-                        wake_edge = wake_now and not latched[(g.name, "wake")]
-                        # Latch before acting, exactly as _toggle_groups does.
-                        latched[(g.name, "kill")] = kill_now
-                        latched[(g.name, "wake")] = wake_now
-                        if not killed[g.name]:
-                            if kill_edge:
-                                killed[g.name] = True
-                                flags.append(f"KILLED[{g.name}]")
-                        elif wake_edge:
-                            killed[g.name] = False
-                            flags.append(f"WOKEN[{g.name}]")
-                    tag = ("  <<< " + " ".join(flags)) if flags else ""
+                        for kind, combo in (
+                            ("kill", g.kill_combo),
+                            ("wake", g.wake_combo),
+                        ):
+                            now = combo_held(combo, glob)
+                            if now and not held_combo[(g.name, kind)]:
+                                flags.append(f"{kind} combo held[{g.name}]")
+                            held_combo[(g.name, kind)] = now
+                    tag = ("  <<< " + ", ".join(flags)) if flags else ""
                     print(f"{path:20} {short:34} {_keyname(ev.code):16} {action}{tag}")
     except KeyboardInterrupt:
         pass
     finally:
         for dev in devices.values():
             dev.close()
+        if ctrl_sock is not None:
+            ctrl_sock.close()
     return 0
 
 
