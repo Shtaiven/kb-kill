@@ -1239,7 +1239,6 @@ class KbKill:
         combo, never suppress a real press. An unread event queued behind us is
         likewise safe — a pending key-up we drop early is just discarded twice.
         """
-        changed = False
         for path, dev in self.devices.items():
             held = self.pressed.get(path)
             if not held:
@@ -1247,18 +1246,22 @@ class KbKill:
             live = active_keys_safe(dev)
             if live is None:
                 continue  # device is going away; rescan will drop it
-            stale = held - live
-            if stale:
-                held -= stale
-                changed = True
-        if changed:
-            # Re-derive the latches from the corrected state so a combo freed by
-            # this can fire again. Deliberately does NOT call _toggle_groups: a
-            # snapshot must never *fire* a hotkey, only re-arm one.
-            now_held = self._global_pressed()
-            for group in self.groups:
-                group.kill_held = combo_held(group.kill_combo, now_held)
-                group.wake_held = combo_held(group.wake_combo, now_held)
+            held -= held - live  # drop only: keys the kernel no longer reports held
+        # Re-derive the latches from ground truth UNCONDITIONALLY (not only when a
+        # key was dropped above). A latch can be pinned True while `pressed` is
+        # already correct — e.g. a lost key-up was processed as a drop on an
+        # earlier pass, or a grab/ungrab swallowed it — and a guard on "did we
+        # drop something this time" would then leave the latch stuck, so the next
+        # press finds no rising edge and is silently eaten. Deriving from the
+        # current union every time costs nothing when it agrees and heals the
+        # latch when it does not. It STILL only ever re-arms, never fires: it
+        # does not call _toggle_groups, and since the correction above only drops
+        # keys, the derived latch can only go True→False (re-arm) or stay put —
+        # it can never complete a combo.
+        now_held = self._global_pressed()
+        for group in self.groups:
+            group.kill_held = combo_held(group.kill_combo, now_held)
+            group.wake_held = combo_held(group.wake_combo, now_held)
 
     def _warn_empty_groups(self) -> None:
         """Warn once per group while it matches zero devices.
@@ -1396,10 +1399,13 @@ class KbKill:
             self._reevaluate_live()
 
     # -- grab / ungrab ------------------------------------------------------- #
-    def _grab(self, path: str) -> None:
+    def _grab(self, path: str) -> bool:
+        """Grab `path`. Return True iff a new exclusive grab was actually taken
+        (so the caller can re-sync held keys, since acquiring the grab changes
+        this device's event routing and can drop an in-flight key-up)."""
         dev = self.devices.get(path)
         if dev is None or path in self.grabbed:
-            return
+            return False
         try:
             dev.grab()
             self.grabbed.add(path)
@@ -1407,20 +1413,26 @@ class KbKill:
             # 1:1 with a kill, so its information is already in the KILLED line's
             # device count; keep the per-device detail for debug runs only.
             log_keys(f"grabbed (eating): {dev.name}")
+            return True
         except OSError as e:
             # _reconcile_grabs runs on every key event and re-attempts a failed
             # grab each time, so an un-deduped failure here is a per-keystroke
             # journal line naming the device — and "busy" is the NORMAL state when
             # input-remapper holds the physical device. Log once per path.
             if path in self._grab_failed:
-                return
+                return False
             self._grab_failed.add(path)
             if e.errno == errno.EBUSY:
                 log_warn(f"cannot grab {dev.name}: busy (held by another process)")
             else:
                 log_warn(f"cannot grab {dev.name}: {e}")
+        return False
 
-    def _ungrab(self, path: str) -> None:
+    def _ungrab(self, path: str) -> bool:
+        """Release `path`. Return True iff we actually held it (so the caller can
+        re-sync held keys: dropping the grab hands routing back and, like taking
+        it, can swallow the key-up that would otherwise clear a combo latch)."""
+        released = False
         dev = self.devices.get(path)
         if dev is not None and path in self.grabbed:
             try:
@@ -1428,8 +1440,10 @@ class KbKill:
             except OSError:
                 pass
             log_keys(f"released: {dev.name}")
+            released = True
         self.grabbed.discard(path)
         self._grab_failed.discard(path)
+        return released
 
     # -- state transitions --------------------------------------------------- #
     def _global_pressed(self) -> set[int]:
@@ -1463,6 +1477,7 @@ class KbKill:
             if group.killed:
                 desired.update(group.targets)
 
+        grabs_changed = False
         for path in desired:
             if path in self.grabbed:
                 self._deferred.discard(path)
@@ -1478,11 +1493,24 @@ class KbKill:
                     )
                 continue
             self._deferred.discard(path)
-            self._grab(path)
+            if self._grab(path):
+                grabs_changed = True
 
         for path in list(self.grabbed):
             if path not in desired:
-                self._ungrab(path)
+                if self._ungrab(path):
+                    grabs_changed = True
+
+        # A grab or ungrab just changed a device's event routing, which can
+        # swallow an in-flight key-up. A lost key-up leaves a phantom key stuck
+        # in `pressed`, and because combos match the GLOBAL union that phantom
+        # pins a kill/wake latch — so the NEXT hotkey press sees no rising edge
+        # and is silently eaten until the periodic sweep clears it (up to
+        # RESCAN_INTERVAL later). Re-sync now instead of waiting: it only ever
+        # drops keys and never fires (see _release_stale_keys), so it cannot
+        # create a hotkey, only re-arm one.
+        if grabs_changed:
+            self._release_stale_keys()
 
     def _toggle_groups(self, held: set[int]) -> None:
         """Flip each group's killed state on the RISING EDGE of its kill/wake combo.
