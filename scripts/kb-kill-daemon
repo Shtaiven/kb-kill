@@ -1578,9 +1578,11 @@ class KbKill:
                 if kill_edge:
                     group.killed = True
                     self._log_kill(group)
+                    self._notify_transition(group)
             elif wake_edge:
                 group.killed = False
                 log_state(f"[{group.name}] WOKEN")
+                self._notify_transition(group)
 
     @staticmethod
     def _combo_satisfiable(combo: list[frozenset[int]], devs) -> bool:
@@ -1930,6 +1932,7 @@ class KbKill:
         log_state(
             f"[{group.name}] {'KILLED' if group.killed else 'WOKEN'} (via control)"
         )
+        self._notify_transition(group)
         self._reconcile_grabs()
 
     def _maybe_broadcast(self) -> None:
@@ -1941,6 +1944,23 @@ class KbKill:
         for conn, info in list(self.clients.items()):
             if info["uid"] in (0, self.live_uid):
                 self._send(conn, state)
+
+    def _notify_transition(self, group: "Group") -> None:
+        """Tell connected clients about ONE kill/wake transition the instant it
+        happens — distinct from _maybe_broadcast, which sends only the coalesced
+        NET state once per loop pass. When several presses are read together the
+        state message collapses them (kill+wake+kill -> one "killed"), so a client
+        watching state alone cannot tell "processed all, coalesced" from "dropped
+        some". These per-edge notices are never coalesced, so `monitor` can show
+        every real toggle. The tray ignores them and follows the state message.
+
+        Same audience (live uid / root) and same fields (validated group name +
+        killed flag) as the state broadcast, so no new disclosure; emitted only on
+        a kill/wake EDGE, so bounded by press rate, never key-event rate."""
+        msg = {"type": "transition", "group": group.name, "killed": group.killed}
+        for conn, info in list(self.clients.items()):
+            if info["uid"] in (0, self.live_uid):
+                self._send(conn, msg)
 
     # -- main loop ----------------------------------------------------------- #
     def run(self) -> int:
@@ -2237,6 +2257,10 @@ def cmd_monitor(config: Config) -> int:
     print("(e.g. a home-row-mod key emitting a modifier instead of its letter).")
     print("Ctrl+C to stop.\n")
 
+    # Once we've seen any per-edge "transition" message, stop diffing the
+    # coalesced "state" message (which would double-print / hide rapid toggles).
+    saw_transition = False
+
     # Factual "is this combo fully held right now" latch: reports the KEY union
     # only (did the chord form on evdev?), never an assumption about daemon state.
     held_combo: dict[tuple[str, str], bool] = {}
@@ -2269,16 +2293,33 @@ def cmd_monitor(config: Config) -> int:
                             msg = json.loads(line)
                         except ValueError:
                             continue
-                        if msg.get("type") != "state":
+                        mtype = msg.get("type")
+                        if mtype == "transition":
+                            # Per-edge notice: the authoritative "the daemon just
+                            # toggled" event, never coalesced — one line per real
+                            # kill/wake, so rapid presses can't hide in a net state.
+                            n = msg.get("group")
+                            k = bool(msg.get("killed"))
+                            print(f">>> DAEMON: [{n}] -> {'KILLED' if k else 'awake'}")
+                            daemon_state[n] = k
+                            saw_transition = True
+                            continue
+                        if mtype != "state":
                             continue
                         cur = {
                             g["name"]: bool(g["killed"]) for g in msg.get("groups", [])
                         }
-                        for n, k in cur.items():
-                            if n in daemon_state and daemon_state[n] != k:
-                                print(
-                                    f">>> DAEMON: [{n}] -> {'KILLED' if k else 'awake'}"
-                                )
+                        # A daemon that also sends per-edge "transition" messages
+                        # has already printed each change, so only sync silently;
+                        # an older daemon (state only) never sets saw_transition, so
+                        # fall back to diffing the coalesced state.
+                        if not saw_transition:
+                            for n, k in cur.items():
+                                if n in daemon_state and daemon_state[n] != k:
+                                    print(
+                                        f">>> DAEMON: [{n}] -> "
+                                        f"{'KILLED' if k else 'awake'}"
+                                    )
                         daemon_state = cur
                     continue
 

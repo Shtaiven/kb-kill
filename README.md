@@ -372,7 +372,10 @@ its control socket and prints the daemon's **real** kill/wake transitions as
 `>>> DAEMON: [group] -> KILLED/awake`. It says `Daemon: CONNECTED` or `Daemon: NOT RUNNING` at the top so you know which. It never *simulates* or guesses kill/wake
 state — a standalone simulation drifts out of sync with the daemon (the classic
 "monitor said woken but the tray stayed killed"), so state comes only from the
-daemon. A `<<< kill/wake combo held[group]` tag on a key line marks the instant
+daemon. The daemon emits one `>>> DAEMON` line per **actual** toggle (never
+coalesced), so several fast presses show as several transitions — you can tell
+"the daemon processed all of them" from "the daemon dropped some". A
+`<<< kill/wake combo held[group]` tag on a key line marks the instant
 the keys actually **form** that chord on evdev; if you press the hotkey and that
 tag never appears, the chord never completed — e.g. a home-row-mod key (common on
 QMK/ZMK boards) emitting its *modifier* instead of its letter, so the daemon never
