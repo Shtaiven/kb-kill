@@ -1990,6 +1990,14 @@ class KbKill:
                     else:
                         assert isinstance(tag, str)  # a device fd: data is its path
                         self._read_device(key.fileobj, tag)
+                # Broadcast a hotkey-driven state change BEFORE the rescan, not
+                # after: rescan() re-opens every input device and can block the
+                # loop for a few hundred ms, and a broadcast queued behind it
+                # makes the tray visibly lag the keypress (the daemon, not the
+                # panel — a plain socket client sees the same delay). The
+                # post-rescan call below still catches state changes the rescan
+                # itself produces (e.g. a target device appearing/vanishing).
+                self._maybe_broadcast()
                 now = time.monotonic()
                 if self.need_rescan or (now - last_scan) >= RESCAN_INTERVAL:
                     self.rescan()
