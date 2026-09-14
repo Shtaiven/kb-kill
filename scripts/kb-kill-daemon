@@ -986,6 +986,25 @@ def fronting_map(devices: dict[str, InputDevice]) -> dict[str, tuple[str, InputD
     return out
 
 
+def active_keys_safe(dev: InputDevice) -> set[int] | None:
+    """The keys the kernel says are held on `dev`, or None if it has gone away.
+
+    python-evdev's ioctl_EVIOCG_bits helper returns NULL *without setting a Python
+    exception* when the ioctl fails on an unplugged device, and CPython surfaces
+    that as SystemError, not OSError. Catching OSError alone is therefore not
+    enough - it took the daemon down in 0.4.0 when a device vanished in the window
+    between open_devices() and the active_keys() call in _add_device().
+
+    None means "don't know", never "nothing held": callers must skip the device
+    rather than substitute an empty set, or _reconcile_grabs() would grab a device
+    with keys still down and strand them (see the grab-deferral invariant).
+    """
+    try:
+        return set(dev.active_keys())
+    except (OSError, SystemError):
+        return None
+
+
 def grabbed_elsewhere(dev: InputDevice) -> bool:
     """True when another process holds an exclusive grab on `dev` (probed by
     attempting a grab: EBUSY means someone else has it). That process may be
@@ -993,7 +1012,8 @@ def grabbed_elsewhere(dev: InputDevice) -> bool:
     daemon itself while a group is killed. Skipped while keys are held so the
     momentary probe grab can't swallow a key-up and leave a key stuck down."""
     try:
-        if dev.active_keys():
+        held = active_keys_safe(dev)
+        if held is None or held:
             return False
         dev.grab()
         dev.ungrab()
@@ -1136,10 +1156,24 @@ class KbKill:
         return out
 
     # -- device lifecycle ---------------------------------------------------- #
-    def _add_device(self, path: str, dev: InputDevice) -> None:
+    def _add_device(self, path: str, dev: InputDevice) -> bool:
+        """Start monitoring `dev`. False if it vanished before we could read it.
+
+        The device can disappear between open_devices() and here, so seeding
+        `pressed` may fail; when it does we register nothing and drop the handle.
+        The next rescan (2s) picks the device up again if it comes back.
+        """
+        held = active_keys_safe(dev)
+        if held is None:
+            try:
+                dev.close()
+            except OSError:
+                pass
+            return False
         self.devices[path] = dev
-        self.pressed[path] = set(dev.active_keys())
+        self.pressed[path] = held
         self.sel.register(dev, selectors.EVENT_READ, path)
+        return True
 
     def _remove_device(self, path: str) -> None:
         dev = self.devices.pop(path, None)
@@ -1177,8 +1211,7 @@ class KbKill:
         for path, dev in current.items():
             if path in self.devices:
                 dev.close()  # already monitored; discard the duplicate handle
-            else:
-                self._add_device(path, dev)
+            elif self._add_device(path, dev):
                 CTRL_LOG.emit(f"watching: {path} ({dev.name})")
 
         for group in self.groups:
@@ -1211,9 +1244,8 @@ class KbKill:
             held = self.pressed.get(path)
             if not held:
                 continue
-            try:
-                live = set(dev.active_keys())
-            except OSError:
+            live = active_keys_safe(dev)
+            if live is None:
                 continue  # device is going away; rescan will drop it
             stale = held - live
             if stale:
@@ -2078,8 +2110,12 @@ def cmd_monitor(config: Config) -> int:
 
     sel = selectors.DefaultSelector()
     pressed: dict[str, set[int]] = {}
-    for path, dev in devices.items():
-        pressed[path] = set(dev.active_keys())
+    for path, dev in list(devices.items()):
+        held = active_keys_safe(dev)
+        if held is None:  # unplugged between listing and here
+            devices.pop(path, None)
+            continue
+        pressed[path] = held
         sel.register(dev, selectors.EVENT_READ, path)
 
     # Mirror the daemon's edge latches (see KbKill._toggle_groups) so the KILL/
