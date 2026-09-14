@@ -355,7 +355,7 @@ its own buttons can trigger the wake combo.
 ```sh
 kb-kill-daemon                # run the service (same as `... run`); systemd does this as root, config-less
 sudo kb-kill-daemon detect    # list keyboards + which are targets + parsed combos
-sudo kb-kill-daemon monitor   # print raw key events (debugging)
+sudo kb-kill-daemon monitor   # print raw key events + kill/wake transitions (debugging)
 #                             # per-key daemon diagnostics are OFF by default:
 #                             # see "Turning on the per-key diagnostics" below
 kb-kill-daemon -c PATH run    # run with a specific config pinned live (ad-hoc testing, no pusher needed)
@@ -366,6 +366,15 @@ requires root. The service itself (`kb-kill-daemon run` with no `-c`) starts
 config-less and waits for `kb-kill-push`.
 
 ### Debugging a wake that won't fire
+
+`monitor` marks the moment a combo *fires* with `<<< KILLED[group]` or
+`<<< WOKEN[group]` — the one transition the daemon would make, not merely "this
+combo is held". That distinction matters for a **toggle config**
+(`kill_combo == wake_combo`), where every press flips the group: four taps of the
+hotkey while holding its modifiers is four transitions that net out to nothing,
+and only the label tells you which press was which. `monitor` is a separate
+process with its own state, so it reads the running daemon's killed flags on
+startup to get the labels the right way round (and says so if it can't).
 
 An exclusive grab routes a device's events to the grabber only, so **`monitor`
 cannot show events from a device the daemon (or input-remapper) has grabbed** —

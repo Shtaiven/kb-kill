@@ -2083,6 +2083,41 @@ def _keyname(code: int) -> str:
     return name
 
 
+def daemon_group_states() -> dict[str, bool] | None:
+    """{group name: killed} from the running daemon, or None if unreachable.
+
+    `monitor` is a separate process with its own latches, so it can only *predict*
+    what the daemon would do. Seeding that prediction from the live daemon is what
+    keeps it honest: for a toggle config (kill_combo == wake_combo) a group that is
+    already killed would otherwise have every transition below labelled backwards.
+
+    Best effort by design - a dev run against no daemon simply starts awake. Reads
+    group names and killed flags only; never key data.
+    """
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            s.connect(control_socket_path())
+            s.sendall(b'{"cmd":"status"}\n')
+            buf = b""
+            while b"\n" not in buf:
+                if len(buf) >= MAX_LINE:
+                    return None
+                chunk = s.recv(4096)
+                if not chunk:
+                    return None
+                buf += chunk
+            msg = json.loads(buf.split(b"\n", 1)[0].decode())
+    except (OSError, ValueError):
+        return None
+    if msg.get("type") != "state":
+        return None
+    try:
+        return {g["name"]: bool(g["killed"]) for g in msg["groups"]}
+    except (KeyError, TypeError):
+        return None
+
+
 def cmd_monitor(config: Config) -> int:
     """Print every key event with its device + keycode, and flag when the
     kill/wake combos match per-device or globally. Used to diagnose how
@@ -2118,18 +2153,32 @@ def cmd_monitor(config: Config) -> int:
         pressed[path] = held
         sel.register(dev, selectors.EVENT_READ, path)
 
-    # Mirror the daemon's edge latches (see KbKill._toggle_groups) so the KILL/
-    # WAKE flags below mark the moment a combo would actually FIRE, not merely
-    # every event while you keep holding it.
+    # Mirror the daemon's edge latches (see KbKill._toggle_groups) so the flags
+    # below mark the moment a combo would actually FIRE, not merely every event
+    # while you keep holding it.
     latched: dict[tuple[str, str], bool] = {}
     glob0 = set().union(*pressed.values()) if pressed else set()
     for g in config.groups:
         latched[(g.name, "kill")] = combo_held(g.kill_combo, glob0)
         latched[(g.name, "wake")] = combo_held(g.wake_combo, glob0)
 
+    # ...and mirror its killed state, so each press is reported as the ONE
+    # transition it actually causes. Reporting "this combo is held" per group
+    # would print KILL and WAKE together on every press of a toggle config
+    # (kill_combo == wake_combo), which is exactly the case where you need to
+    # know which of the two just happened.
+    live = daemon_group_states()
+    killed = {g.name: (live or {}).get(g.name, False) for g in config.groups}
+
     print("Monitoring all input devices. Press a group's kill/wake combo.")
     for g in config.groups:
-        print(f"  [{g.name}] kill={g.kill_raw} wake={g.wake_raw}")
+        state = "KILLED" if killed[g.name] else "awake"
+        print(f"  [{g.name}] kill={g.kill_raw} wake={g.wake_raw}  (now: {state})")
+    if live is None:
+        print()
+        print("NOTE: could not read the running daemon's state - assuming every")
+        print("group is awake. If one is in fact killed, its transitions below")
+        print("are labelled backwards; start from a known state to be sure.")
     print("Ctrl+C to stop.\n")
     try:
         while True:
@@ -2153,14 +2202,20 @@ def cmd_monitor(config: Config) -> int:
                     glob = set().union(*pressed.values()) if pressed else set()
                     flags = []
                     for g in config.groups:
-                        for kind, combo in (
-                            ("KILL", g.kill_combo),
-                            ("WAKE", g.wake_combo),
-                        ):
-                            now = combo_held(combo, glob)
-                            if now and not latched[(g.name, kind.lower())]:
-                                flags.append(f"{kind}[{g.name}]")
-                            latched[(g.name, kind.lower())] = now
+                        kill_now = combo_held(g.kill_combo, glob)
+                        wake_now = combo_held(g.wake_combo, glob)
+                        kill_edge = kill_now and not latched[(g.name, "kill")]
+                        wake_edge = wake_now and not latched[(g.name, "wake")]
+                        # Latch before acting, exactly as _toggle_groups does.
+                        latched[(g.name, "kill")] = kill_now
+                        latched[(g.name, "wake")] = wake_now
+                        if not killed[g.name]:
+                            if kill_edge:
+                                killed[g.name] = True
+                                flags.append(f"KILLED[{g.name}]")
+                        elif wake_edge:
+                            killed[g.name] = False
+                            flags.append(f"WOKEN[{g.name}]")
                     tag = ("  <<< " + " ".join(flags)) if flags else ""
                     print(f"{path:20} {short:34} {_keyname(ev.code):16} {action}{tag}")
     except KeyboardInterrupt:
