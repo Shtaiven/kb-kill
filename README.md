@@ -86,17 +86,25 @@ installing this on your system; never run scripts you don't trust.
   TTY case). Without an active seat (headless, container) the daemon runs but stays
   **idle** and never grabs anything.
 - The tray (optional) additionally needs PyGObject + GTK 3 + `AyatanaAppIndicator3`.
+  Its on-screen display comes from the shell itself on GNOME and KDE; on COSMIC,
+  sway and other wlroots compositors it needs `gtk-layer-shell` (GTK 3), and
+  without it the menu entry is greyed out and nothing pops. The `.deb`/`.rpm`
+  pull all of these in as weak dependencies; the commands below are for a
+  checkout install.
 
 ```sh
 # Ubuntu / Debian / Pop!_OS
 sudo apt install python3 python3-evdev                                     # daemon
 sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 # tray
+sudo apt install gir1.2-gtklayershell-0.1                                  # tray OSD
 # Fedora
 sudo dnf install python3 python3-evdev                                     # daemon
 sudo dnf install python3-gobject gtk3 libayatana-appindicator-gtk3         # tray
+sudo dnf install gtk-layer-shell                                           # tray OSD
 # Arch / Manjaro
 sudo pacman -S python python-evdev                                         # daemon
 sudo pacman -S python-gobject gtk3 libayatana-appindicator                 # tray
+sudo pacman -S gtk-layer-shell                                             # tray OSD
 ```
 
 ## Install from a checkout
@@ -285,6 +293,35 @@ daemon reporting that it acted. Then:
 (checked = AWAKE). It uses the AppIndicator / StatusNotifierItem protocol, native on
 KDE and COSMIC, and on GNOME with the AppIndicator extension. It runs as your
 user and only talks to the daemon over the control socket.
+
+On every toggle it also flashes an on-screen display near the bottom of the screen
+— the volume / airplane-mode kind, not a notification that lands in your history.
+One hotkey can flip several groups at once, and each gets its own card, stacked
+(the daemon announces every edge separately, so the tray holds them together for
+a moment to show them as one stack).
+There is no shared protocol for this, so the tray picks a backend at runtime:
+`org.gnome.Shell.ShowOSD` on GNOME, `org.kde.osdService` on KDE, and everywhere
+else a `gtk-layer-shell` surface it draws itself (mutter does not support
+layer-shell, hence the split). With no backend available the menu entry is
+greyed out and nothing pops.
+
+**On-screen display** in the menu turns it on and off — on by default. The tray
+writes that choice to `~/.config/kb-kill/tray.toml`, which is its own file, not
+the config pushed to the daemon — hence two separate menu entries: **Edit groups
+& hotkeys…** opens `kb-kill.toml` (what `kb-kill-push` sends to the daemon) and
+**Edit tray settings…** opens `tray.toml`, creating it from the current values
+if it does not exist yet:
+
+```toml
+osd = true          # the menu writes this one
+osd_margin = 96     # px above the bottom of the screen
+osd_opacity = 0.92  # 0.0 clear .. 1.0 solid
+```
+
+Colours, font and (on COSMIC) corner radius come from the desktop, so only the
+geometry is here. Edited values apply the next time the tray starts; the menu
+toggle leaves them alone, and anything missing, malformed or out of range falls
+back to the defaults above.
 
 The socket is a small newline-delimited JSON protocol if you want to script it:
 `{"cmd":"kill|wake|toggle","group":"<name>"}`, `{"cmd":"status"}`,
