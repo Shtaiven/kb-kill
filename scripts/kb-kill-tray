@@ -21,7 +21,7 @@ import tomllib
 from collections.abc import Callable
 
 # Rewritten by packaging/bump-version.sh from the repo-root VERSION file.
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 if __name__ == "__main__" and sys.argv[1:] and sys.argv[1] in ("-V", "--version"):
     print(f"kb-kill-tray {VERSION} ({os.path.realpath(__file__)})")

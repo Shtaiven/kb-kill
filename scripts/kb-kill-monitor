@@ -30,7 +30,7 @@ except ImportError:
     sys.exit("kb-kill-monitor: python-evdev is required (python3-evdev / python-evdev)")
 
 # Rewritten by packaging/bump-version.sh from the repo-root VERSION file.
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 _EVIOCSMASK = 0x40104593
 _MASKED_TYPES = (
     ecodes.EV_REL,
