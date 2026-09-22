@@ -14,6 +14,7 @@ optdepends=(
   'python-gobject: tray icon (kb-kill-tray)'
   'gtk3: tray icon (kb-kill-tray)'
   'libayatana-appindicator: tray icon (kb-kill-tray)'
+  'gtk-layer-shell: tray on-screen display outside GNOME/KDE (kb-kill-tray)'
 )
 backup=('etc/kb-kill/kb-kill.toml')
 install="$pkgname.install"
@@ -47,8 +48,11 @@ package() {
   done
 
   # Icons.
+  # Twice: the tray points its indicator at /usr/share/kb-kill/icons, the
+  # GNOME/KDE OSD only finds the name through the icon theme.
   for i in icons/*.svg; do
     install -Dm0644 "$i" "$pkgdir/usr/share/kb-kill/icons/$(basename "$i")"
+    install -Dm0644 "$i" "$pkgdir/usr/share/icons/hicolor/scalable/apps/$(basename "$i")"
   done
 
   # Default config (a backup= conffile: pacman preserves user edits as .pacsave).

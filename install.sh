@@ -22,6 +22,7 @@ PROJECT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 CONFIG="$HOME/.config/kb-kill/kb-kill.toml"
 BIN_DIR=/usr/local/bin
 ICON_DIR=/usr/local/share/kb-kill/icons
+THEME_ICON_DIR=/usr/local/share/icons/hicolor/scalable/apps
 
 say() { printf '\033[0;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
@@ -118,6 +119,14 @@ PY
 then
   warn "kb-kill-tray needs PyGObject + GTK 3 + AppIndicator3; it will not start until they are installed (or use --no-tray)."
 fi
+if [ "$INSTALL_TRAY" -eq 1 ] && ! python3 - <<'PY' 2>/dev/null
+import gi
+gi.require_version("GtkLayerShell", "0.1")
+from gi.repository import GtkLayerShell  # noqa: F401
+PY
+then
+  say "Tray OSD: GNOME and KDE supply their own; elsewhere install gtk-layer-shell (gir1.2-gtklayershell-0.1 on Debian/Ubuntu)."
+fi
 
 # --------------------------------------------------------------------------- #
 # System-wide (sudo): binaries, icons, daemon unit, default config
@@ -131,6 +140,12 @@ if [ "$INSTALL_DAEMON" -eq 1 ]; then
   done
   sudo install -d -m0755 "$ICON_DIR"
   sudo install -m0644 "$PROJECT_DIR"/icons/*.svg "$ICON_DIR/"
+  # Also into the icon theme: the GNOME/KDE on-screen display resolves the icon
+  # name inside the shell's own process, which never sees $ICON_DIR.
+  sudo install -d -m0755 "$THEME_ICON_DIR"
+  sudo install -m0644 "$PROJECT_DIR"/icons/*.svg "$THEME_ICON_DIR/"
+  command -v gtk-update-icon-cache >/dev/null 2>&1 &&
+    sudo gtk-update-icon-cache -qtf /usr/local/share/icons/hicolor >/dev/null 2>&1 || true
   for f in "$PROJECT_DIR"/services/*-daemon.service; do
     sudo install -m0644 -o root -g root "$f" "/etc/systemd/system/$(basename "$f")"
   done

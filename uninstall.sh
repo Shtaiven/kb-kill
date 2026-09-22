@@ -57,6 +57,9 @@ if [ "$REMOVE_SYSTEM" -eq 1 ]; then
   sudo systemctl daemon-reload
   for b in "${BINS[@]}"; do sudo rm -f "$BIN_DIR/$b"; done
   sudo rm -rf /usr/local/share/kb-kill/icons /usr/local/share/kb-kill
+  for i in "$PROJECT_DIR"/icons/*.svg; do
+    sudo rm -f "/usr/local/share/icons/hicolor/scalable/apps/$(basename "$i")"
+  done
   for d in "${LAUNCHERS[@]}"; do sudo rm -f "/usr/share/applications/$d"; done
   sudo update-desktop-database /usr/share/applications 2>/dev/null || true
 else

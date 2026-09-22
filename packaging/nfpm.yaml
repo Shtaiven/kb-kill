@@ -60,11 +60,20 @@ contents:
     file_info: { mode: 0644 }
 
   # --- icons ---
+  # Twice over: the tray points its indicator at /usr/share/kb-kill/icons, while
+  # the GNOME/KDE OSD resolves "kb-kill-killed" inside the shell's own process
+  # and so only ever finds it through the icon theme.
   - src: icons/kb-kill-awake.svg
     dst: /usr/share/kb-kill/icons/kb-kill-awake.svg
     file_info: { mode: 0644 }
   - src: icons/kb-kill-killed.svg
     dst: /usr/share/kb-kill/icons/kb-kill-killed.svg
+    file_info: { mode: 0644 }
+  - src: icons/kb-kill-awake.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/kb-kill-awake.svg
+    file_info: { mode: 0644 }
+  - src: icons/kb-kill-killed.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/kb-kill-killed.svg
     file_info: { mode: 0644 }
 
   # --- default config: a conffile, never clobbered on upgrade ---
@@ -92,6 +101,7 @@ overrides:
       - python3-gi
       - gir1.2-gtk-3.0
       - gir1.2-ayatanaappindicator3-0.1
+      - gir1.2-gtklayershell-0.1   # tray OSD outside GNOME/KDE
   rpm:
     depends:
       - "python3 >= 3.11"
@@ -100,3 +110,4 @@ overrides:
       - python3-gobject
       - gtk3
       - libayatana-appindicator-gtk3
+      - gtk-layer-shell             # tray OSD outside GNOME/KDE

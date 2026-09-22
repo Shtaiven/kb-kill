@@ -29,9 +29,12 @@ if command -v loginctl >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; th
   done
 fi
 
-# Refresh the app menu.
+# Refresh the app menu and the icon theme cache (the tray OSD looks its icons
+# up by name through the theme).
 command -v update-desktop-database >/dev/null 2>&1 && \
   update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+command -v gtk-update-icon-cache >/dev/null 2>&1 && \
+  gtk-update-icon-cache -qtf /usr/share/icons/hicolor >/dev/null 2>&1 || true
 
 # The root daemon: start now on first install, restart to pick up the new binary
 # on upgrade. Skipped silently when systemd isn't running (build host/container).

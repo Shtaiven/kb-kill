@@ -26,6 +26,7 @@ map_local() {
     /usr/lib/systemd/user/*) echo /etc/systemd/user ;;
     /usr/share/applications/*) echo /usr/share/applications ;;
     /usr/share/kb-kill/icons/*) echo /usr/local/share/kb-kill/icons ;;
+    /usr/share/icons/hicolor/*) echo /usr/local/share/icons/hicolor/scalable/apps ;;
     /etc/kb-kill/*) echo /etc/kb-kill ;;
     /usr/share/licenses/* | /usr/share/doc/*) echo "" ;;
     *) echo "?" ;;
