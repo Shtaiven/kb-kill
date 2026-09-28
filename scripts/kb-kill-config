@@ -625,6 +625,28 @@ def _entry_error(row: Gtk.Widget, bad: bool) -> None:
         row.remove_css_class("error")
 
 
+def clear_button(tooltip: str, on_clicked) -> Gtk.Button:
+    """The one clear control every editable row uses."""
+    button = Gtk.Button(
+        icon_name="edit-clear-symbolic", css_classes=["flat"], valign=Gtk.Align.CENTER
+    )
+    button.set_tooltip_text(tooltip)
+    button.connect("clicked", lambda _b: on_clicked())
+    return button
+
+
+def remove_button(tooltip: str, on_clicked) -> Gtk.Button:
+    """A flat x that takes the whole row away, unlike clear_button's <x| on a field."""
+    button = Gtk.Button(
+        icon_name="window-close-symbolic",
+        css_classes=["flat", "circular"],
+        valign=Gtk.Align.CENTER,
+    )
+    button.set_tooltip_text(tooltip)
+    button.connect("clicked", lambda _b: on_clicked())
+    return button
+
+
 class MatcherList(Adw.PreferencesGroup):
     """One matcher field: a list of exact names or globs."""
 
@@ -644,14 +666,7 @@ class MatcherList(Adw.PreferencesGroup):
 
     def _add_row(self, value: str, focus: bool = False) -> None:
         row = Adw.EntryRow(title="Device name or glob (*, ?, [..], {a,b})", text=value)
-        remove = Gtk.Button(
-            icon_name="user-trash-symbolic",
-            css_classes=["flat"],
-            valign=Gtk.Align.CENTER,
-        )
-        remove.set_tooltip_text("Remove")
-        remove.connect("clicked", lambda _b: self._remove(row))
-        row.add_suffix(remove)
+        row.add_suffix(remove_button("Remove this pattern", lambda: self._remove(row)))
         row.connect("changed", lambda _r: self._store())
         self.add(row)
         self._rows.append(row)
@@ -733,15 +748,10 @@ class ComboRow(Adw.EntryRow):
             label="Record", css_classes=["flat"], valign=Gtk.Align.CENTER
         )
         record.connect("clicked", self._on_record)
-        self._clear = Gtk.Button(
-            icon_name="edit-clear-symbolic",
-            css_classes=["flat"],
-            valign=Gtk.Align.CENTER,
+        self._clear = clear_button(
+            "Clear: use the hotkey from Defaults" if inherited else "Clear: no hotkey",
+            lambda: self.set_text(""),
         )
-        self._clear.set_tooltip_text(
-            "Clear: use the hotkey from Defaults" if inherited else "Clear"
-        )
-        self._clear.connect("clicked", lambda _b: self.set_text(""))
         self.add_suffix(self._clear)
         self.add_suffix(record)
         self.connect("changed", self._on_changed)
