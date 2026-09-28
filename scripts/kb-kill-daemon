@@ -93,6 +93,10 @@ HANDSHAKE_SECONDS = 10  # drop a connection that never sends a command
 GROUP_NAME_RE = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9 ._-]{0,31}\Z")
 LABEL_MAX_LEN = 64
 SEATS_DIR = "/run/systemd/seats"
+SESSIONS_DIR = "/run/systemd/sessions"
+# A session this young when the daemon first sees it counts as a fresh login
+# (the daemon started at boot); an older one means the daemon restarted.
+START_KILLED_GRACE = 120.0
 INPUT_DIR = "/dev/input"
 
 _IN_ATTRIB, _IN_CLOSE_WRITE, _IN_MOVED_TO, _IN_CREATE, _IN_DELETE = (
@@ -196,25 +200,43 @@ def log_state(msg: str, pri: int = PRI_INFO) -> None:
 # --------------------------------------------------------------------------- #
 # logind seat + inotify
 # --------------------------------------------------------------------------- #
-def active_uids() -> set[int]:
-    """uids owning a foreground session, one per seat (empty when headless)."""
-    uids: set[int] = set()
+def active_sessions() -> dict[str, int]:
+    """session id -> uid of each seat's foreground session."""
+    out: dict[str, int] = {}
     try:
         names = os.listdir(SEATS_DIR)
     except OSError:
-        return uids
+        return out
     for name in names:
+        fields: dict[str, str] = {}
         try:
             with open(os.path.join(SEATS_DIR, name)) as fh:
                 for line in fh:
-                    if line.startswith("ACTIVE_UID="):
-                        val = line.strip().split("=", 1)[1]
-                        if val.isdigit():
-                            uids.add(int(val))
-                        break
+                    key, _, val = line.strip().partition("=")
+                    fields[key] = val
         except OSError:
             continue
-    return uids
+        sid, uid = fields.get("ACTIVE", ""), fields.get("ACTIVE_UID", "")
+        if sid.isalnum() and uid.isdigit():
+            out[sid] = int(uid)
+    return out
+
+
+def session_age(sid: str) -> float | None:
+    """Seconds since logind created session `sid`, or None if unknown."""
+    try:
+        with open(os.path.join(SESSIONS_DIR, sid)) as fh:
+            for line in fh:
+                if line.startswith("REALTIME="):
+                    return time.time() - int(line.strip().split("=", 1)[1]) / 1e6
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _is_new_session(sid: str) -> bool:
+    age = session_age(sid)
+    return age is not None and age < START_KILLED_GRACE
 
 
 class InotifyWatch:
@@ -648,6 +670,10 @@ class KbKill:
         self.live_uid: int | None = None
         self.groups: list[Group] = []
         self.forced = config is not None  # -c: pinned live, no arbitration
+        # start_killed fires once per activation of a session (login, or a
+        # switch back to it), never on a re-push or reconnect within one.
+        self._sessions: dict[str, int] | None = None  # None: not looked yet
+        self._armed: set[str] = set()  # sessions whose start_killed is due
         if config is not None:
             self.pushed[os.getuid()] = config
             self.live_uid = os.getuid()
@@ -856,11 +882,30 @@ class KbKill:
         self._sync_latches(self._global_pressed())
         self.rescan()
 
+    def _track_sessions(self) -> dict[str, int]:
+        """Arm start_killed for each session that just became active."""
+        now = active_sessions()
+        first = self._sessions is None
+        for sid in now.keys() - (self._sessions or {}).keys():
+            # Seen becoming active, or already active when the daemon started:
+            # then only a young session is a login rather than a restart.
+            if not first or _is_new_session(sid):
+                self._armed.add(sid)
+        self._armed &= now.keys()
+        self._sessions = now
+        return now
+
     def _set_live(self, uid: int | None) -> None:
         self.live_uid = uid
         cfg = self.pushed.get(uid) if uid is not None else None
         groups = cfg.groups if cfg else []
-        self._install_groups(groups, {g.name: True for g in groups if g.start_killed})
+        sid = next((s for s, u in (self._sessions or {}).items() if u == uid), None)
+        fresh = cfg is not None and sid in self._armed
+        if fresh:
+            self._armed.discard(sid)
+        self._install_groups(
+            groups, {g.name: True for g in groups if g.start_killed} if fresh else {}
+        )
         for g in self.groups:
             if g.killed:
                 log_state(f"[{g.name}] KILLED (start_killed)")
@@ -876,9 +921,8 @@ class KbKill:
     def _reevaluate_live(self) -> None:
         if self.forced:
             return
-        desired = next(
-            (uid for uid in sorted(active_uids()) if uid in self.pushed), None
-        )
+        active = set(self._track_sessions().values())
+        desired = next((uid for uid in sorted(active) if uid in self.pushed), None)
         if desired != self.live_uid:
             self._set_live(desired)
 

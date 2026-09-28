@@ -1040,11 +1040,12 @@ class TrayPage(Adw.PreferencesPage):
             self._loading = False
 
     def open_text(self) -> None:
-        """Seed a missing file from the values shown, so the editor opens a
+        """Write what is shown first: a pending edit, or for a missing file a
         documented template rather than an empty buffer."""
         if self._timer:
             GLib.source_remove(self._timer)
-        if not os.path.exists(tray_config_path()):
+            self._write()  # clears _timer
+        elif not os.path.exists(tray_config_path()):
             self._write()
         if os.path.exists(tray_config_path()):
             launch_editor(tray_config_path())
@@ -1402,13 +1403,14 @@ class CosmicShortcuts:
         return out
 
     def bound(self, chords: list[Chord]) -> set[Chord]:
-        """Shortcuts that already swallow a combo: ours, or a no-op of yours."""
-        out = set()
-        for entry in self._entries():
-            chord = self._chord_of_entry(entry)
-            if chord and (self.TAG in entry or NOOP in self._action(entry)):
-                out.add(chord)
-        return out
+        """The `chords` a shortcut already swallows: ours, or a no-op of yours.
+        The file's key names are compared case-insensitively (F5 vs f5)."""
+        swallowed = {
+            self._chord_of_entry(entry)
+            for entry in self._entries()
+            if self.TAG in entry or NOOP in self._action(entry)
+        }
+        return {chord for chord in chords if self._norm(chord) in swallowed}
 
     def apply(self, chords: list[Chord], take: set[Chord]) -> Report:
         """Swallow `chords`; a clashing one only if it is in `take`."""
@@ -1867,6 +1869,7 @@ class DesktopPage(Adw.PreferencesPage):
                 self._float = Adw.SwitchRow(
                     title="Float the settings window",
                     subtitle="Instead of tiling it. Takes effect the next time the window opens.",
+                    sensitive=False,  # until refresh() finds COSMIC
                 )
                 self._float_handler = self._float.connect(
                     "notify::active", self._on_float
@@ -1913,6 +1916,8 @@ class DesktopPage(Adw.PreferencesPage):
                 self._buttons[backend.title],
             )
             why = backend.unavailable()
+            if isinstance(backend, CosmicShortcuts):
+                self._float.set_sensitive(why is None)  # never create COSMIC's files
             apply.set_sensitive(why is None and bool(chords))
             remove.set_sensitive(why is None)
             if why:
@@ -1926,7 +1931,6 @@ class DesktopPage(Adw.PreferencesPage):
                 apply.set_sensitive(False)
                 remove.set_sensitive(False)
             if isinstance(backend, CosmicShortcuts):
-                self._float.set_sensitive(True)
                 self._float.handler_block(self._float_handler)
                 self._float.set_active(backend.floating())
                 self._float.handler_unblock(self._float_handler)
@@ -2255,8 +2259,11 @@ class ConfigWindow(Adw.ApplicationWindow):
         self._rebuild()
         self.changed()
 
-    def save(self, then=None) -> None:
+    def save(self, then=None, overwrite: bool = False) -> None:
         if not self.readable:
+            return
+        if not overwrite and self._read_text() != self.text:
+            self._confirm_overwrite(then)
             return
         text = render(self.text, self.saved, self.model)
         result, error = ask_daemon("config_check", cmd="check_config", toml=text)
@@ -2274,6 +2281,28 @@ class ConfigWindow(Adw.ApplicationWindow):
             self.alert("Not saved", f"kb-kill would reject this config:\n\n{message}")
             return
         self._commit(text, result.get("warnings") or [], then)
+
+    def _confirm_overwrite(self, then) -> None:
+        """The file changed under unsaved edits: never pick a side silently."""
+        dialog = Adw.AlertDialog(
+            heading="kb-kill.toml changed on disk",
+            body="It was edited outside this window after you opened it. "
+            "Overwrite it with your edits, or reload it and drop them?",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("reload", "Reload")
+        dialog.add_response("overwrite", "Overwrite")
+        dialog.set_response_appearance("overwrite", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_close_response("cancel")
+
+        def answered(_d, response: str) -> None:
+            if response == "reload":
+                self.load()
+            elif response == "overwrite":
+                self.save(then, overwrite=True)
+
+        dialog.connect("response", answered)
+        dialog.present(self)
 
     def _commit(self, text: str, warnings: list[str], then) -> None:
         try:

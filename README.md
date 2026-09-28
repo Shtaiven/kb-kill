@@ -217,7 +217,9 @@ together. The old name `virtual_keyboard` is accepted as a deprecated alias.
 - `start_killed = true` (per group, not inherited) starts the group **KILLED**
   whenever your session becomes the active one: at login, or when you switch
   back to it. A re-push keeps each group's current state, so saving an edit
-  never kills anything by itself.
+  never kills anything by itself, and neither does a daemon or `kb-kill-push`
+  restart mid-session (the daemon only counts a session as a fresh login if
+  logind created it in the last two minutes).
 - A group **name** is up to 32 characters of letters, digits, space, `.`, `_`, `-`
   (it appears in log lines). A label is up to 64 printable characters.
 - TOML rule: top-level keys come **before** any `[groups.*]` table.
