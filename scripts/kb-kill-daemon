@@ -275,6 +275,7 @@ class Group:
         kill_raw: str,
         wake_raw: str,
         virtual: bool | None,
+        start_killed: bool = False,
     ) -> None:
         self.name = name
         self.label = label
@@ -286,6 +287,7 @@ class Group:
         self.kill_combo = _parse_combo(kill_raw)
         self.wake_combo = _parse_combo(wake_raw)
         self.virtual = virtual  # None = "auto" (pair with a fronting remapper copy)
+        self.start_killed = start_killed  # KILLED when its user becomes live
         # runtime
         self.targets: dict[str, InputDevice] = {}
         self.killed = False
@@ -337,7 +339,9 @@ _GROUP_KEYS = {
     "wake_combo",
     "virtual",
     "virtual_keyboard",
+    "start_killed",
 }
+_TOP_KEYS = {"kill_combo", "wake_combo"}
 _GLOB_META_RE = re.compile(r"[*?]|\[[!^]?\]?[^]]*\]")
 _NEG_CLASS_RE = re.compile(r"\[\^([^]]*\])")
 MAX_PATTERNS_PER_ENTRY = 256  # brace expansion cap; configs come from any local uid
@@ -450,6 +454,10 @@ def _build_group(
                 f"{where}: invalid 'label' {_safe(label)!r}: up to {LABEL_MAX_LEN} printable characters"
             )
 
+    start_killed = table.get("start_killed", False)
+    if not isinstance(start_killed, bool):
+        raise ConfigError(f"{where}: 'start_killed' must be true or false")
+
     kill_raw = table.get("kill_combo", defaults["kill_combo"])
     wake_raw = table.get("wake_combo", defaults["wake_combo"])
     for key, val in (("kill_combo", kill_raw), ("wake_combo", wake_raw)):
@@ -469,15 +477,16 @@ def _build_group(
             kill_raw,
             wake_raw,
             virtual,
+            start_killed,
         )
     except ConfigError as e:
         raise ConfigError(f"{where}: {e}")
 
 
 def parse_config(doc: object, source: str, warn: Warn = _journal_warn) -> Config:
-    """Top-level keys form the "default" group (if they include a matcher) and
-    supply combo defaults for every [groups.*] table. Warnings go to `warn`, the
-    journal unless a caller (check_config) must keep them out of it."""
+    """The top level holds only kill_combo/wake_combo, the defaults every
+    [groups.*] table inherits. Warnings go to `warn`, the journal unless a
+    caller (check_config) must keep them out of it."""
     if not isinstance(doc, dict):
         raise ConfigError(f"{source}: top level must be a table")
     sections = doc.pop("groups", {})
@@ -488,13 +497,20 @@ def parse_config(doc: object, source: str, warn: Warn = _journal_warn) -> Config
         "wake_combo": doc.get("wake_combo"),
     }
 
-    groups = []
-    if any(f in doc for f in _MATCH_KEYS):
-        groups.append(
-            _build_group("default", doc, defaults, f"{source} [top-level]", warn)
+    # There used to be a "default" group made of top-level keys. Refuse it
+    # rather than guess: it now belongs in a [groups.<name>] table.
+    stray = [k for k in doc if k in _GROUP_KEYS and k not in _TOP_KEYS]
+    if stray:
+        raise ConfigError(
+            f"{source} [top-level]: {', '.join(repr(k) for k in stray[:4])} "
+            "must be in a [groups.<name>] table (the top-level default group is "
+            "gone; the top level only holds kill_combo and wake_combo)"
         )
-    else:
-        _warn_unknown_keys(doc, source, warn)
+    _warn_unknown_keys(
+        {k: v for k, v in doc.items() if k not in _TOP_KEYS}, source, warn
+    )
+
+    groups = []
     for name, table in sections.items():
         if not GROUP_NAME_RE.match(name):
             raise ConfigError(
@@ -636,6 +652,8 @@ class KbKill:
             self.pushed[os.getuid()] = config
             self.live_uid = os.getuid()
             self.groups = config.groups
+            for g in self.groups:
+                g.killed = g.start_killed
         self.clients: dict[
             socket.socket, dict
         ] = {}  # conn -> {buf, uid, born, hello, debug}
@@ -823,8 +841,8 @@ class KbKill:
     # -- live config ---------------------------------------------------------- #
     def _install_groups(self, groups: list[Group], preserve: dict[str, bool]) -> None:
         """Make `groups` live. Ungrabs everything first (a grab never outlives its
-        config); killed state comes from `preserve`, so a user switch (empty map)
-        always starts awake."""
+        config); killed state comes from `preserve` only, so a kill is never
+        inherited: a user switch passes just that user's own start_killed."""
         for path in list(self.grabbed):
             self._ungrab(path)
         for g in groups:
@@ -841,7 +859,11 @@ class KbKill:
     def _set_live(self, uid: int | None) -> None:
         self.live_uid = uid
         cfg = self.pushed.get(uid) if uid is not None else None
-        self._install_groups(cfg.groups if cfg else [], preserve={})
+        groups = cfg.groups if cfg else []
+        self._install_groups(groups, {g.name: True for g in groups if g.start_killed})
+        for g in self.groups:
+            if g.killed:
+                log_state(f"[{g.name}] KILLED (start_killed)")
         if cfg:
             CTRL_LOG.emit(
                 f"live config: uid {uid} -> {len(self.groups)} group(s) [{', '.join(g.name for g in self.groups)}]"
@@ -902,6 +924,7 @@ class KbKill:
                     "kill": g.kill_raw,
                     "wake": g.wake_raw,
                     "virtual": g.virtual_label,
+                    "start_killed": g.start_killed,
                 }
                 for g in cfg.groups
             ],

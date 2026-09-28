@@ -63,6 +63,8 @@ rebuild the package or re-run `./install.sh`.
 - **Grab deferral.** `_reconcile_grabs` never grabs a device with keys held.
 - **A grab never outlives its config; a user switch starts awake.**
   `_install_groups` ungrabs first and takes killed state only from `preserve`.
+  The one exception is the incoming user's own `start_killed` groups
+  (`_set_live`); a kill is still never carried over from another user.
 - **No root.** Everything needs only group `input`. Never suggest adding a
   login user to `input`. Any new syscall/path/capability widens the sandbox in
   `services/kb-kill-daemon.service`; do it deliberately.

@@ -40,7 +40,7 @@ sudo dnf install ./kb-kill-*.noarch.rpm
 ```
 
 kb-kill does nothing until you define a group. Open **kb-kill Settings** (from
-the app menu, the tray's **kb-kill settings…**, or `kb-kill-config`), add a
+the app menu, the tray's **Configuration…**, or `kb-kill-config`), add a
 group, pick a target device and record a kill and a wake hotkey; or edit
 `~/.config/kb-kill/kb-kill.toml` (created from `/etc/kb-kill/kb-kill.toml`) by
 hand. Then check:
@@ -144,6 +144,7 @@ killed only by a combo you set, and both `kill_combo` and `wake_combo` are
 A simple single-keyboard config:
 
 ```toml
+[groups.laptop]
 keyboards  = "AT Translated Set 2 keyboard"   # exact name (kb-kill-detect shows it)
 kill_combo = "ctrl+alt+shift+k"
 wake_combo = "ctrl+alt+shift+u"
@@ -206,10 +207,17 @@ together. The old name `virtual_keyboard` is accepted as a deprecated alias.
 
 ### Groups
 
-- The **top-level** keys form the **default group** (when they include a matcher
-  field) and supply `kill_combo`/`wake_combo` defaults for every `[groups.*]`.
-- Each **`[groups.<name>]`** table adds a group. `virtual` is per group and not
+- Each **`[groups.<name>]`** table is a group. `virtual` is per group and not
   inherited. An optional `label = "…"` is the display name the tray shows.
+- The **top level** holds only `kill_combo`/`wake_combo`: the default hotkeys
+  every group inherits when it sets none. Group keys there (`keyboards`,
+  `label`, `virtual`, …) are a config error; older kb-kill read them as a
+  "default" group, and they now belong in a `[groups.<name>]` table
+  (`[groups.default]` keeps the old name).
+- `start_killed = true` (per group, not inherited) starts the group **KILLED**
+  whenever your session becomes the active one: at login, or when you switch
+  back to it. A re-push keeps each group's current state, so saving an edit
+  never kills anything by itself.
 - A group **name** is up to 32 characters of letters, digits, space, `.`, `_`, `-`
   (it appears in log lines). A label is up to 64 printable characters.
 - TOML rule: top-level keys come **before** any `[groups.*]` table.
@@ -221,7 +229,8 @@ together. The old name `virtual_keyboard` is accepted as a deprecated alias.
 ```toml
 wake_combo = "ctrl+alt+shift+u"               # inherited below
 
-keyboards  = "AT Translated Set 2 keyboard"   # default group (the laptop)
+[groups.laptop]
+keyboards  = "AT Translated Set 2 keyboard"
 kill_combo = "ctrl+alt+shift+k"
 
 [groups.externals]
@@ -259,8 +268,9 @@ remapper maps to something else does not.
 push and tray run for every logged-in user, so each session feeds the shared
 daemon its own config. Only the config of the user **currently controlling the
 seat** governs the devices; others are held dormant. On a user switch the daemon
-swaps configs and starts the incoming one **awake**, so a kill is never inherited
-and the login greeter can never be disabled.
+swaps configs and starts the incoming one **awake** (except the groups that
+user's own config marks `start_killed`), so a kill is never inherited and the
+login greeter can never be disabled.
 
 ## Commands
 
@@ -296,12 +306,12 @@ daemon reporting that it acted. Then:
 
 ## Settings window
 
-`kb-kill-config` (**kb-kill Settings** in the app menu, or **kb-kill settings…**
+`kb-kill-config` (**kb-kill Settings** in the app menu, or **Configuration…**
 in the tray) edits both of your files, one tab each:
 
-- **Groups & hotkeys** edits `kb-kill.toml`. **Top level** holds the hotkeys
-  every group inherits and, optionally, the default group; each `[groups.*]`
-  table has its own page. **+** next to a matcher lists the devices the daemon
+- **Groups** edits `kb-kill.toml`. **Defaults** holds the hotkeys
+  every group inherits; each `[groups.*]` table has its own page. The **×** on
+  a group's hotkey clears it, so the group falls back to the default. **+** next to a matcher lists the devices the daemon
   sees (of that class) and inserts the exact name; you can also type a glob.
   **Record** captures a hotkey from the keys and mouse buttons you hold together.
   **Save** first sends the new file to the daemon's own parser
@@ -311,10 +321,37 @@ in the tray) edits both of your files, one tab each:
   change the file in place, so comments, key order and keys the editor does not
   know are kept.
 - **Tray** edits `tray.toml` and applies as you change it (see
-  [Tray icon](#tray-icon)).
+  [Tray icon](#tray-icon)). **Start the tray when I log in** turns the tray's
+  user unit on or off for you alone (off masks it, since it is enabled for
+  every user; on unmasks it).
+- **Desktop** stops kb-kill's hotkeys from also reaching the app in front: a
+  terminal otherwise prints a keycode for ctrl+alt+shift+k. **Apply** binds each
+  hotkey in the saved config to a do-nothing desktop shortcut (`/bin/true`);
+  the desktop then takes the key, while kb-kill, which reads the keyboard
+  itself, still sees it and works as before. Nothing changes until you press
+  **Apply**, so re-apply after changing hotkeys; **Remove** deletes only the
+  shortcuts kb-kill added. A shortcut you already bound to a no-op counts as
+  done and is left alone. If a combo is already used for something else,
+  **Apply** asks first: a dialog lists each clash and what taking it over does,
+  every one off by default, and the ones you leave off are skipped. Taking one
+  over removes your own shortcut for it (COSMIC backs the file up first) or
+  takes the combo off the desktop's built-in shortcut; on COSMIC, **Remove**
+  gives a built-in back, while on GNOME and KDE you reset it in their settings. Mouse-button combos cannot be desktop shortcuts
+  and are listed as skipped. A warning next to a hotkey names what already uses
+  it on each desktop kb-kill can see (your current one first): your own
+  shortcuts, and the desktop's built-in ones, which a swallow would replace.
+  - COSMIC: entries tagged `description: Some("kb-kill")` in
+    `~/.config/cosmic/com.system76.CosmicSettings.Shortcuts/v1/custom` (the file
+    is saved to `custom.kb-kill-backup` first). **Float the settings window**
+    adds a tiling exception for the window, taking effect the next time it opens.
+  - GNOME (untested): custom keybindings under
+    `org.gnome.settings-daemon.plugins.media-keys`, paths `…/kb-kill-N/`.
+  - KDE Plasma (untested): `~/.local/share/applications/kb-kill-swallow-N.desktop`
+    command shortcuts, keys in `kglobalshortcutsrc`, then a restart of
+    `plasma-kglobalaccel` (or a re-login).
 
-The window's menu has **Open as text…** for anything the form does not cover;
-it opens the file behind the tab in view (`kb-kill.toml` or `tray.toml`). If a
+For anything the form does not cover, the window's menu opens either file in
+your text editor: **Open kb-kill.toml…** or **Open tray.toml…**. If a
 file changes on disk while the window is open, the tab reloads it (or offers
 to, if you have unsaved group edits). Recording a hotkey that kb-kill already uses
 fires it, and the desktop may keep some combos (often Super) to itself.
@@ -336,7 +373,7 @@ There is no shared protocol for this, so the tray picks a backend at runtime:
 else a `gtk-layer-shell` surface it draws itself (mutter does not support
 layer-shell, hence the split). With no backend available nothing pops.
 
-**kb-kill settings…** in the menu opens the settings window, whose **Tray** tab
+**Configuration…** in the menu opens the settings window, whose **Tray** tab
 turns the display on and off (on by default) and sets its geometry. The tray
 keeps these in `~/.config/kb-kill/tray.toml`, its own file rather than the config
 pushed to the daemon, and follows it live: every change flashes a preview card.
