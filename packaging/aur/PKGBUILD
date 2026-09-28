@@ -15,6 +15,9 @@ optdepends=(
   'gtk3: tray icon (kb-kill-tray)'
   'libayatana-appindicator: tray icon (kb-kill-tray)'
   'gtk-layer-shell: tray on-screen display outside GNOME/KDE (kb-kill-tray)'
+  'gtk4: settings window (kb-kill-config)'
+  'libadwaita: settings window (kb-kill-config)'
+  'python-tomlkit: settings window (kb-kill-config)'
 )
 backup=('etc/kb-kill/kb-kill.toml')
 install="$pkgname.install"

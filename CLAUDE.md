@@ -12,7 +12,9 @@ crash cannot break input. Config is **pushed**: each user's `kb-kill-push` sends
 their TOML to the daemon over a control socket, and the daemon applies only the
 config of the user who currently controls the seat (logind `ACTIVE_UID`).
 
-Pure Python + shell + systemd units. No build step, no test suite. The primary
+Pure Python + shell + systemd units. No build step, no test suite. The tray is
+GTK3 (AppIndicator has no GTK4 port) and the settings window GTK4; one process
+cannot load both, so they stay separate programs. The primary
 install method is the `.deb`/`.rpm`; `install.sh` is for a git checkout.
 
 ## Files
@@ -21,7 +23,8 @@ install method is the `.deb`/`.rpm`; `install.sh` is for a git checkout.
 | ----------------------------- | -------------------------------------------------------------------------------------- |
 | `scripts/kb-kill-daemon`      | the daemon. Runs as a systemd `DynamicUser` with `SupplementaryGroups=input`, not root |
 | `scripts/kb-kill-push`        | per-user config pusher (stdlib), mandatory                                             |
-| `scripts/kb-kill-tray`        | optional GTK3/AppIndicator tray                                                        |
+| `scripts/kb-kill-tray`        | optional GTK3/AppIndicator tray; follows `tray.toml` live                              |
+| `scripts/kb-kill-config`      | optional GTK4/libadwaita settings window (groups & hotkeys, tray); tomlkit round-trip  |
 | `scripts/kb-kill-detect`      | unprivileged socket client: what the daemon matches and grabs                          |
 | `scripts/kb-kill-monitor`     | privileged raw key-event viewer + daemon state (`sudo`)                                |
 | `services/*.service`          | `*-daemon.service` is the system unit; the others are global user units                |
@@ -51,7 +54,9 @@ rebuild the package or re-run `./install.sh`.
   rate (timing alone leaks typing); state lines go through the global
   `STATE_LOG` bucket, config/device lines through `CTRL_LOG`; all text passes
   `_safe()`; group names/labels are charset-checked. Key-rate diagnostics go
-  only to a root client that sent `{"cmd":"debug"}`.
+  only to a root client that sent `{"cmd":"debug"}`. `check_config` (any uid)
+  must log nothing: parser warnings go to the `warn` sink it passes, and back
+  to the caller only.
 - **Edge-triggered combos.** `_toggle_groups` fires on not-held -> held only and
   `_sync_latches` is the single place latches are written. `_release_stale_keys`
   only ever drops keys (re-arms, never fires).
@@ -78,4 +83,6 @@ rebuild the package or re-run `./install.sh`.
 `packaging/nfpm.yaml` is the canonical payload list. Adding a file means: place
 it in the right directory, add it to `nfpm.yaml`, run `packaging/check-sync.sh`
 (release.yml runs it too). Version literals live in `VERSION` and are copied by
-`bump-version.sh`; never edit them by hand.
+`bump-version.sh`; never edit them by hand. `StartupWMClass` in
+`desktop/kb-kill-config.desktop` must equal `APP_ID` in `kb-kill-config`: that
+is how shells match the window to its launcher (name and icon).

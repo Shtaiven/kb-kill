@@ -36,6 +36,7 @@ import struct
 import sys
 import time
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
 
 try:
@@ -402,19 +403,25 @@ def _as_names(value: object, where: str, field: str) -> list[str]:
     return names
 
 
-def _warn_unknown_keys(table: dict, where: str) -> None:
+Warn = Callable[[str], None]
+
+
+def _journal_warn(msg: str) -> None:
+    CTRL_LOG.emit(f"warning: {msg}", PRI_WARN)
+
+
+def _warn_unknown_keys(table: dict, where: str, warn: Warn) -> None:
     unknown = [key for key in table if key not in _GROUP_KEYS]
     for key in unknown[:4]:
-        CTRL_LOG.emit(f"warning: {where}: unknown key {key!r} (ignored)", PRI_WARN)
+        warn(f"{where}: unknown key {key!r} (ignored)")
     if len(unknown) > 4:
-        CTRL_LOG.emit(
-            f"warning: {where}: {len(unknown) - 4} further unknown key(s) ignored",
-            PRI_WARN,
-        )
+        warn(f"{where}: {len(unknown) - 4} further unknown key(s) ignored")
 
 
-def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
-    _warn_unknown_keys(table, where)
+def _build_group(
+    name: str, table: dict, defaults: dict, where: str, warn: Warn
+) -> Group:
+    _warn_unknown_keys(table, where, warn)
     matchers = {f: _as_names(table[f], where, f) for f in _MATCH_KEYS if f in table}
     if not matchers:
         raise ConfigError(
@@ -426,10 +433,7 @@ def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
             f"{where}: set 'virtual' or its deprecated alias 'virtual_keyboard', not both"
         )
     if "virtual_keyboard" in table:
-        CTRL_LOG.emit(
-            f"warning: {where}: 'virtual_keyboard' is deprecated, use 'virtual'",
-            PRI_WARN,
-        )
+        warn(f"{where}: 'virtual_keyboard' is deprecated, use 'virtual'")
     virtual = table.get("virtual", table.get("virtual_keyboard", "auto"))
     if isinstance(virtual, str) and virtual.strip().lower() == "auto":
         virtual = None
@@ -470,9 +474,10 @@ def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
         raise ConfigError(f"{where}: {e}")
 
 
-def parse_config(doc: object, source: str) -> Config:
+def parse_config(doc: object, source: str, warn: Warn = _journal_warn) -> Config:
     """Top-level keys form the "default" group (if they include a matcher) and
-    supply combo defaults for every [groups.*] table."""
+    supply combo defaults for every [groups.*] table. Warnings go to `warn`, the
+    journal unless a caller (check_config) must keep them out of it."""
     if not isinstance(doc, dict):
         raise ConfigError(f"{source}: top level must be a table")
     sections = doc.pop("groups", {})
@@ -485,9 +490,11 @@ def parse_config(doc: object, source: str) -> Config:
 
     groups = []
     if any(f in doc for f in _MATCH_KEYS):
-        groups.append(_build_group("default", doc, defaults, f"{source} [top-level]"))
+        groups.append(
+            _build_group("default", doc, defaults, f"{source} [top-level]", warn)
+        )
     else:
-        _warn_unknown_keys(doc, source)
+        _warn_unknown_keys(doc, source, warn)
     for name, table in sections.items():
         if not GROUP_NAME_RE.match(name):
             raise ConfigError(
@@ -496,9 +503,11 @@ def parse_config(doc: object, source: str) -> Config:
             )
         if not isinstance(table, dict):
             raise ConfigError(f"{source}: [groups.{name}] must be a table")
-        groups.append(_build_group(name, table, defaults, f"{source} [groups.{name}]"))
+        groups.append(
+            _build_group(name, table, defaults, f"{source} [groups.{name}]", warn)
+        )
     if not groups:
-        CTRL_LOG.emit(f"{source}: no groups defined; inert (monitor only)")
+        warn(f"{source}: no groups defined; inert (monitor only)")
     return Config(groups, source)
 
 
@@ -513,9 +522,9 @@ def load_config_file(path: str) -> Config:
         raise ConfigError(f"{p}: {e}")
 
 
-def load_config_text(text: str, source: str) -> Config:
+def load_config_text(text: str, source: str, warn: Warn = _journal_warn) -> Config:
     try:
-        return parse_config(tomllib.loads(text), source)
+        return parse_config(tomllib.loads(text), source, warn)
     except (tomllib.TOMLDecodeError, TypeError, ValueError) as e:
         raise ConfigError(f"{source}: {e}")
 
@@ -866,6 +875,38 @@ class KbKill:
         else:
             self._reevaluate_live()
 
+    @staticmethod
+    def _check_config(text: str) -> dict:
+        """Parse a candidate config for a settings editor. Nothing reaches the
+        journal: warnings and errors go back to the caller only."""
+        warnings: list[str] = []
+        try:
+            cfg = load_config_text(text, "config", warnings.append)
+        except ConfigError as e:
+            return {
+                "type": "config_check",
+                "ok": False,
+                "error": _safe(e),
+                "warnings": [_safe(w) for w in warnings],
+                "groups": [],
+            }
+        return {
+            "type": "config_check",
+            "ok": True,
+            "error": None,
+            "warnings": [_safe(w) for w in warnings],
+            "groups": [
+                {
+                    "name": g.name,
+                    "label": g.label or g.name,
+                    "kill": g.kill_raw,
+                    "wake": g.wake_raw,
+                    "virtual": g.virtual_label,
+                }
+                for g in cfg.groups
+            ],
+        }
+
     # -- grabs ---------------------------------------------------------------- #
     def _grab(self, path: str) -> bool:
         dev = self.devices.get(path)
@@ -1208,6 +1249,10 @@ class KbKill:
         if cmd == "set_config":  # any uid; governs only while that uid is live
             if isinstance(obj.get("toml"), str):
                 self._on_set_config(uid, obj["toml"])
+            return
+        if cmd == "check_config":  # any uid; parses only, installs nothing
+            if isinstance(obj.get("toml"), str):
+                self._send(conn, self._check_config(obj["toml"]))
             return
         if uid not in (0, self.live_uid):
             CTRL_LOG.emit(

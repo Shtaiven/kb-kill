@@ -127,6 +127,17 @@ PY
 then
   say "Tray OSD: GNOME and KDE supply their own; elsewhere install gtk-layer-shell (gir1.2-gtklayershell-0.1 on Debian/Ubuntu)."
 fi
+if ! python3 - <<'PY' 2>/dev/null
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw
+import tomlkit  # noqa: F401
+assert (Adw.get_major_version(), Adw.get_minor_version()) >= (1, 5)
+PY
+then
+  say "kb-kill-config (settings window) needs GTK 4, libadwaita >= 1.5 and tomlkit (gir1.2-gtk-4.0 gir1.2-adw-1 python3-tomlkit on Debian/Ubuntu); without them it opens kb-kill.toml in a text editor."
+fi
 
 # --------------------------------------------------------------------------- #
 # System-wide (sudo): binaries, icons, daemon unit, default config

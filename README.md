@@ -39,9 +39,11 @@ sudo apt install ./kb-kill_*_all.deb
 sudo dnf install ./kb-kill-*.noarch.rpm
 ```
 
-kb-kill does nothing until you define a group: edit
-`~/.config/kb-kill/kb-kill.toml` (created from `/etc/kb-kill/kb-kill.toml`) to
-name a target device and a `kill_combo`/`wake_combo`. Then check:
+kb-kill does nothing until you define a group. Open **kb-kill Settings** (from
+the app menu, the tray's **kb-kill settings…**, or `kb-kill-config`), add a
+group, pick a target device and record a kill and a wake hotkey; or edit
+`~/.config/kb-kill/kb-kill.toml` (created from `/etc/kb-kill/kb-kill.toml`) by
+hand. Then check:
 
 ```sh
 kb-kill-detect                           # what the daemon matches and would grab
@@ -88,23 +90,28 @@ installing this on your system; never run scripts you don't trust.
 - The tray (optional) additionally needs PyGObject + GTK 3 + `AyatanaAppIndicator3`.
   Its on-screen display comes from the shell itself on GNOME and KDE; on COSMIC,
   sway and other wlroots compositors it needs `gtk-layer-shell` (GTK 3), and
-  without it the menu entry is greyed out and nothing pops. The `.deb`/`.rpm`
-  pull all of these in as weak dependencies; the commands below are for a
-  checkout install.
+  without it nothing pops.
+- The settings window `kb-kill-config` (optional) needs GTK 4, libadwaita ≥ 1.5
+  and `tomlkit`. Without them it opens `kb-kill.toml` in a text editor instead.
+  The `.deb`/`.rpm` pull all of these in as weak dependencies; the commands
+  below are for a checkout install.
 
 ```sh
 # Ubuntu / Debian / Pop!_OS
 sudo apt install python3 python3-evdev                                     # daemon
 sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 # tray
 sudo apt install gir1.2-gtklayershell-0.1                                  # tray OSD
+sudo apt install gir1.2-gtk-4.0 gir1.2-adw-1 python3-tomlkit               # settings
 # Fedora
 sudo dnf install python3 python3-evdev                                     # daemon
 sudo dnf install python3-gobject gtk3 libayatana-appindicator-gtk3         # tray
 sudo dnf install gtk-layer-shell                                           # tray OSD
+sudo dnf install gtk4 libadwaita python3-tomlkit                           # settings
 # Arch / Manjaro
 sudo pacman -S python python-evdev                                         # daemon
 sudo pacman -S python-gobject gtk3 libayatana-appindicator                 # tray
 sudo pacman -S gtk-layer-shell                                             # tray OSD
+sudo pacman -S gtk4 libadwaita python-tomlkit                              # settings
 ```
 
 ## Install from a checkout
@@ -287,6 +294,31 @@ daemon reporting that it acted. Then:
   tokens are held, which device delivered the last event, and why a grab is being
   deferred. It goes only to your terminal, never to the journal.
 
+## Settings window
+
+`kb-kill-config` (**kb-kill Settings** in the app menu, or **kb-kill settings…**
+in the tray) edits both of your files, one tab each:
+
+- **Groups & hotkeys** edits `kb-kill.toml`. **Top level** holds the hotkeys
+  every group inherits and, optionally, the default group; each `[groups.*]`
+  table has its own page. **+** next to a matcher lists the devices the daemon
+  sees (of that class) and inserts the exact name; you can also type a glob.
+  **Record** captures a hotkey from the keys and mouse buttons you hold together.
+  **Save** first sends the new file to the daemon's own parser
+  (`check_config`). A config it would reject is not written, and you get the
+  reason instead of a line in the journal. A config it accepts replaces the
+  file in one step, and `kb-kill-push` applies it within about a second. Edits
+  change the file in place, so comments, key order and keys the editor does not
+  know are kept.
+- **Tray** edits `tray.toml` and applies as you change it (see
+  [Tray icon](#tray-icon)).
+
+The window's menu has **Open as text…** for anything the form does not cover;
+it opens the file behind the tab in view (`kb-kill.toml` or `tray.toml`). If a
+file changes on disk while the window is open, the tab reloads it (or offers
+to, if you have unsaved group edits). Recording a hotkey that kb-kill already uses
+fires it, and the desktop may keep some combos (often Super) to itself.
+
 ## Tray icon
 
 `kb-kill-tray` shows whether any group is KILLED and toggles groups from its menu
@@ -302,34 +334,34 @@ a moment to show them as one stack).
 There is no shared protocol for this, so the tray picks a backend at runtime:
 `org.gnome.Shell.ShowOSD` on GNOME, `org.kde.osdService` on KDE, and everywhere
 else a `gtk-layer-shell` surface it draws itself (mutter does not support
-layer-shell, hence the split). With no backend available the menu entry is
-greyed out and nothing pops.
+layer-shell, hence the split). With no backend available nothing pops.
 
-**On-screen display** in the menu turns it on and off — on by default. The tray
-writes that choice to `~/.config/kb-kill/tray.toml`, which is its own file, not
-the config pushed to the daemon — hence two separate menu entries: **Edit groups
-& hotkeys…** opens `kb-kill.toml` (what `kb-kill-push` sends to the daemon) and
-**Edit tray settings…** opens `tray.toml`, creating it from the current values
-if it does not exist yet:
+**kb-kill settings…** in the menu opens the settings window, whose **Tray** tab
+turns the display on and off (on by default) and sets its geometry. The tray
+keeps these in `~/.config/kb-kill/tray.toml`, its own file rather than the config
+pushed to the daemon, and follows it live: every change flashes a preview card.
+The file is plain TOML if you would rather edit it:
 
 ```toml
-osd = true          # the menu writes this one
+osd = true          # show the on-screen display
 osd_margin = 96     # px above the bottom of the screen
 osd_opacity = 0.92  # 0.0 clear .. 1.0 solid
 ```
 
 Colours, font and (on COSMIC) corner radius come from the desktop, so only the
-geometry is here. Edited values apply the next time the tray starts; the menu
-toggle leaves them alone, and anything missing, malformed or out of range falls
-back to the defaults above.
+geometry is here. Anything missing, malformed or out of range falls back to the
+defaults above.
 
 The socket is a small newline-delimited JSON protocol if you want to script it:
 `{"cmd":"kill|wake|toggle","group":"<name>"}`, `{"cmd":"status"}`,
 `{"cmd":"devices","all":true}`; the daemon replies and broadcasts
 `{"type":"state","groups":[{name,label,killed,targets,kill,wake,kill_codes,wake_codes}]}`
 to the active user's clients on every change. Config is delivered the same way
-(`{"cmd":"set_config","toml":"…"}`, what `kb-kill-push` sends). `{"cmd":"debug"}`
-(root only) subscribes to key-rate diagnostics.
+(`{"cmd":"set_config","toml":"…"}`, what `kb-kill-push` sends), and
+`{"cmd":"check_config","toml":"…"}` parses a candidate without applying it,
+replying `{"type":"config_check","ok":…,"error":…,"warnings":[…],"groups":[…]}`
+(what the settings window checks before it saves). `{"cmd":"debug"}` (root only)
+subscribes to key-rate diagnostics.
 
 ## input-remapper coexistence
 

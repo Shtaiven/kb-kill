@@ -27,6 +27,9 @@ depends:
 
 contents:
   # --- executables (root-owned, on the global PATH) ---
+  - src: scripts/kb-kill-config
+    dst: /usr/bin/kb-kill-config
+    file_info: { mode: 0755 }
   - src: scripts/kb-kill-daemon
     dst: /usr/bin/kb-kill-daemon
     file_info: { mode: 0755 }
@@ -54,7 +57,10 @@ contents:
     dst: /usr/lib/systemd/user/kb-kill-tray.service
     file_info: { mode: 0644 }
 
-  # --- app-menu launcher (paths rewritten to /usr) ---
+  # --- app-menu launchers (paths rewritten to /usr) ---
+  - src: packaging/build/desktop/kb-kill-config.desktop
+    dst: /usr/share/applications/kb-kill-config.desktop
+    file_info: { mode: 0644 }
   - src: packaging/build/desktop/kb-kill-tray.desktop
     dst: /usr/share/applications/kb-kill-tray.desktop
     file_info: { mode: 0644 }
@@ -102,6 +108,9 @@ overrides:
       - gir1.2-gtk-3.0
       - gir1.2-ayatanaappindicator3-0.1
       - gir1.2-gtklayershell-0.1   # tray OSD outside GNOME/KDE
+      - gir1.2-gtk-4.0             # kb-kill-config (settings window)
+      - gir1.2-adw-1
+      - python3-tomlkit
   rpm:
     depends:
       - "python3 >= 3.11"
@@ -111,3 +120,6 @@ overrides:
       - gtk3
       - libayatana-appindicator-gtk3
       - gtk-layer-shell             # tray OSD outside GNOME/KDE
+      - gtk4                        # kb-kill-config (settings window)
+      - libadwaita
+      - python3-tomlkit
