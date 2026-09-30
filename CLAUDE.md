@@ -37,7 +37,7 @@ install method is the `.deb`/`.rpm`; `install.sh` is for a git checkout.
 ```sh
 kb-kill-detect                    # groups, devices, targets, grabs (as the active user)
 sudo kb-kill-monitor [--debug]    # raw key events + daemon state (+ key-rate diagnostics)
-journalctl -u kb-kill-daemon -f   # live config, KILLED / AWAKE (rate-limited)
+journalctl -u kb-kill-daemon -f   # live config, killed / awake (rate-limited)
 ./scripts/kb-kill-daemon -c some.toml   # dev run: pins a file config, socket in $XDG_RUNTIME_DIR
 packaging/check-sync.sh           # installer vs deb/rpm vs AUR payload agreement
 packaging/bump-version.sh X.Y.Z   # the only way to change version literals
@@ -79,10 +79,10 @@ rebuild the package or re-run `./install.sh`.
 - **Device identity is path + inode** (`_stale`); rescans are driven by inotify
   on `/dev/input`, the 10 s tick is a backstop. Each fd carries an EVIOCSMASK so
   only EV_KEY/EV_SYN arrive.
-- **Vocabulary:** group state is `KILLED` or `AWAKE`, upper-case, in the
-  journal, monitor and detect. What a desktop user sees is lower case: the
-  settings window ("Start killed", "killed · 2 devices"), the tray title
-  ("kb-kill: killed …" / "kb-kill: awake") and the OSD ("<group> killed").
+- **Vocabulary:** group state is "killed" or "awake", lower case, in every
+  text a person reads: journal, tray title, OSD, settings window, monitor,
+  detect. Identifiers keep their names (`ICON_KILLED`, the `killed` JSON field,
+  `start_killed`).
 
 ## Packaging
 

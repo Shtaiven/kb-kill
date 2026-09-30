@@ -908,7 +908,7 @@ class KbKill:
         )
         for g in self.groups:
             if g.killed:
-                log_state(f"[{g.name}] KILLED (start_killed)")
+                log_state(f"[{g.name}] killed (start_killed)")
         if cfg:
             CTRL_LOG.emit(
                 f"live config: uid {uid} -> {len(self.groups)} group(s) [{', '.join(g.name for g in self.groups)}]"
@@ -1077,9 +1077,9 @@ class KbKill:
                     f"[{group.name}] note: cannot wake itself; use the wake hotkey on another device",
                     PRI_WARN,
                 )
-            log_state(f"[{group.name}] KILLED ({len(group.targets)} device(s)){via}")
+            log_state(f"[{group.name}] killed ({len(group.targets)} device(s)){via}")
         else:
-            log_state(f"[{group.name}] AWAKE{via}")
+            log_state(f"[{group.name}] awake{via}")
         self._maybe_broadcast()
 
     # -- events --------------------------------------------------------------- #

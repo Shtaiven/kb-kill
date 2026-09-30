@@ -78,7 +78,7 @@ def combo_held(codes: list[list[int]], pressed: set[int]) -> bool:
 
 
 def state_word(killed: bool) -> str:
-    return "KILLED" if killed else "AWAKE"
+    return "killed" if killed else "awake"
 
 
 class Monitor:
@@ -210,7 +210,7 @@ class Monitor:
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="kb-kill-monitor",
-        description="Print raw key events and the kb-kill daemon's real KILLED/AWAKE state.",
+        description="Print raw key events and the kb-kill daemon's real killed/awake state.",
     )
     parser.add_argument(
         "-s", "--socket", default=socket_path(), help="daemon control socket"

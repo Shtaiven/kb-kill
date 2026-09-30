@@ -214,7 +214,7 @@ together. The old name `virtual_keyboard` is accepted as a deprecated alias.
   `label`, `virtual`, …) are a config error; older kb-kill read them as a
   "default" group, and they now belong in a `[groups.<name>]` table
   (`[groups.default]` keeps the old name).
-- `start_killed = true` (per group, not inherited) starts the group **KILLED**
+- `start_killed = true` (per group, not inherited) starts the group **killed**
   whenever your session becomes the active one: at login, or when you switch
   back to it. A re-push keeps each group's current state, so saving an edit
   never kills anything by itself, and neither does a daemon or `kb-kill-push`
@@ -278,7 +278,7 @@ login greeter can never be disabled.
 
 ```sh
 kb-kill-detect                 # groups, every device, which one each group targets, grabs
-sudo kb-kill-monitor           # raw key events + the daemon's real KILLED/AWAKE transitions
+sudo kb-kill-monitor           # raw key events + the daemon's real killed/awake transitions
 sudo kb-kill-monitor --debug   # ... plus the daemon's key-rate diagnostics (grab deferral, wake progress)
 journalctl -u kb-kill-daemon -f
 ```
@@ -291,7 +291,7 @@ needs `sudo`; nothing it prints is written anywhere but your terminal.
 
 Run `sudo kb-kill-monitor` and press the combo one key at a time. Each key line
 shows the device it came from; a `<<< kill combo held [group]` tag marks the
-instant the held keys form the combo, and `>>> daemon: [group] -> KILLED` is the
+instant the held keys form the combo, and `>>> daemon: [group] -> killed` is the
 daemon reporting that it acted. Then:
 
 - **No tag ever appears:** the combo never completes on evdev. A remapper is
@@ -363,7 +363,7 @@ fires it, and the desktop may keep some combos (often Super) to itself.
 ## Tray icon
 
 `kb-kill-tray` shows whether any group is killed and toggles groups from its menu
-(checked = AWAKE). It uses the AppIndicator / StatusNotifierItem protocol, native on
+(checked = awake). It uses the AppIndicator / StatusNotifierItem protocol, native on
 KDE and COSMIC, and on GNOME with the AppIndicator extension. It runs as your
 user and only talks to the daemon over the control socket.
 
@@ -446,7 +446,7 @@ is keylogger-*capable*. The design minimizes and contains that:
   devices, not typed keys.
 - **Nothing keystroke-paced reaches the journal.** The journal is readable by
   group adm/wheel, and any local uid may push a config, so a hostile config (one
-  group per key) could otherwise turn `KILLED`/`AWAKE` lines into a keylogger.
+  group per key) could otherwise turn killed/awake lines into a keylogger.
   State lines pass a global token bucket (burst 4, then one per 5 s); logged text
   is flattened to one printable line; group names and labels are charset-checked
   so a TOML key containing `\n` cannot forge journal records.

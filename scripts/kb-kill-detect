@@ -93,7 +93,7 @@ def main() -> int:
             f'  "{g["label"]}"' if g.get("label") and g["label"] != g["name"] else ""
         )
         print(
-            f"  [{g['name']}]{label}  {'KILLED' if g['killed'] else 'AWAKE'}  ({g['targets']} target device(s))"
+            f"  [{g['name']}]{label}  {'killed' if g['killed'] else 'awake'}  ({g['targets']} target device(s))"
         )
         print(f"  {'':10}kill = {g.get('kill', '?')}    wake = {g.get('wake', '?')}")
 
