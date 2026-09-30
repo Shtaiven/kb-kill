@@ -319,7 +319,11 @@ in the tray) edits both of your files, one tab each:
   cannot hold turned into `_` ("Laptop Keyboards" → `laptop_keyboards`).
   In the sidebar, right-click a group (or press Shift+F10) to rename it (its
   label) or delete it, or press F2 or Delete; Ctrl+Z and Ctrl+Shift+Z undo and redo adding, renaming
-  and deleting groups (Revert and a reload from disk clear that history). **+** next to a matcher lists the devices the daemon
+  and deleting groups (Revert and a reload from disk clear that history).
+  **Matched Devices** at the bottom of a group's page shows what its kill hotkey
+  would disable right now, unsaved edits included, as the daemon itself works
+  it out (globs, and input-remapper's copy in place of the hardware); a group
+  that matches nothing says so. **+** next to a matcher lists the devices the daemon
   sees (of that class) and inserts the exact name; you can also type a glob.
   **Record** captures a hotkey from the keys and mouse buttons you hold together,
   once you let go (as in GNOME Settings): Esc cancels, Backspace clears.
@@ -409,7 +413,9 @@ to the active user's clients on every change. Config is delivered the same way
 (`{"cmd":"set_config","toml":"…"}`, what `kb-kill-push` sends), and
 `{"cmd":"check_config","toml":"…"}` parses a candidate without applying it,
 replying `{"type":"config_check","ok":…,"error":…,"warnings":[…],"groups":[…]}`
-(what the settings window checks before it saves). `{"cmd":"debug"}` (root only)
+(what the settings window checks before it saves); for the active user (or
+root) the reply also carries `"targets":{"<group>":[{path,name,class,virtual,instead_of}]}`,
+what each group would grab right now. `{"cmd":"debug"}` (root only)
 subscribes to key-rate diagnostics.
 
 ## input-remapper coexistence

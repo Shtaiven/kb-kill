@@ -56,7 +56,9 @@ rebuild the package or re-run `./install.sh`.
   `_safe()`; group names/labels are charset-checked. Key-rate diagnostics go
   only to a root client that sent `{"cmd":"debug"}`. `check_config` (any uid)
   must log nothing: parser warnings go to the `warn` sink it passes, and back
-  to the caller only.
+  to the caller only. Its `targets` preview (device names, like `devices`) goes
+  only to the live uid or root, and resolves through the same
+  `_resolve_targets` as the live grab, so preview and grab cannot disagree.
 - **Edge-triggered combos.** `_toggle_groups` fires on not-held -> held only and
   `_sync_latches` is the single place latches are written. `_release_stale_keys`
   only ever drops keys (re-arms, never fires).

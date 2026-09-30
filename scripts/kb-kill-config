@@ -40,6 +40,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 SOCKET_TIMEOUT = 3.0
 STATUS_DELAY_MS = 1500  # kb-kill-push notices a save within ~1 s
 TRAY_WRITE_DELAY_MS = 300
+PREVIEW_DELAY_MS = 400  # after the last edit, ask the daemon what would match
 DISK_DEBOUNCE_MS = 300
 
 # Mirrors of the daemon's limits (scripts/kb-kill-daemon); the daemon's
@@ -892,6 +893,15 @@ class GroupPage(Adw.PreferencesPage):
         for section in group_details(win, group):
             self.add(section)
 
+        self._matched = Adw.PreferencesGroup(
+            title="Matched Devices",
+            description="What the kill hotkey would disable right now, "
+            "including unsaved edits.",
+        )
+        self._matched_rows: list[Adw.PreferencesRow] = []
+        self.add(self._matched)
+        self.show_matches(None, "Looking…")
+
         danger = Adw.PreferencesGroup()
         delete = Gtk.Button(
             label="Delete Group",
@@ -923,6 +933,42 @@ class GroupPage(Adw.PreferencesPage):
         self._name.set_subtitle(GLib.markup_escape_text(self._group.name))
         self._win.changed()
         self._win.retitle(self._group)
+
+    CLASS_WORDS = MappingProxyType({"kbd": "keyboard", "ptr": "pointer"})
+
+    def show_matches(self, devices: list[dict] | None, note: str | None) -> None:
+        """The daemon's preview for this group; `note` when there is none."""
+        for row in self._matched_rows:
+            self._matched.remove(row)
+        self._matched_rows = []
+        rows: list[Adw.PreferencesRow] = []
+        if devices is None:
+            rows.append(Adw.ActionRow(subtitle=GLib.markup_escape_text(note or "")))
+        elif not devices:
+            empty = Adw.ActionRow(
+                title="No Device Matches",
+                subtitle="Nothing would be disabled; check the names with the + "
+                "buttons above.",
+            )
+            empty.add_prefix(
+                Gtk.Image(icon_name="dialog-warning-symbolic", css_classes=["warning"])
+            )
+            rows.append(empty)
+        for d in devices or []:
+            kind = "virtual" if d.get("virtual") else "physical"
+            what = self.CLASS_WORDS.get(d.get("class"), "device")
+            parts = [f"{kind} {what}", str(d.get("path", ""))]
+            if d.get("instead_of"):
+                parts.append(f"input-remapper's copy of {d['instead_of']}")
+            rows.append(
+                Adw.ActionRow(
+                    title=GLib.markup_escape_text(str(d.get("name", ""))),
+                    subtitle=GLib.markup_escape_text(" · ".join(parts)),
+                )
+            )
+        for row in rows:
+            self._matched.add(row)
+            self._matched_rows.append(row)
 
     def refresh(self) -> None:
         for row in self._combos:
@@ -2144,6 +2190,7 @@ class ConfigWindow(Adw.ApplicationWindow):
         self._closing = False
         self._undo: list[Edit] = []
         self._redo: list[Edit] = []
+        self._preview_timer = 0
 
         self._stack = Adw.ViewStack()
         if self._stack.find_property("enable-transitions"):  # libadwaita >= 1.7
@@ -2386,6 +2433,46 @@ class ConfigWindow(Adw.ApplicationWindow):
 
     def changed(self) -> None:
         self._sync_header()
+        self._schedule_preview()
+
+    # -- matched-devices preview --------------------------------------------- #
+    def _schedule_preview(self) -> None:
+        if self._preview_timer:
+            GLib.source_remove(self._preview_timer)
+        self._preview_timer = GLib.timeout_add(PREVIEW_DELAY_MS, self._run_preview)
+
+    def _run_preview(self) -> bool:
+        """Ask the daemon what each group would grab, edits included: its own
+        matching (globs, remapper copies), so the preview cannot disagree."""
+        self._preview_timer = 0
+        pages = [(g, self._pages.get(g.key)) for g in self.model.groups]
+        if not self.readable or not pages:
+            return False
+        result, error = ask_daemon(
+            "config_check",
+            cmd="check_config",
+            toml=render(self.text, self.saved, self.model),
+        )
+        if result is None:
+            note = f"No preview: {error}"
+        elif not result.get("ok"):
+            message = re.sub(r"^config:?\s*", "", str(result.get("error")))
+            note = f"No preview until the config is valid: {message}"
+        elif "targets" not in result:
+            note = (
+                "No preview: the kb-kill daemon is older than this window, "
+                "or you are not the user at the seat."
+            )
+        else:
+            note = None
+        for group, page in pages:
+            if page is None:
+                continue
+            if note:
+                page.show_matches(None, note)
+            else:
+                page.show_matches(result["targets"].get(group.name.strip(), []), None)
+        return False  # one-shot timer
 
     def _sync_header(self) -> None:
         on_groups = self._stack.get_visible_child_name() == "groups"

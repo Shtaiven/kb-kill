@@ -746,15 +746,24 @@ class KbKill:
             elif until <= now:
                 del self._fronted_until[path]
 
-    def _resolve_targets(self, group: Group) -> dict[str, InputDevice]:
+    def _resolve_targets(
+        self,
+        group: Group,
+        devices: dict[str, InputDevice] | None = None,
+        fronting: dict[str, tuple[str, InputDevice]] | None = None,
+    ) -> dict[str, InputDevice]:
+        """What `group` grabs. The live devices by default; check_config's
+        preview passes its own set, so both go through this one function."""
+        devices = self.devices if devices is None else devices
+        fronting = self._fronting if fronting is None else fronting
         now = time.monotonic()
         out: dict[str, InputDevice] = {}
-        for path, dev in self.devices.items():
+        for path, dev in devices.items():
             if not self._dev_matches(group, dev):
                 continue
             if group.virtual is False:
                 out[path] = dev
-            elif (front := self._fronting.get(path)) is not None:
+            elif (front := fronting.get(path)) is not None:
                 out[front[0]] = front[1]  # the remapper's copy instead of the hardware
             elif self._fronted_until.get(path, 0.0) <= now:
                 out[path] = dev
@@ -941,10 +950,12 @@ class KbKill:
         else:
             self._reevaluate_live()
 
-    @staticmethod
-    def _check_config(text: str) -> dict:
+    def _check_config(self, text: str, uid: int | None = None) -> dict:
         """Parse a candidate config for a settings editor. Nothing reaches the
-        journal: warnings and errors go back to the caller only."""
+        journal: warnings and errors go back to the caller only. The live user
+        (or root) also gets `targets`: what each group would grab right now,
+        from the same matching the daemon uses; device names are theirs to
+        see (as with `devices`), not every local uid's."""
         warnings: list[str] = []
         try:
             cfg = load_config_text(text, "config", warnings.append)
@@ -972,7 +983,52 @@ class KbKill:
                 }
                 for g in cfg.groups
             ],
+            **(
+                {"targets": self._preview_targets(cfg)}
+                if uid in (0, self.live_uid)
+                else {}
+            ),
         }
+
+    def _preview_targets(self, cfg: Config) -> dict[str, list[dict]]:
+        """Per group of `cfg`, the devices it would grab. Pointers the live
+        config does not watch are opened just for this, then closed."""
+        want_pointers = any(g.pointers or g.devices for g in cfg.groups)
+        devices = {
+            p: d
+            for p, d in self.devices.items()
+            if is_keyboard(d) or (want_pointers and is_pointer(d))
+        }
+        opened: list[InputDevice] = []
+        try:
+            for path in sorted(set(list_devices()) - self.devices.keys()):
+                try:
+                    dev = InputDevice(path)
+                except OSError:
+                    continue
+                opened.append(dev)
+                if is_keyboard(dev) or (want_pointers and is_pointer(dev)):
+                    devices[path] = dev
+            fronting = fronting_map(devices)
+            copy_of = {copy: devices[hw].name for hw, (copy, _d) in fronting.items()}
+            return {
+                g.name: [
+                    {
+                        "path": path,
+                        "name": _safe(dev.name),
+                        "class": device_class(dev),
+                        "virtual": is_virtual(dev),
+                        "instead_of": _safe(copy_of[path]) if path in copy_of else None,
+                    }
+                    for path, dev in sorted(
+                        self._resolve_targets(g, devices, fronting).items()
+                    )
+                ]
+                for g in cfg.groups
+            }
+        finally:
+            for dev in opened:
+                dev.close()
 
     # -- grabs ---------------------------------------------------------------- #
     def _grab(self, path: str) -> bool:
@@ -1319,7 +1375,7 @@ class KbKill:
             return
         if cmd == "check_config":  # any uid; parses only, installs nothing
             if isinstance(obj.get("toml"), str):
-                self._send(conn, self._check_config(obj["toml"]))
+                self._send(conn, self._check_config(obj["toml"], uid))
             return
         if uid not in (0, self.live_uid):
             CTRL_LOG.emit(
