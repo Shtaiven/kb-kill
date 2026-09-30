@@ -1,0 +1,26 @@
+name: Test
+
+# The daemon's state rules (tests/), on every push and pull request.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install python-evdev
+        # The system python3 (3.12 here; the code supports >= 3.11), so the
+        # distro's python3-evdev is importable without a venv or pip.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-evdev
+
+      - name: Run tests
+        run: /usr/bin/python3 -m unittest discover -v tests
