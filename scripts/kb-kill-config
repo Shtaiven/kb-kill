@@ -23,15 +23,18 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import tomllib
 import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TypeGuard
+from xml.sax.saxutils import escape as xml_escape
 
 # Rewritten by packaging/bump-version.sh from the repo-root VERSION file.
 VERSION = "0.6.0"
@@ -50,14 +53,6 @@ DISK_DEBOUNCE_MS = 300
 GROUP_NAME_RE = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9 ._-]{0,31}\Z")
 LABEL_MAX_LEN = 64
 _UNSAFE = re.compile(r"[\x00-\x1f\x7f]")
-MODIFIER_NAMES = frozenset(
-    {
-        *("ctrl", "control", "lctrl", "rctrl", "alt", "lalt", "ralt", "altgr"),
-        *("shift", "lshift", "rshift", "super", "meta", "win", "cmd"),
-        *("lsuper", "lmeta", "rsuper", "rmeta"),
-        *("mouseleft", "mouseright", "mousemiddle"),
-    }
-)
 MATCH_KEYS = ("keyboards", "pointers", "devices")
 
 # Tray settings: the same keys, defaults and clamps as kb-kill-tray.
@@ -65,11 +60,24 @@ OSD_MARGIN, OSD_MARGIN_MAX, OSD_OPACITY = 96, 2000, 0.92
 
 
 def socket_path() -> str:
+    """The daemon's socket. /run/kb-kill (made by systemd) and
+    $XDG_RUNTIME_DIR (private to this user) are used as found. The /tmp
+    fallback of a dev daemon only when this user owns it: anyone can create a
+    file there, and would then read what is sent and answer as the daemon."""
     candidates = ["/run/kb-kill/control.sock"]
     if base := os.environ.get("XDG_RUNTIME_DIR"):
         candidates.append(os.path.join(base, "kb-kill.sock"))
-    candidates.append(f"/tmp/kb-kill-{os.getuid()}.sock")
-    return next((c for c in candidates if os.path.exists(c)), candidates[0])
+    found = next((c for c in candidates if os.path.exists(c)), None)
+    if found:
+        return found
+    tmp = f"/tmp/kb-kill-{os.getuid()}.sock"
+    try:
+        st = os.lstat(tmp)
+        if stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid():
+            return tmp
+    except OSError:
+        pass
+    return candidates[0]
 
 
 def user_config_path() -> str:
@@ -166,21 +174,60 @@ def ask_daemon(want: str, **cmd: object) -> tuple[dict | None, str | None]:
             sock.settimeout(SOCKET_TIMEOUT)
             sock.connect(socket_path())
             sock.sendall((json.dumps(cmd) + "\n").encode())
-            buf = b""
-            while True:
-                while b"\n" not in buf:
-                    chunk = sock.recv(65536)
-                    if not chunk:
-                        return None, "the daemon closed the connection"
-                    buf += chunk
-                line, buf = buf.split(b"\n", 1)
-                msg = json.loads(line)
-                if msg.get("type") == "error":
-                    return None, str(msg.get("error"))
-                if msg.get("type") == want:
-                    return msg, None
-    except (OSError, ValueError) as e:
+            with sock.makefile("rb") as replies:
+                for line in replies:
+                    msg = json.loads(line)
+                    if msg.get("type") == "error":
+                        return None, str(msg.get("error"))
+                    if msg.get("type") == want:
+                        return msg, None
+        return None, "the daemon closed the connection"
+    except (OSError, ValueError, RecursionError) as e:
         return None, f"cannot reach the kb-kill daemon ({e})"
+
+
+def watch_file(path: str, on_change) -> "Gio.FileMonitor | None":
+    """Call on_change() shortly after `path` is written or replaced. Watches
+    the real file's directory: an atomic replace (or a symlinked file) swaps
+    the inode a file monitor would stay on, and one save is several events."""
+    folder, name = os.path.split(os.path.realpath(path))
+    timer = 0
+
+    def fire() -> bool:
+        nonlocal timer
+        timer = 0
+        on_change()
+        return False  # one-shot timer
+
+    def changed(_m, file: "Gio.File", other: "Gio.File | None", _ev) -> None:
+        nonlocal timer
+        if name not in (file.get_basename(), other and other.get_basename()):
+            return
+        if timer:
+            GLib.source_remove(timer)
+        timer = GLib.timeout_add(DISK_DEBOUNCE_MS, fire)
+
+    try:
+        os.makedirs(folder, exist_ok=True)
+        monitor = Gio.File.new_for_path(folder).monitor_directory(
+            Gio.FileMonitorFlags.WATCH_MOVES, None
+        )
+    except (OSError, GLib.Error):
+        return None
+    monitor.connect("changed", changed)
+    return monitor
+
+
+def ask_daemon_async(done, want: str, **cmd: object) -> None:
+    """ask_daemon on a worker thread, so a slow or stuck daemon never freezes
+    the window; done(reply, error) then runs on the GTK main loop. Only the
+    socket work happens off it."""
+
+    def work() -> None:
+        reply, error = ask_daemon(want, **cmd)
+        GLib.idle_add(lambda: done(reply, error) and False)
+
+    threading.Thread(target=work, daemon=True).start()
 
 
 def fallback(why: str) -> int:
@@ -274,16 +321,7 @@ def combo_text(codes: list[int], pin_side: bool) -> str:
 def token_ok(token: str) -> bool:
     """The daemon's _parse_token, minus the parsing."""
     t = token.strip().lower()
-    if not t:
-        return False
-    if t in MODIFIER_NAMES:
-        return True
-    upper = t.upper()
-    if hasattr(ecodes, f"KEY_{upper}"):
-        return True
-    if upper.startswith(("KEY_", "BTN_")) and hasattr(ecodes, upper):
-        return True
-    return t.isdigit()
+    return bool(t) and (t in MODIFIER_NAMES or _token_code(t) is not None)
 
 
 def combo_ok(spec: str) -> bool:
@@ -452,7 +490,16 @@ def _set(container, key: str, value: object) -> None:
         container._insert_at(index, key, value)
 
 
-def _write_fields(container, old: Group, new: Group, combos: bool) -> None:
+def _write_combos(container, old_kill, old_wake, new_kill, new_wake) -> None:
+    for key, a, b in (
+        ("kill_combo", old_kill, new_kill),
+        ("wake_combo", old_wake, new_wake),
+    ):
+        if a.strip() != b.strip():
+            _set(container, key, b.strip())
+
+
+def _write_fields(container, old: Group, new: Group) -> None:
     """Only the fields that changed, so untouched ones keep their formatting."""
     if old.label.strip() != new.label.strip():
         _set(container, "label", new.label.strip())
@@ -468,25 +515,14 @@ def _write_fields(container, old: Group, new: Group, combos: bool) -> None:
         )
     if old.start_killed != new.start_killed:
         _set(container, "start_killed", True if new.start_killed else None)
-    if combos:
-        for key, a, b in (
-            ("kill_combo", old.kill, new.kill),
-            ("wake_combo", old.wake, new.wake),
-        ):
-            if a.strip() != b.strip():
-                _set(container, key, b.strip())
+    _write_combos(container, old.kill, old.wake, new.kill, new.wake)
 
 
 def render(text: str, old: Model, new: Model) -> str:
     """`text` edited from `old` to `new`, keeping everything the editor does
     not model (comments, unknown keys, order) as it was."""
     doc = tomlkit.parse(text)
-    for key, a, b in (
-        ("kill_combo", old.kill, new.kill),
-        ("wake_combo", old.wake, new.wake),
-    ):
-        if a.strip() != b.strip():
-            _set(doc, key, b.strip())
+    _write_combos(doc, old.kill, old.wake, new.kill, new.wake)
 
     by_orig = {g.name: g for g in old.groups}
     kept = {g.orig for g in new.groups if g.orig}
@@ -500,7 +536,7 @@ def render(text: str, old: Model, new: Model) -> str:
             g.orig = None
             continue
         table = sections[g.orig]
-        _write_fields(table, by_orig[g.orig], g, combos=True)
+        _write_fields(table, by_orig[g.orig], g)
         if g.name.strip() != g.orig.strip():
             renamed.append(g)
     # Rename in place: comments, position and inline/dotted form stay. Only a
@@ -534,7 +570,7 @@ def render(text: str, old: Model, new: Model) -> str:
         table = tomlkit.table()
         if len(sections):
             table.trivia.indent = "\n"  # a blank line after the previous table
-        _write_fields(table, Group(), g, combos=True)
+        _write_fields(table, Group(), g)
         sections[g.name.strip()] = table
     if sections is not None and not sections:
         del doc["groups"]
@@ -744,15 +780,32 @@ class MatcherList(Adw.PreferencesGroup):
                 activatable=True,
             )
         )
-        names, error = self._win.device_names(self._cls)
-        for name, subtitle in names:
-            rows.append(
-                Adw.ActionRow(
-                    title=GLib.markup_escape_text(name),
-                    subtitle=subtitle,
-                    activatable=True,
+        names: list[tuple[str, str]] = []
+        looking = Adw.ActionRow(title="Looking for devices…", activatable=False)
+        rows.append(looking)
+
+        def listed(found: list[tuple[str, str]], error: str | None) -> None:
+            rows.remove(looking)
+            names.extend(found)
+            for name, subtitle in found:
+                rows.append(
+                    Adw.ActionRow(
+                        title=GLib.markup_escape_text(name),
+                        subtitle=subtitle,
+                        activatable=True,
+                    )
                 )
-            )
+            if error:
+                box.append(
+                    Gtk.Label(
+                        label=error,
+                        wrap=True,
+                        max_width_chars=44,
+                        css_classes=["dim-label", "caption"],
+                    )
+                )
+
+        self._win.device_names(self._cls, listed)
 
         def activated(_list, row: Gtk.ListBoxRow) -> None:
             popover.popdown()
@@ -772,15 +825,6 @@ class MatcherList(Adw.PreferencesGroup):
             min_content_width=360,
         )
         box.append(scroller)
-        if error:
-            box.append(
-                Gtk.Label(
-                    label=error,
-                    wrap=True,
-                    max_width_chars=44,
-                    css_classes=["dim-label", "caption"],
-                )
-            )
         popover.set_child(box)
         popover.popup()
 
@@ -1107,7 +1151,6 @@ class TrayPage(Adw.PreferencesPage):
         super().__init__()
         self._win = win
         self._timer = 0
-        self._disk_timer = 0
         self._loading = False
         enabled, margin, opacity = load_tray_settings()
 
@@ -1154,7 +1197,8 @@ class TrayPage(Adw.PreferencesPage):
         self._enabled.connect("notify::active", self._schedule)
         self._margin.connect("notify::value", self._schedule)
         self._opacity.connect("notify::value", self._schedule)
-        self._monitor = self._watch()
+        # Follow hand edits, so the next change here does not undo them.
+        self._monitor = watch_file(tray_config_path(), self._on_disk_changed)
 
     def _on_at_login(self, row, _pspec) -> None:
         if self._loading:
@@ -1187,33 +1231,9 @@ class TrayPage(Adw.PreferencesPage):
         if os.path.exists(tray_config_path()):
             launch_editor(tray_config_path())
 
-    def _watch(self) -> Gio.FileMonitor | None:
-        """Follow hand edits, so the next change here does not undo them.
-        The real file's directory: a symlinked tray.toml is replaced there."""
-        folder = os.path.dirname(os.path.realpath(tray_config_path()))
-        try:
-            os.makedirs(folder, exist_ok=True)
-            monitor = Gio.File.new_for_path(folder).monitor_directory(
-                Gio.FileMonitorFlags.WATCH_MOVES, None
-            )
-        except (OSError, GLib.Error):
-            return None
-        monitor.connect("changed", self._on_disk_event)
-        return monitor
-
-    def _on_disk_event(self, _m, file: Gio.File, other: Gio.File | None, _ev) -> None:
-        name = os.path.basename(os.path.realpath(tray_config_path()))
-        if name not in (file.get_basename(), other and other.get_basename()):
-            return
-        if self._disk_timer:
-            GLib.source_remove(self._disk_timer)
-        self._disk_timer = GLib.timeout_add(DISK_DEBOUNCE_MS, self._on_disk_changed)
-
-    def _on_disk_changed(self) -> bool:
-        self._disk_timer = 0
+    def _on_disk_changed(self) -> None:
         if not self._timer:  # an edit waiting to be written wins
             self.load()
-        return False
 
     def flush(self) -> None:
         if self._timer:
@@ -1311,6 +1331,9 @@ _MODS = {
     "super": "super", "meta": "super", "win": "super", "cmd": "super",
     "lsuper": "super", "lmeta": "super", "rsuper": "super", "rmeta": "super",
 }  # fmt: skip
+# Every token the daemon takes as a modifier or mouse button (its
+# MODIFIER_ALIASES keys), for inline feedback; the daemon has the final word.
+MODIFIER_NAMES = frozenset(_MODS) | {"mouseleft", "mouseright", "mousemiddle"}
 _MOD_NAMES = ("super", "ctrl", "alt", "shift")
 
 
@@ -1883,15 +1906,20 @@ class KdeShortcuts:
         return out
 
     def _free(self, chord: Chord, clash: Clash) -> None:
+        """Take the combo off an action's active shortcuts. The file holds
+        KConfig-escaped text (several shortcuts joined by an escaped tab);
+        kwriteconfig escapes what it is given, so it gets the plain text."""
         target = (self._qt(chord) or "").lower()
         for groups, action, value in clash.where:
             active, _sep, rest = value.partition(",")
             kept = [a for a in active.split("\\t") if a.strip().lower() != target]
-            new = "\\t".join(kept) or "none"
+            plain = "\t".join(_kconfig_unescape(a) for a in kept) or "none"
+            if rest:
+                plain = f"{plain},{_kconfig_unescape(rest)}"
             args = [a for g in groups for a in ("--group", g)]
             subprocess.run(
-                [self.tool, "--file", "kglobalshortcutsrc", *args, "--key", action,
-                 f"{new},{rest}" if rest else new],
+                [self.tool, "--file", "kglobalshortcutsrc", *args,
+                 "--key", action, plain],
                 check=False,
             )  # fmt: skip
 
@@ -1982,17 +2010,48 @@ class KdeShortcuts:
         if reload:
             self._reload()
 
-    @staticmethod
-    def _reload() -> list[str]:
-        """kglobalaccel reads kglobalshortcutsrc at start (Plasma 6 runs it as a
-        user unit); without that, the change lands at the next login."""
-        rc, _out = systemctl_user("restart", "plasma-kglobalaccel.service")
-        return (
-            [] if rc == 0 else ["Log out and back in for KDE to pick the shortcuts up."]
-        )
+    UNIT = "plasma-kglobalaccel.service"
+
+    @classmethod
+    def _reload(cls) -> list[str]:
+        """kglobalaccel reads kglobalshortcutsrc when it starts. Restart it
+        only where it runs as its own user unit (Plasma on X11); under Plasma
+        Wayland it lives inside KWin, and starting the unit there would bring
+        up a second one. Otherwise the change lands at the next login."""
+        _rc, state = systemctl_user("is-active", cls.UNIT)
+        if state.splitlines()[:1] == ["active"]:
+            rc, _out = systemctl_user("restart", cls.UNIT)
+            if rc == 0:
+                return []
+        return ["Log out and back in for KDE to pick the shortcuts up."]
 
     def label(self, chord: Chord) -> str:
         return self._qt(chord) or chord.keysym
+
+
+_KCONFIG_ESCAPES = MappingProxyType(
+    {"\\": "\\", "t": "\t", "n": "\n", "r": "\r", "s": " "}
+)
+
+
+def _kconfig_unescape(text: str) -> str:
+    """KConfig's value escaping undone: \\\\ \\t \\n \\r \\s and \\xHH."""
+    out, i = [], 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            if nxt in _KCONFIG_ESCAPES:
+                out.append(_KCONFIG_ESCAPES[nxt])
+                i += 2
+                continue
+            if nxt == "x" and re.fullmatch(r"[0-9A-Fa-f]{2}", text[i + 2 : i + 4]):
+                out.append(chr(int(text[i + 2 : i + 4], 16)))
+                i += 4
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 def current_desktops() -> set[str]:
@@ -2264,7 +2323,6 @@ class ConfigWindow(Adw.ApplicationWindow):
         self.model = Model()
         self.readable = True
         self._status: dict[str, dict] = {}
-        self._disk_timer = 0
         self._banner_action = None
         self._pages: dict[str, Adw.PreferencesPage] = {}
         self._rows: dict[str, Adw.ActionRow] = {}
@@ -2272,6 +2330,8 @@ class ConfigWindow(Adw.ApplicationWindow):
         self._undo: list[Edit] = []
         self._redo: list[Edit] = []
         self._preview_timer = 0
+        self._preview_gen = 0  # a preview reply for an older edit is dropped
+        self._saving = False  # a save's check is out
 
         self._stack = Adw.ViewStack()
         if self._stack.find_property("enable-transitions"):  # libadwaita >= 1.7
@@ -2360,15 +2420,9 @@ class ConfigWindow(Adw.ApplicationWindow):
         # Bubble phase: a focused text field takes Ctrl+Z for its own typing
         # first; the group history gets it everywhere else.
         history = Gtk.ShortcutController()
-        for trigger, action in (
-            ("<Primary>z", "win.undo"),
-            ("<Primary><Shift>z", "win.redo"),
-        ):
+        for key, action in (("undo", "win.undo"), ("redo", "win.redo")):
             history.add_shortcut(
-                Gtk.Shortcut.new(
-                    Gtk.ShortcutTrigger.parse_string(trigger),
-                    Gtk.NamedAction.new(action),
-                )
+                Gtk.Shortcut.new(key_trigger(key), Gtk.NamedAction.new(action))
             )
         self.add_controller(history)
         self._sync_history()
@@ -2396,7 +2450,7 @@ class ConfigWindow(Adw.ApplicationWindow):
         self._split.connect("notify::collapsed", self._on_collapsed)
 
         self.connect("close-request", self._on_close_request)
-        self._monitor = self._watch_config()
+        self._monitor = watch_file(self.path, self._on_disk_changed)
         self.load()
 
     # -- layout --------------------------------------------------------------- #
@@ -2404,14 +2458,14 @@ class ConfigWindow(Adw.ApplicationWindow):
         self._list = Gtk.ListBox(css_classes=["navigation-sidebar"])
         self._list.connect("row-selected", self._on_row_selected)
         keys = Gtk.ShortcutController()
-        for trigger, handler in (
-            ("Delete|KP_Delete", self._delete_selected),
-            ("F2", self._rename_selected),
-            ("<Shift>F10|Menu", self._menu_selected),
+        for key, handler in (
+            ("delete", self._delete_selected),
+            ("rename", self._rename_selected),
+            ("group-menu", self._menu_selected),
         ):
             keys.add_shortcut(
                 Gtk.Shortcut.new(
-                    Gtk.ShortcutTrigger.parse_string(trigger),
+                    key_trigger(key),
                     Gtk.CallbackAction.new(lambda *_a, h=handler: h() or True),
                 )
             )
@@ -2526,14 +2580,22 @@ class ConfigWindow(Adw.ApplicationWindow):
         """Ask the daemon what each group would grab, edits included: its own
         matching (globs, remapper copies), so the preview cannot disagree."""
         self._preview_timer = 0
-        pages = [(g, self._pages.get(g.key)) for g in self.model.groups]
-        if not self.readable or not pages:
+        if not self.readable or not self.model.groups:
             return False
-        result, error = ask_daemon(
+        self._preview_gen += 1
+        gen = self._preview_gen
+        ask_daemon_async(
+            lambda result, error: self._show_preview(gen, result, error),
             "config_check",
             cmd="check_config",
             toml=render(self.text, self.saved, self.model),
         )
+        return False  # one-shot timer
+
+    def _show_preview(self, gen: int, result: dict | None, error: str | None) -> None:
+        if gen != self._preview_gen:
+            return  # an edit came after this request; its own reply follows
+        pages = [(g, self._pages.get(g.key)) for g in self.model.groups]
         if result is None and "unknown command" in str(error):
             note = "No preview: the kb-kill daemon is older than this window."
         elif result is None:
@@ -2555,7 +2617,6 @@ class ConfigWindow(Adw.ApplicationWindow):
                 name = group.name.strip()
                 page.show_matches(result["matches"].get(name, []), None)
                 page.show_wakeable(result.get("wakeable", {}).get(name))
-        return False  # one-shot timer
 
     def _sync_header(self) -> None:
         on_groups = self._stack.get_visible_child_name() == "groups"
@@ -2830,8 +2891,22 @@ class ConfigWindow(Adw.ApplicationWindow):
         if not overwrite and self._read_text() != self.text:
             self._confirm_overwrite(then)
             return
+        if self._saving:
+            return  # a check is already out; its answer decides
         text = render(self.text, self.saved, self.model)
-        result, error = ask_daemon("config_check", cmd="check_config", toml=text)
+        snapshot = copy.deepcopy(self.model)  # edits made during the check stay unsaved
+        self._saving = True
+        ask_daemon_async(
+            lambda result, error: self._checked(
+                text, snapshot, result, error, then, overwrite
+            ),
+            "config_check",
+            cmd="check_config",
+            toml=text,
+        )
+
+    def _checked(self, text, snapshot, result, error, then, overwrite) -> None:
+        self._saving = False
         if result is None:
             if "unknown command" in str(error):
                 error = "it is older than this window"
@@ -2840,14 +2915,14 @@ class ConfigWindow(Adw.ApplicationWindow):
                 f"The daemon could not check this config: {error}. It is valid TOML, "
                 "but kb-kill may still reject it.",
                 "Save Anyway",
-                lambda: self._commit(text, [], then, overwrite),
+                lambda: self._commit(text, snapshot, [], then, overwrite),
             )
             return
         if not result.get("ok"):
             message = re.sub(r"^config:?\s*", "", str(result.get("error")))
             self.alert("Not Saved", f"kb-kill would reject this config:\n\n{message}")
             return
-        self._commit(text, result.get("warnings") or [], then, overwrite)
+        self._commit(text, snapshot, result.get("warnings") or [], then, overwrite)
 
     def _confirm_overwrite(self, then) -> None:
         """The file changed under unsaved edits: never pick a side silently."""
@@ -2871,7 +2946,10 @@ class ConfigWindow(Adw.ApplicationWindow):
         dialog.connect("response", answered)
         dialog.present(self)
 
-    def _commit(self, text: str, warnings: list[str], then, overwrite=False) -> None:
+    def _commit(
+        self, text: str, snapshot: Model, warnings: list[str], then, overwrite=False
+    ) -> None:
+        """Write `text`, rendered from `snapshot`: that is what is now saved."""
         try:
             tomllib.loads(text)
         except tomllib.TOMLDecodeError as e:  # never write what cannot be read
@@ -2886,9 +2964,13 @@ class ConfigWindow(Adw.ApplicationWindow):
             self.alert("Not Saved", f"Cannot write {self.path}: {e}")
             return
         self.text = text
-        for g in self.model.groups:
+        for g in snapshot.groups:
             g.orig = g.name = g.name.strip()
-        self.saved = copy.deepcopy(self.model)
+        saved_as = {g.key: g.name for g in snapshot.groups}
+        for g in self.model.groups:  # the live copy, possibly edited since
+            if g.key in saved_as:
+                g.orig = saved_as[g.key]
+        self.saved = snapshot
         self.changed()
         if warnings:
             more = f" (+{len(warnings) - 1} more)" if len(warnings) > 1 else ""
@@ -2901,12 +2983,14 @@ class ConfigWindow(Adw.ApplicationWindow):
             then()
 
     def refresh_status(self) -> bool:
-        state, error = ask_daemon("state", cmd="status")
+        ask_daemon_async(self._show_status, "state", cmd="status")
+        return False
+
+    def _show_status(self, state: dict | None, error: str | None) -> None:
         self._status = {g["name"]: g for g in state.get("groups", [])} if state else {}
         if error and self.readable and not self._banner.get_revealed():
             self._show_banner(f"No live status: {error}", "Retry", self.refresh_status)
         self._update_status_rows()
-        return False
 
     def _update_status_rows(self) -> None:
         live = self._status
@@ -2927,9 +3011,20 @@ class ConfigWindow(Adw.ApplicationWindow):
             if row := self._rows.get(g.key):
                 row.set_subtitle(line(g.orig or "", g.orig is not None))
 
-    def device_names(self, cls: str | None) -> tuple[list[tuple[str, str]], str | None]:
-        """(name, subtitle) per distinct device name of a class, for the picker."""
-        reply, error = ask_daemon("devices", cmd="devices", all=True)
+    def device_names(self, cls: str | None, done) -> None:
+        """done(names, error): (name, subtitle) per distinct device name of a
+        class, for the picker, once the daemon has answered."""
+        ask_daemon_async(
+            lambda reply, error: done(*self._device_names(reply, error, cls)),
+            "devices",
+            cmd="devices",
+            all=True,
+        )
+
+    @staticmethod
+    def _device_names(
+        reply: dict | None, error: str | None, cls: str | None
+    ) -> tuple[list[tuple[str, str]], str | None]:
         if reply is None:
             return [], f"No device list: {error}"
         seen: dict[str, str] = {}
@@ -2943,35 +3038,13 @@ class ConfigWindow(Adw.ApplicationWindow):
         return sorted(seen.items(), key=lambda kv: kv[0].lower()), None
 
     # -- file on disk --------------------------------------------------------- #
-    def _watch_config(self) -> Gio.FileMonitor | None:
-        folder = os.path.dirname(os.path.realpath(self.path))
-        try:
-            os.makedirs(folder, exist_ok=True)
-            monitor = Gio.File.new_for_path(folder).monitor_directory(
-                Gio.FileMonitorFlags.WATCH_MOVES, None
-            )
-        except (OSError, GLib.Error):
-            return None
-        monitor.connect("changed", self._on_disk_event)
-        return monitor
-
-    def _on_disk_event(self, _m, file: Gio.File, other: Gio.File | None, _ev) -> None:
-        name = os.path.basename(os.path.realpath(self.path))
-        if name not in (file.get_basename(), other and other.get_basename()):
-            return
-        if self._disk_timer:
-            GLib.source_remove(self._disk_timer)
-        self._disk_timer = GLib.timeout_add(DISK_DEBOUNCE_MS, self._on_disk_changed)
-
-    def _on_disk_changed(self) -> bool:
-        self._disk_timer = 0
+    def _on_disk_changed(self) -> None:
         if self._read_text() == self.text:
-            return False  # our own save, or a touch
+            return  # our own save, or a touch
         if self.dirty():
             self._show_banner("kb-kill.toml changed on disk.", "Reload", self.load)
         else:
             self.load()
-        return False
 
     def _on_tab(self, *_args) -> None:
         self._sync_header()
@@ -3048,82 +3121,64 @@ class ConfigWindow(Adw.ApplicationWindow):
         self.close()
 
 
-SHORTCUTS_UI = """
-<interface>
-  <object class="GtkShortcutsWindow" id="shortcuts">
-    <property name="modal">1</property>
-    <child>
-      <object class="GtkShortcutsSection">
-        <property name="section-name">shortcuts</property>
-        <child>
-          <object class="GtkShortcutsGroup">
-            <property name="title">General</property>
-            <child><object class="GtkShortcutsShortcut">
-              <property name="title">Save Groups</property>
-              <property name="accelerator">&lt;Primary&gt;s</property>
-            </object></child>
-            <child><object class="GtkShortcutsShortcut">
-              <property name="title">Show Keyboard Shortcuts</property>
-              <property name="accelerator">&lt;Primary&gt;question</property>
-            </object></child>
-            <child><object class="GtkShortcutsShortcut">
-              <property name="title">Main Menu</property>
-              <property name="accelerator">F10</property>
-            </object></child>
-            <child><object class="GtkShortcutsShortcut">
-              <property name="title">Close Window</property>
-              <property name="accelerator">&lt;Primary&gt;w</property>
-            </object></child>
-            <child><object class="GtkShortcutsShortcut">
-              <property name="title">Quit</property>
-              <property name="accelerator">&lt;Primary&gt;q</property>
-            </object></child>
-          </object>
-        </child>
-        <child>
-          <object class="GtkShortcutsGroup">
-            <property name="title">Groups</property>
-            <child><object class="GtkShortcutsShortcut">
-              <property name="title">Undo</property>
-              <property name="accelerator">&lt;Primary&gt;z</property>
-            </object></child>
-            <child><object class="GtkShortcutsShortcut">
-              <property name="title">Redo</property>
-              <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;z</property>
-            </object></child>
-            <child><object class="GtkShortcutsShortcut">
-              <property name="title">Rename Group</property>
-              <property name="accelerator">F2</property>
-            </object></child>
-            <child><object class="GtkShortcutsShortcut">
-              <property name="title">Delete Group</property>
-              <property name="accelerator">Delete</property>
-            </object></child>
-            <child><object class="GtkShortcutsShortcut">
-              <property name="title">Group Menu</property>
-              <property name="accelerator">&lt;Shift&gt;F10</property>
-            </object></child>
-          </object>
-        </child>
-      </object>
-    </child>
-  </object>
-</interface>
-"""
+# Every keyboard shortcut, once: (help-window group, title, key). The bindings
+# and the Keyboard Shortcuts window are both made from this.
+KEYS = MappingProxyType(
+    {
+        "save": ("General", "Save Groups", "<Primary>s"),
+        "help": ("General", "Show Keyboard Shortcuts", "<Primary>question"),
+        "menu": ("General", "Main Menu", "F10"),  # GTK's, for the primary menu
+        "close": ("General", "Close Window", "<Primary>w"),
+        "quit": ("General", "Quit", "<Primary>q"),
+        "undo": ("Groups", "Undo", "<Primary>z"),
+        "redo": ("Groups", "Redo", "<Primary><Shift>z"),
+        "rename": ("Groups", "Rename Group", "F2"),
+        "delete": ("Groups", "Delete Group", "Delete"),
+        "group-menu": ("Groups", "Group Menu", "<Shift>F10"),
+    }
+)
+KEY_ALIASES = MappingProxyType({"delete": "KP_Delete", "group-menu": "Menu"})
+
+
+def key_trigger(name: str) -> "Gtk.ShortcutTrigger":
+    """KEYS[name], plus its unlisted alias (keypad Delete, the Menu key)."""
+    keys = [KEYS[name][2], *([KEY_ALIASES[name]] if name in KEY_ALIASES else [])]
+    return Gtk.ShortcutTrigger.parse_string("|".join(keys))
 
 
 def shortcuts_window() -> Gtk.ShortcutsWindow:
-    return Gtk.Builder.new_from_string(SHORTCUTS_UI, -1).get_object("shortcuts")
+    groups: dict[str, list[str]] = {}
+    for section, title, key in KEYS.values():
+        groups.setdefault(section, []).append(
+            "<child><object class='GtkShortcutsShortcut'>"
+            f"<property name='title'>{xml_escape(title)}</property>"
+            f"<property name='accelerator'>{xml_escape(key)}</property>"
+            "</object></child>"
+        )
+    body = "".join(
+        "<child><object class='GtkShortcutsGroup'>"
+        f"<property name='title'>{xml_escape(section)}</property>{''.join(rows)}"
+        "</object></child>"
+        for section, rows in groups.items()
+    )
+    ui = (
+        "<interface><object class='GtkShortcutsWindow' id='shortcuts'>"
+        "<property name='modal'>1</property>"
+        "<child><object class='GtkShortcutsSection'>"
+        f"<property name='section-name'>shortcuts</property>{body}"
+        "</object></child></object></interface>"
+    )
+    return Gtk.Builder.new_from_string(ui, -1).get_object("shortcuts")
 
 
 class ConfigApp(Adw.Application):
     """Single instance: launching it again raises the open window."""
 
     ACCELS = (
-        ("win.save", ["<Primary>s"]),
-        ("win.show-help-overlay", ["<Primary>question"]),
-        ("window.close", ["<Primary>w"]),
-        ("app.quit", ["<Primary>q"]),
+        ("win.save", "save"),
+        ("win.show-help-overlay", "help"),
+        ("window.close", "close"),
+        ("app.quit", "quit"),
     )
 
     def __init__(self) -> None:
@@ -3136,8 +3191,8 @@ class ConfigApp(Adw.Application):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", handler)
             self.add_action(action)
-        for action, accels in self.ACCELS:
-            self.set_accels_for_action(action, accels)
+        for action, key in self.ACCELS:
+            self.set_accels_for_action(action, [KEYS[key][2]])
 
     def do_activate(self) -> None:
         if self._win is None:

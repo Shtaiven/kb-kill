@@ -1017,38 +1017,34 @@ class KbKill:
     def _check_config(self, text: str, uid: int | None = None) -> dict:
         """Parse a candidate config for a settings editor. Nothing reaches the
         journal: warnings and errors go back to the caller only. The live user
-        (or root) also gets `targets`: what each group would grab right now,
-        from the same matching the daemon uses; device names are theirs to
-        see (as with `devices`), not every local uid's."""
+        (or root) also gets `matches` and `wakeable` (see _preview): device
+        names are theirs to see (as with `devices`), not every local uid's."""
         warnings: list[str] = []
+        reply: dict = {"type": "config_check", "warnings": warnings}
         try:
             cfg = load_config_text(text, "config", warnings.append)
         except ConfigError as e:
-            return {
-                "type": "config_check",
-                "ok": False,
-                "error": _safe(e),
-                "warnings": [_safe(w) for w in warnings],
-                "groups": [],
+            reply.update(ok=False, error=_safe(e), groups=[])
+        else:
+            reply.update(ok=True, error=None, groups=self._group_summaries(cfg))
+            if uid in (0, self.live_uid):
+                reply.update(self._preview(cfg))
+        reply["warnings"] = [_safe(w) for w in warnings]
+        return reply
+
+    @staticmethod
+    def _group_summaries(cfg: Config) -> list[dict]:
+        return [
+            {
+                "name": g.name,
+                "label": g.label or g.name,
+                "kill": g.kill_raw,
+                "wake": g.wake_raw,
+                "virtual": g.virtual_label,
+                "start_killed": g.start_killed,
             }
-        return {
-            "type": "config_check",
-            "ok": True,
-            "error": None,
-            "warnings": [_safe(w) for w in warnings],
-            "groups": [
-                {
-                    "name": g.name,
-                    "label": g.label or g.name,
-                    "kill": g.kill_raw,
-                    "wake": g.wake_raw,
-                    "virtual": g.virtual_label,
-                    "start_killed": g.start_killed,
-                }
-                for g in cfg.groups
-            ],
-            **(self._preview(cfg) if uid in (0, self.live_uid) else {}),
-        }
+            for g in cfg.groups
+        ]
 
     def _preview(self, cfg: Config) -> dict:
         """`matches`: per group of `cfg`, the devices it would grab.
@@ -1421,7 +1417,9 @@ class KbKill:
             self._drop_client(conn)
             return
         *lines, rest = (info["buf"] + data).split(b"\n")
-        if len(rest) > MAX_LINE:
+        # Every line, finished or not: one recv can complete a line far longer
+        # than MAX_LINE, which checking only the unfinished tail would pass.
+        if max(map(len, [rest, *lines])) > MAX_LINE:
             CTRL_LOG.emit("control: dropping client (over-long line)", PRI_WARN)
             self._drop_client(conn)
             return

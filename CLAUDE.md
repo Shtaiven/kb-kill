@@ -71,6 +71,12 @@ rebuild the package or re-run `./install.sh`.
   a reconnect or daemon restart does not) and on every re-push (saving is a
   restart). A kill is never carried over, from another user or across a save,
   and `_start` refuses to kill a group whose wake hotkey no device can type.
+- **Untrusted input stays bounded.** Configs from any uid are capped
+  (`MAX_GROUPS`, `MAX_COMBO_TOKENS`, `MAX_LINE`, checked on every line) and
+  `RecursionError` counts as bad input. Clients (`socket_path()` in every
+  script, kept identical) trust `/tmp/kb-kill-<uid>.sock` only if it is a
+  socket they own. The settings window never waits on the daemon on the GTK
+  main loop (`ask_daemon_async`).
 - **No root.** Everything needs only group `input`. Never suggest adding a
   login user to `input`. Any new syscall/path/capability widens the sandbox in
   `services/kb-kill-daemon.service`; do it deliberately.

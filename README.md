@@ -488,6 +488,13 @@ is keylogger-*capable*. The design minimizes and contains that:
   State lines pass a global token bucket (burst 4, then one per 5 s); logged text
   is flattened to one printable line; group names and labels are charset-checked
   so a TOML key containing `\n` cannot forge journal records.
+- **Clients only talk to a socket they can trust.** `/run/kb-kill` (made by
+  systemd) and `$XDG_RUNTIME_DIR` (private to you) are used as found; the `/tmp`
+  fallback of a dev daemon only when you own it, since anyone could otherwise
+  create it, read the config sent to it and answer in the daemon's name.
+- **Any local uid may send a config, so parsing is bounded:** at most 64
+  groups and 16 keys per hotkey, and nesting too deep for the parser is a
+  rejected config, not a crash.
 - **Not root.** The daemon runs as a systemd `DynamicUser` with
   `SupplementaryGroups=input`; that is the whole privilege. Do **not** add your
   login user to group `input`: that would give every process you run the same

@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import socket
+import stat
 import sys
 
 # Rewritten by packaging/bump-version.sh from the repo-root VERSION file.
@@ -17,11 +18,24 @@ VERSION = "0.6.0"
 
 
 def socket_path() -> str:
+    """The daemon's socket. /run/kb-kill (made by systemd) and
+    $XDG_RUNTIME_DIR (private to this user) are used as found. The /tmp
+    fallback of a dev daemon only when this user owns it: anyone can create a
+    file there, and would then read what is sent and answer as the daemon."""
     candidates = ["/run/kb-kill/control.sock"]
     if base := os.environ.get("XDG_RUNTIME_DIR"):
         candidates.append(os.path.join(base, "kb-kill.sock"))
-    candidates.append(f"/tmp/kb-kill-{os.getuid()}.sock")
-    return next((c for c in candidates if os.path.exists(c)), candidates[0])
+    found = next((c for c in candidates if os.path.exists(c)), None)
+    if found:
+        return found
+    tmp = f"/tmp/kb-kill-{os.getuid()}.sock"
+    try:
+        st = os.lstat(tmp)
+        if stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid():
+            return tmp
+    except OSError:
+        pass
+    return candidates[0]
 
 
 class Daemon:
