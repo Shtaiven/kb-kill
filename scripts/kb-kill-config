@@ -1875,7 +1875,6 @@ class DesktopPage(Adw.PreferencesPage):
     def __init__(self, win: "ConfigWindow") -> None:
         super().__init__()
         self._win = win
-        self._combo_rows: list[Adw.ActionRow] = []
         self._backends = [CosmicShortcuts(), GnomeShortcuts(), KdeShortcuts()]
         # Per desktop: its Shortcuts dropdown, the hotkey rows in it, buttons.
         self._status: dict[str, Adw.ExpanderRow] = {}
@@ -1949,7 +1948,7 @@ class DesktopPage(Adw.PreferencesPage):
         remove = Gtk.Button(
             label="Remove", valign=Gtk.Align.CENTER, css_classes=["flat"]
         )
-        apply.set_tooltip_text("Bind every hotkey above to a do-nothing shortcut")
+        apply.set_tooltip_text("Bind each hotkey to a do-nothing shortcut")
         remove.set_tooltip_text("Remove the shortcuts kb-kill added")
         apply.connect("clicked", lambda _b: self._apply(backend))
         remove.connect("clicked", lambda _b: self._remove(backend))
@@ -1961,20 +1960,8 @@ class DesktopPage(Adw.PreferencesPage):
         return status
 
     def refresh(self) -> None:
-        for row in self._combo_rows:
-            self._combos.remove(row)
-        self._combo_rows = []
         wanted = wanted_chords(self._win.saved)
         chords = [c for _s, c in wanted if isinstance(c, Chord)]
-        for spec, chord in wanted:
-            row = Adw.ActionRow(
-                title=GLib.markup_escape_text(spec),
-                subtitle=GLib.markup_escape_text(
-                    "" if isinstance(chord, Chord) else f"Skipped: {chord}"
-                ),
-            )
-            self._combos.add(row)
-            self._combo_rows.append(row)
         self._empty.set_visible(not wanted)
         for section in (self._combos, *self._sections):
             section.set_visible(bool(wanted))
@@ -2010,8 +1997,7 @@ class DesktopPage(Adw.PreferencesPage):
                 summary += f"; {n} already in use" if n > 1 else "; 1 already in use"
             status.set_subtitle(GLib.markup_escape_text(summary))
             for spec, chord in wanted:
-                if isinstance(chord, Chord):
-                    self._add_hotkey_row(status, title, spec, chord, bound, clashes)
+                self._add_hotkey_row(status, title, spec, chord, bound, clashes)
             if clashes and status.get_title() == "Shortcuts":
                 status.set_expanded(True)  # your desktop: show what needs a look
             if isinstance(backend, CosmicShortcuts):
@@ -2028,11 +2014,16 @@ class DesktopPage(Adw.PreferencesPage):
         status: Adw.ExpanderRow,
         title: str,
         spec: str,
-        chord: Chord,
+        chord: Chord | str,
         bound,
         clashes,
     ) -> None:
-        if (clash := clashes.get(chord)) is not None:
+        """One hotkey's state on one desktop; `chord` is the reason, as a str,
+        when no desktop shortcut can express it (a mouse button, a bare key)."""
+        clash = clashes.get(chord) if isinstance(chord, Chord) else None
+        if not isinstance(chord, Chord):
+            state = f"Skipped: {chord}"
+        elif clash is not None:
             state = f"Already in use: {clash.what}"
         elif chord in bound:
             state = "Swallowed"
