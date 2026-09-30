@@ -1877,7 +1877,9 @@ class DesktopPage(Adw.PreferencesPage):
         self._win = win
         self._combo_rows: list[Adw.ActionRow] = []
         self._backends = [CosmicShortcuts(), GnomeShortcuts(), KdeShortcuts()]
-        self._status: dict[str, Adw.ActionRow] = {}
+        # Per desktop: its Shortcuts dropdown, the hotkey rows in it, buttons.
+        self._status: dict[str, Adw.ExpanderRow] = {}
+        self._hotkey_rows: dict[str, list[Adw.ActionRow]] = {}
         self._buttons: dict[str, tuple[Gtk.Button, Gtk.Button]] = {}
 
         self._empty = Adw.PreferencesGroup(visible=False)
@@ -1901,10 +1903,15 @@ class DesktopPage(Adw.PreferencesPage):
         here = current_desktops()
         current = [b for b in self._backends if b.title.split()[0].upper() in here]
         self._sections: list[Adw.PreferencesGroup] = []
-        self._expanders: dict[str, Adw.ExpanderRow] = {}
         others = Adw.PreferencesGroup(title="Other Desktops")
         for backend in self._backends:
-            rows = [self._status_row(backend)]
+            up_front = backend in current or not current
+            # Up front the desktop is the group's title; among the others it
+            # titles the dropdown itself, so no dropdown sits inside another.
+            status = self._status_row(
+                backend, "Shortcuts" if up_front else backend.title
+            )
+            rows: list[Gtk.Widget] = [status]
             if isinstance(backend, CosmicShortcuts):
                 self._float = Adw.SwitchRow(
                     title="Float Settings Window",
@@ -1914,8 +1921,11 @@ class DesktopPage(Adw.PreferencesPage):
                 self._float_handler = self._float.connect(
                     "notify::active", self._on_float
                 )
-                rows.append(self._float)
-            if backend in current or not current:
+                if up_front:
+                    rows.append(self._float)
+                else:
+                    status.add_row(self._float)
+            if up_front:
                 group = Adw.PreferencesGroup(
                     title=backend.title,
                     description="Your current desktop." if current else "",
@@ -1925,17 +1935,14 @@ class DesktopPage(Adw.PreferencesPage):
                 self.add(group)
                 self._sections.append(group)
             else:
-                expander = Adw.ExpanderRow(title=backend.title)
-                for row in rows:
-                    expander.add_row(row)
-                others.add(expander)
-                self._expanders[backend.title] = expander
-        if self._expanders:
+                others.add(status)
+        if len(current) < len(self._backends) and current:
             self.add(others)
             self._sections.append(others)
 
-    def _status_row(self, backend) -> Adw.ActionRow:
-        status = Adw.ActionRow(title="Shortcuts")
+    def _status_row(self, backend, title: str) -> Adw.ExpanderRow:
+        """The desktop's Shortcuts row; open it for each hotkey's state there."""
+        status = Adw.ExpanderRow(title=title)
         apply = Gtk.Button(
             label="Apply", valign=Gtk.Align.CENTER, css_classes=["suggested-action"]
         )
@@ -1949,6 +1956,7 @@ class DesktopPage(Adw.PreferencesPage):
         status.add_suffix(remove)
         status.add_suffix(apply)
         self._status[backend.title] = status
+        self._hotkey_rows[backend.title] = []
         self._buttons[backend.title] = (apply, remove)
         return status
 
@@ -1958,26 +1966,13 @@ class DesktopPage(Adw.PreferencesPage):
         self._combo_rows = []
         wanted = wanted_chords(self._win.saved)
         chords = [c for _s, c in wanted if isinstance(c, Chord)]
-        found = self._conflicts(chords)
         for spec, chord in wanted:
-            if not isinstance(chord, Chord):
-                subtitle, warn = f"Skipped: {chord}", False
-            else:
-                clashes = found.get(chord, [])
-                subtitle = "\n".join(
-                    f"{desktop} already uses it: {what}" for desktop, what in clashes
-                )
-                warn = bool(clashes)
             row = Adw.ActionRow(
                 title=GLib.markup_escape_text(spec),
-                subtitle=GLib.markup_escape_text(subtitle),
+                subtitle=GLib.markup_escape_text(
+                    "" if isinstance(chord, Chord) else f"Skipped: {chord}"
+                ),
             )
-            if warn:
-                icon = Gtk.Image(
-                    icon_name="dialog-warning-symbolic", css_classes=["warning"]
-                )
-                icon.set_tooltip_text("This combo is already a desktop shortcut")
-                row.add_prefix(icon)
             self._combos.add(row)
             self._combo_rows.append(row)
         self._empty.set_visible(not wanted)
@@ -1985,31 +1980,40 @@ class DesktopPage(Adw.PreferencesPage):
             section.set_visible(bool(wanted))
 
         for backend in self._backends:
-            status, (apply, remove) = (
-                self._status[backend.title],
-                self._buttons[backend.title],
-            )
+            title = backend.title
+            status, (apply, remove) = self._status[title], self._buttons[title]
+            for row in self._hotkey_rows[title]:
+                status.remove(row)
+            self._hotkey_rows[title] = []
             why = backend.unavailable()
             if isinstance(backend, CosmicShortcuts):
                 self._float.set_sensitive(why is None)  # never create COSMIC's files
             apply.set_sensitive(why is None and bool(chords))
             remove.set_visible(False)
-            expander = self._expanders.get(backend.title)
             if why:
                 status.set_subtitle(GLib.markup_escape_text(why))
-                if expander:
-                    expander.set_subtitle(GLib.markup_escape_text(why))
+                status.set_enable_expansion(False)  # nothing to show there
                 continue
+            status.set_enable_expansion(True)
             try:
-                n = len(backend.bound(chords) & set(chords))
-                summary = f"{n} of {len(chords)} hotkeys swallowed"
+                bound = backend.bound(chords)
+                clashes = backend.conflicts(chords)
+                summary = (
+                    f"{len(bound & set(chords))} of {len(chords)} hotkeys swallowed"
+                )
                 remove.set_visible(backend.has_own())  # only once there is any
             except (ValueError, OSError, GLib.Error) as e:
-                summary = str(e)
+                bound, clashes, summary = set(), {}, str(e)
                 apply.set_sensitive(False)
+            if clashes:
+                n = len(clashes)
+                summary += f"; {n} already in use" if n > 1 else "; 1 already in use"
             status.set_subtitle(GLib.markup_escape_text(summary))
-            if expander:
-                expander.set_subtitle(GLib.markup_escape_text(summary))
+            for spec, chord in wanted:
+                if isinstance(chord, Chord):
+                    self._add_hotkey_row(status, title, spec, chord, bound, clashes)
+            if clashes and status.get_title() == "Shortcuts":
+                status.set_expanded(True)  # your desktop: show what needs a look
             if isinstance(backend, CosmicShortcuts):
                 self._float.handler_block(self._float_handler)
                 self._float.set_active(backend.floating())
@@ -2019,23 +2023,33 @@ class DesktopPage(Adw.PreferencesPage):
                 "The hotkeys listed are the saved ones; save to include your edits"
             )
 
-    def _conflicts(self, chords: list[Chord]) -> dict[Chord, list[tuple[str, str]]]:
-        """Per combo, (desktop, what uses it), the current desktop first."""
-        here = current_desktops()
-        order = sorted(
-            self._backends, key=lambda b: b.title.split()[0].upper() not in here
+    def _add_hotkey_row(
+        self,
+        status: Adw.ExpanderRow,
+        title: str,
+        spec: str,
+        chord: Chord,
+        bound,
+        clashes,
+    ) -> None:
+        if (clash := clashes.get(chord)) is not None:
+            state = f"Already in use: {clash.what}"
+        elif chord in bound:
+            state = "Swallowed"
+        else:
+            state = "Not swallowed yet"
+        row = Adw.ActionRow(
+            title=GLib.markup_escape_text(spec),
+            subtitle=GLib.markup_escape_text(state),
         )
-        out: dict[Chord, list[tuple[str, str]]] = {}
-        for backend in order:
-            if backend.unavailable():
-                continue
-            try:
-                found = backend.conflicts(chords)
-            except (ValueError, OSError, GLib.Error):
-                continue
-            for chord, clash in found.items():
-                out.setdefault(chord, []).append((backend.title, clash.what))
-        return out
+        if clash is not None:
+            icon = Gtk.Image(
+                icon_name="dialog-warning-symbolic", css_classes=["warning"]
+            )
+            icon.set_tooltip_text("This combo is already a desktop shortcut")
+            row.add_prefix(icon)
+        status.add_row(row)
+        self._hotkey_rows[title].append(row)
 
     def _apply(self, backend) -> None:
         """Clashing hotkeys are the user's call: ask, each off by default."""

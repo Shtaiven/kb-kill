@@ -346,9 +346,11 @@ in the tray) edits both of your files, one tab each:
   over removes your own shortcut for it (COSMIC backs the file up first) or
   takes the combo off the desktop's built-in shortcut; on COSMIC, **Remove**
   gives a built-in back, while on GNOME and KDE you reset it in their settings. Mouse-button combos cannot be desktop shortcuts
-  and are listed as skipped. A warning next to a hotkey names what already uses
-  it on each desktop kb-kill can see (your current one first): your own
-  shortcuts, and the desktop's built-in ones, which a swallow would replace.
+  and are listed as skipped. Each desktop's **Shortcuts** row opens into its
+  hotkeys and their state there: swallowed, not yet, or already in use, with
+  what uses it (your own shortcuts, or the desktop's built-in ones, which a
+  swallow would replace). Your desktop's list opens by itself when a hotkey
+  clashes.
   - COSMIC: entries tagged `description: Some("kb-kill")` in
     `~/.config/cosmic/com.system76.CosmicSettings.Shortcuts/v1/custom` (the file
     is saved to `custom.kb-kill-backup` first). **Float the settings window**
