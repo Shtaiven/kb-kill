@@ -366,6 +366,9 @@ class Osd:
     def _pass_through(win: Gtk.Window) -> None:
         """Empty input region: clicks go to whatever is underneath."""
         try:
+            # cairo.Region reaches GDK only through gi's cairo bridge
+            # (python3-gi-cairo on Debian); without it the card eats clicks.
+            gi.require_foreign("cairo")
             import cairo
 
             win.get_window().input_shape_combine_region(cairo.Region(), 0, 0)

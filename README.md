@@ -116,7 +116,7 @@ installing this on your system; never run scripts you don't trust.
 # Ubuntu / Debian / Pop!_OS
 sudo apt install python3 python3-evdev                                     # daemon
 sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 # tray
-sudo apt install gir1.2-gtklayershell-0.1                                  # tray OSD
+sudo apt install gir1.2-gtklayershell-0.1 python3-gi-cairo                 # tray OSD
 sudo apt install gir1.2-gtk-4.0 gir1.2-adw-1 python3-tomlkit               # settings
 # Fedora
 sudo dnf install python3 python3-evdev                                     # daemon
