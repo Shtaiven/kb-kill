@@ -1910,6 +1910,7 @@ class DesktopPage(Adw.PreferencesPage):
         for backend in self._backends:
             up_front = backend.title in self._current or not self._current
             status = self._status_row(backend, f"{backend.title} Shortcuts")
+            status.set_expanded(backend.title in self._current)  # yours, open
             (front if up_front else others).add(status)
             if isinstance(backend, CosmicShortcuts):
                 self._float = Adw.SwitchRow(
@@ -1990,8 +1991,6 @@ class DesktopPage(Adw.PreferencesPage):
             status.set_subtitle(GLib.markup_escape_text(summary))
             for spec, chord in wanted:
                 self._add_hotkey_row(status, title, spec, chord, bound, clashes)
-            if clashes and title in self._current:
-                status.set_expanded(True)  # your desktop: show what needs a look
             if isinstance(backend, CosmicShortcuts):
                 self._float.handler_block(self._float_handler)
                 self._float.set_active(backend.floating())

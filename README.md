@@ -350,8 +350,7 @@ in the tray) edits both of your files, one tab each:
   Desktop**, the rest under **Other Desktops**) opens into its
   hotkeys and their state there: swallowed, not yet, or already in use, with
   what uses it (your own shortcuts, or the desktop's built-in ones, which a
-  swallow would replace). Your desktop's list opens by itself when a hotkey
-  clashes.
+  swallow would replace). Your desktop's list starts open.
   - COSMIC: entries tagged `description: Some("kb-kill")` in
     `~/.config/cosmic/com.system76.CosmicSettings.Shortcuts/v1/custom` (the file
     is saved to `custom.kb-kill-backup` first). **COSMIC Tiling Exception**
