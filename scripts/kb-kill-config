@@ -2687,7 +2687,18 @@ class ConfigApp(Adw.Application):
     def do_activate(self) -> None:
         if self._win is None:
             self._win = ConfigWindow(self)
+            GLib.idle_add(self._unfocus)
         self._win.present()
+
+    def _unfocus(self) -> bool:
+        """GTK focuses the first entry on map, which selects all its text.
+        Start with nothing focused or selected until a click or Tab."""
+        focus = self._win.get_focus() if self._win else None
+        if isinstance(focus, Gtk.Editable):
+            focus.select_region(0, 0)
+        if self._win:
+            self._win.set_focus(None)
+        return False  # one-shot idle
 
     def _on_about(self, *_args) -> None:
         Adw.AboutDialog(
