@@ -66,9 +66,9 @@ rebuild the package or re-run `./install.sh`.
 - **A grab never outlives its config; a user switch starts awake.**
   `_install_groups` ungrabs first and takes killed state only from `preserve`.
   Every install (`_start`) begins awake apart from the config's own
-  `start_killed` groups: on a session activation (`_track_sessions` arms it when
-  a seat's ACTIVE session changes, including a second session of the same uid;
-  a reconnect or daemon restart does not) and on every re-push (saving is a
+  `start_killed` groups: at login (`_track_sessions` arms a session the first
+  time it is active, including a second session of the same uid; switching back
+  to a known session, a reconnect or a daemon restart does not) and on every re-push (saving is a
   restart). A kill is never carried over, from another user or across a save,
   and `_start` refuses to kill a group whose wake hotkey no device can type.
 - **Untrusted input stays bounded.** Configs from any uid are capped

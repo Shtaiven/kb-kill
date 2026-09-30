@@ -38,9 +38,10 @@
 #       devices   = ...   → keyboards and pointers alike, whichever class
 #   * Optional per group: label = "Laptop keyboard" — a display name the tray
 #     shows instead of the group's table key. Cosmetic only.
-#   * Optional per group: start_killed = true — the group starts killed whenever
-#     your session becomes the active one (login, or switching back to it)
-#     instead of awake. Not inherited. Wake it with its wake_combo as usual.
+#   * Optional per group: start_killed = true — the group starts killed, not
+#     awake, when you log in and whenever this file is saved (not when you
+#     switch back to a running session). Not inherited. Wake it with its
+#     wake_combo as usual.
 #   * TOML rule: top-level keys MUST come before any [groups.*] table.
 #   * Give each group a DISTINCT combo (a shared combo just toggles both groups
 #     together — which is how you kill a physical + a virtual target at once).

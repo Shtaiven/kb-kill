@@ -882,7 +882,7 @@ def group_details(win: "ConfigWindow", group: Group) -> list[Adw.PreferencesGrou
     startup = Adw.PreferencesGroup(title="Startup")
     start = Adw.SwitchRow(
         title="Start killed",
-        subtitle="At login, or when you switch back to this session",
+        subtitle=GroupPage.START_HINT,
         active=group.start_killed,
     )
 
@@ -1002,7 +1002,7 @@ class GroupPage(Adw.PreferencesPage):
 
     CLASS_WORDS = MappingProxyType({"kbd": "keyboard", "ptr": "pointer"})
 
-    START_HINT = "At login, or when you switch back to this session"
+    START_HINT = "At login, and when you save"
 
     def show_wakeable(self, wakeable: bool | None) -> None:
         """Say on the Start killed switch when the wake hotkey cannot be typed:

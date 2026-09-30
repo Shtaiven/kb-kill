@@ -244,6 +244,14 @@ def session_age(sid: str) -> float | None:
     return None
 
 
+def _existing_sessions() -> set[str]:
+    """Every session logind still has, active or not."""
+    try:
+        return {n for n in os.listdir(SESSIONS_DIR) if n.isalnum()}
+    except OSError:
+        return set()
+
+
 def _is_new_session(sid: str) -> bool:
     age = session_age(sid)
     return age is not None and age < START_KILLED_GRACE
@@ -690,10 +698,11 @@ class KbKill:
         self.live_uid: int | None = None
         self.groups: list[Group] = []
         self.forced = config is not None  # -c: pinned live, no arbitration
-        # start_killed fires once per activation of a session (login, or a
-        # switch back to it), never on a re-push or reconnect within one.
+        # start_killed fires once per session, at login: never when a session
+        # is switched back to, nor on a reconnect or daemon restart within it.
         self._sessions: dict[str, int] | None = None  # None: not looked yet
         self._armed: set[str] = set()  # sessions whose start_killed is due
+        self._seen: set[str] = set()  # sessions ever active; they had their login
         if config is not None:
             self.pushed[os.getuid()] = config
             self.live_uid = os.getuid()
@@ -912,14 +921,17 @@ class KbKill:
         self.rescan()
 
     def _track_sessions(self) -> dict[str, int]:
-        """Arm start_killed for each session that just became active."""
+        """Arm start_killed for each session active for the first time: a
+        login. One switched back to was seen before and is not armed again.
+        Already active when the daemon started, only a young session counts
+        (a login at boot rather than a daemon restart)."""
         now = active_sessions()
         first = self._sessions is None
-        for sid in now.keys() - (self._sessions or {}).keys():
-            # Seen becoming active, or already active when the daemon started:
-            # then only a young session is a login rather than a restart.
+        for sid in now.keys() - self._seen:
             if not first or _is_new_session(sid):
                 self._armed.add(sid)
+        self._seen |= now.keys()
+        self._seen &= _existing_sessions() | now.keys()  # forget ended ones
         self._armed &= now.keys()
         self._sessions = now
         return now

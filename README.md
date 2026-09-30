@@ -231,8 +231,8 @@ together. The old name `virtual_keyboard` is accepted as a deprecated alias.
   "default" group, and they now belong in a `[groups.<name>]` table
   (`[groups.default]` keeps the old name).
 - `start_killed = true` (per group, not inherited) starts the group **killed**
-  whenever your session becomes the active one (at login, or when you switch
-  back to it), and whenever the config is saved.
+  when you log in (not when you switch back to a session that is already
+  running), and whenever the config is saved.
 - **Saving is a restart:** every change to the file (kb-kill-push re-sends it)
   starts every group awake again, except the `start_killed` ones, which start
   killed. A daemon or `kb-kill-push` restart mid-session starts everything
