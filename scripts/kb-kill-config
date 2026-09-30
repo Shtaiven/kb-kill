@@ -33,6 +33,7 @@ from types import MappingProxyType
 VERSION = "0.5.1"
 
 APP_ID = "io.github.shtaiven.KbKillConfig"
+APP_NAME = "kb-kill Settings"  # as the launcher names it
 HERE = os.path.dirname(os.path.realpath(__file__))
 SOCKET_TIMEOUT = 3.0
 STATUS_DELAY_MS = 1500  # kb-kill-push notices a save within ~1 s
@@ -497,7 +498,9 @@ def render(text: str, old: Model, new: Model) -> str:
 # Hotkey recorder
 # --------------------------------------------------------------------------- #
 class RecordDialog(Adw.Dialog):
-    """Records the keys (and mouse buttons) held together, then released."""
+    """Records a hotkey the way GNOME Settings does: the keys (and mouse
+    buttons) held together count once they are all let go. Esc on its own
+    cancels, Backspace on its own clears."""
 
     def __init__(self, title: str, on_done) -> None:
         super().__init__(title=title, content_width=440)
@@ -505,29 +508,20 @@ class RecordDialog(Adw.Dialog):
         self._held: set[int] = set()
         self._chord: list[int] = []
 
-        header = Adw.HeaderBar(
-            show_start_title_buttons=False, show_end_title_buttons=False
-        )
-        cancel = Gtk.Button(label="Cancel")
-        cancel.connect("clicked", lambda _b: self.close())
-        header.pack_start(cancel)
-        self._use = Gtk.Button(
-            label="Use", sensitive=False, css_classes=["suggested-action"]
-        )
-        self._use.connect("clicked", self._on_use)
-        header.pack_end(self._use)
-
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
         for side in ("top", "bottom", "start", "end"):
             getattr(box, f"set_margin_{side}")(18)
-        self._shown = Gtk.Label(
-            label="Press the combo…", css_classes=["title-2"], wrap=True
-        )
+        self._shown = Gtk.Label(label=self.PROMPT, css_classes=["title-2"], wrap=True)
         box.append(self._shown)
+        box.append(
+            Gtk.Label(
+                label="Press Esc to cancel or Backspace to clear.",
+                css_classes=["dim-label"],
+            )
+        )
 
         pad = Gtk.Label(
-            label="Click here to add a mouse button\n(hold one to combine it with others)",
-            justify=Gtk.Justification.CENTER,
+            label="Click here to add a mouse button",
             css_classes=["card", "dim-label"],
             height_request=72,
         )
@@ -538,13 +532,10 @@ class RecordDialog(Adw.Dialog):
         box.append(pad)
 
         self._pin = Gtk.CheckButton(label="Only the side I pressed (lctrl, not ctrl)")
-        self._pin.connect("toggled", lambda _b: self._render())
         box.append(self._pin)
         box.append(
             Gtk.Label(
-                label="A combo kb-kill already uses fires as you press it. "
-                "The desktop may keep some combos (often Super) to itself. "
-                "Escape on its own cancels.",
+                label="A hotkey kb-kill already uses fires as you press it.",
                 wrap=True,
                 xalign=0,
                 css_classes=["dim-label", "caption"],
@@ -552,7 +543,7 @@ class RecordDialog(Adw.Dialog):
         )
 
         view = Adw.ToolbarView()
-        view.add_top_bar(header)
+        view.add_top_bar(Adw.HeaderBar())
         view.set_content(box)
         self.set_child(view)
 
@@ -561,24 +552,35 @@ class RecordDialog(Adw.Dialog):
         keys.connect("key-released", self._on_key_released)
         self.add_controller(keys)
 
+    PROMPT = "Press a hotkey…"
+
     def _press(self, code: int) -> None:
         if not self._held:
             self._chord = []  # a fresh chord once everything was let go
         self._held.add(code)
         if code not in self._chord:
             self._chord.append(code)
-        self._render()
+        self._shown.set_label(self._text() or self.PROMPT)
+
+    def _release(self, code: int) -> None:
+        self._held.discard(code)
+        # Modifiers alone are no hotkey: wait for a key or button with them.
+        if not self._held and any(c not in _SIDED for c in self._chord):
+            self._finish(self._text())
 
     def _on_key_pressed(self, _ctl, _keyval: int, keycode: int, _state) -> bool:
         code = keycode - XKB_OFFSET
-        if code == ecodes.KEY_ESC and not self._held:
+        if not self._held and code == ecodes.KEY_ESC:
             self.close()
-            return True
-        self._press(code)
+        elif not self._held and code == ecodes.KEY_BACKSPACE:
+            self._finish("")
+        else:
+            self._press(code)
         return True
 
     def _on_key_released(self, _ctl, _keyval: int, keycode: int, _state) -> None:
-        self._held.discard(keycode - XKB_OFFSET)
+        if keycode - XKB_OFFSET in self._held:
+            self._release(keycode - XKB_OFFSET)
 
     def _on_click(
         self, gesture: Gtk.GestureClick, _n: int, _x: float, _y: float, down: bool
@@ -588,18 +590,14 @@ class RecordDialog(Adw.Dialog):
             return
         if down:
             self._press(code)
-        else:
-            self._held.discard(code)
+        elif code in self._held:
+            self._release(code)
 
     def _text(self) -> str:
         return combo_text(self._chord, self._pin.get_active())
 
-    def _render(self) -> None:
-        self._shown.set_label(self._text() or "Press the combo…")
-        self._use.set_sensitive(bool(self._chord))
-
-    def _on_use(self, _b) -> None:
-        self._on_done(self._text())
+    def _finish(self, text: str) -> None:
+        self._on_done(text)
         self.close()
 
 
@@ -607,14 +605,14 @@ class RecordDialog(Adw.Dialog):
 # Group editing widgets
 # --------------------------------------------------------------------------- #
 MATCHER_INFO = {
-    "keyboards": ("Keyboards", "Keyboard-class devices only", "kbd"),
-    "pointers": ("Pointers", "Mice, trackballs and touchpads", "ptr"),
-    "devices": ("Any device", "Any input device, whatever its class", None),
+    "keyboards": ("Keyboards", "Keyboard-class devices, by name or glob", "kbd"),
+    "pointers": ("Pointers", "Mice, trackballs and touchpads, by name or glob", "ptr"),
+    "devices": ("Any Device", "Any input device, by name or glob", None),
 }
 VIRTUAL_CHOICES = [
     ("auto", "Auto", "Target the forwarded copy of anything input-remapper fronts"),
-    ("true", "Virtual devices only", "Never grab a physical device"),
-    ("false", "Exactly as matched", "Grab what the patterns name, fronted or not"),
+    ("true", "Virtual Devices Only", "Never grab a physical device"),
+    ("false", "Exactly as Matched", "Grab what the patterns name, fronted or not"),
 ]
 
 
@@ -625,26 +623,30 @@ def _entry_error(row: Gtk.Widget, bad: bool) -> None:
         row.remove_css_class("error")
 
 
-def clear_button(tooltip: str, on_clicked) -> Gtk.Button:
-    """The one clear control every editable row uses."""
+def icon_button(icon: str, tooltip: str, on_clicked, css=("flat",)) -> Gtk.Button:
+    """An icon-only button; a tooltip is no accessible name in GTK 4, so the
+    same text is set as the button's label for screen readers."""
     button = Gtk.Button(
-        icon_name="edit-clear-symbolic", css_classes=["flat"], valign=Gtk.Align.CENTER
+        icon_name=icon,
+        tooltip_text=tooltip,
+        css_classes=list(css),
+        valign=Gtk.Align.CENTER,
     )
-    button.set_tooltip_text(tooltip)
+    button.update_property([Gtk.AccessibleProperty.LABEL], [tooltip])
     button.connect("clicked", lambda _b: on_clicked())
     return button
+
+
+def clear_button(tooltip: str, on_clicked) -> Gtk.Button:
+    """The one clear control every editable row uses."""
+    return icon_button("edit-clear-symbolic", tooltip, on_clicked)
 
 
 def remove_button(tooltip: str, on_clicked) -> Gtk.Button:
     """A flat x that takes the whole row away, unlike clear_button's <x| on a field."""
-    button = Gtk.Button(
-        icon_name="window-close-symbolic",
-        css_classes=["flat", "circular"],
-        valign=Gtk.Align.CENTER,
+    return icon_button(
+        "window-close-symbolic", tooltip, on_clicked, css=("flat", "circular")
     )
-    button.set_tooltip_text(tooltip)
-    button.connect("clicked", lambda _b: on_clicked())
-    return button
 
 
 class MatcherList(Adw.PreferencesGroup):
@@ -655,17 +657,15 @@ class MatcherList(Adw.PreferencesGroup):
         super().__init__(title=title, description=description)
         self._win, self._group, self._field = win, group, field_name
         self._rows: list[Adw.EntryRow] = []
-        add = Gtk.Button(
-            icon_name="list-add-symbolic", css_classes=["flat"], valign=Gtk.Align.CENTER
+        add = icon_button(
+            "list-add-symbolic", f"Add to {title}", lambda: self._on_add(add)
         )
-        add.set_tooltip_text("Add a device or pattern")
-        add.connect("clicked", self._on_add)
         self.set_header_suffix(add)
         for value in getattr(group, field_name):
             self._add_row(value)
 
     def _add_row(self, value: str, focus: bool = False) -> None:
-        row = Adw.EntryRow(title="Device name or glob (*, ?, [..], {a,b})", text=value)
+        row = Adw.EntryRow(title="Device", text=value)
         row.add_suffix(remove_button("Remove this pattern", lambda: self._remove(row)))
         row.connect("changed", lambda _r: self._store())
         self.add(row)
@@ -692,7 +692,9 @@ class MatcherList(Adw.PreferencesGroup):
         )
         rows.append(
             Adw.ActionRow(
-                title="Name or pattern…", subtitle="Type it yourself", activatable=True
+                title="Name or Pattern…",
+                subtitle="Type it yourself, glob wildcards allowed",
+                activatable=True,
             )
         )
         names, error = self._win.device_names(self._cls)
@@ -775,9 +777,9 @@ class ComboRow(Adw.EntryRow):
             return
         inherited = self._inherited().strip()
         self.set_title(
-            f"{self._title} (inherits {GLib.markup_escape_text(inherited)})"
+            f"{self._title} · Default {GLib.markup_escape_text(inherited)}"
             if inherited
-            else f"{self._title} (required: none set here or in Defaults)"
+            else f"{self._title} · Required"
         )
 
 
@@ -786,9 +788,8 @@ def group_details(win: "ConfigWindow", group: Group) -> list[Adw.PreferencesGrou
     out: list[Adw.PreferencesGroup] = [MatcherList(win, group, m) for m in MATCH_KEYS]
     startup = Adw.PreferencesGroup(title="Startup")
     start = Adw.SwitchRow(
-        title="Start KILLED",
-        subtitle="Whenever your session becomes the active one: at login, "
-        "or when you switch back to it. Wake it with its wake hotkey.",
+        title="Start Killed",
+        subtitle="At login, or when you switch back to this session",
         active=group.start_killed,
     )
 
@@ -801,7 +802,7 @@ def group_details(win: "ConfigWindow", group: Group) -> list[Adw.PreferencesGrou
     out.append(startup)
     advanced = Adw.PreferencesGroup(title="Remappers")
     choice = Adw.ComboRow(
-        title="Remapped devices",
+        title="Remapped Devices",
         model=Gtk.StringList.new([label for _v, label, _s in VIRTUAL_CHOICES]),
     )
     values = [v for v, _l, _s in VIRTUAL_CHOICES]
@@ -819,31 +820,18 @@ def group_details(win: "ConfigWindow", group: Group) -> list[Adw.PreferencesGrou
     return out
 
 
-def label_row(win: "ConfigWindow", group: Group) -> Adw.EntryRow:
-    row = Adw.EntryRow(title="Label shown in the tray (optional)", text=group.label)
-
-    def edited(r) -> None:
-        group.label = r.get_text()
-        _entry_error(r, not label_ok(group.label.strip()))
-        win.changed()
-        win.retitle(group)
-
-    row.connect("changed", edited)
-    return row
-
-
 class GroupPage(Adw.PreferencesPage):
     def __init__(self, win: "ConfigWindow", group: Group) -> None:
         super().__init__()
         self._win, self._group = win, group
-        basics = Adw.PreferencesGroup(title="Group")
-        name = Adw.EntryRow(
-            title="Name (letters, digits, space, . _ -)", text=group.name
-        )
-        name.connect("changed", self._on_rename)
-        basics.add(name)
-        basics.add(label_row(win, group))
-        self.add(basics)
+        self._basics = Adw.PreferencesGroup(title="Group", description=self.HINT)
+        self._name = Adw.EntryRow(title="Name", text=group.name)
+        self._name.connect("changed", self._on_rename)
+        self._label = Adw.EntryRow(title="Label", text=group.label)
+        self._label.connect("changed", self._on_label)
+        self._basics.add(self._name)
+        self._basics.add(self._label)
+        self.add(self._basics)
 
         hotkeys = Adw.PreferencesGroup(
             title="Hotkeys",
@@ -852,14 +840,14 @@ class GroupPage(Adw.PreferencesPage):
         self._combos = [
             ComboRow(
                 win,
-                "Kill hotkey",
+                "Kill Hotkey",
                 lambda: group.kill,
                 lambda v: setattr(group, "kill", v),
                 lambda: win.model.kill,
             ),
             ComboRow(
                 win,
-                "Wake hotkey",
+                "Wake Hotkey",
                 lambda: group.wake,
                 lambda v: setattr(group, "wake", v),
                 lambda: win.model.wake,
@@ -873,7 +861,7 @@ class GroupPage(Adw.PreferencesPage):
 
         danger = Adw.PreferencesGroup()
         delete = Gtk.Button(
-            label="Delete group",
+            label="Delete Group",
             halign=Gtk.Align.CENTER,
             css_classes=["destructive-action", "pill"],
         )
@@ -886,15 +874,37 @@ class GroupPage(Adw.PreferencesPage):
         taken = {g.name.strip() for g in self._win.model.groups if g is not self._group}
         return bool(GROUP_NAME_RE.match(name)) and name not in taken
 
+    HINT = "The tray shows the label, or the name if there is none."
+
+    def _describe(self) -> None:
+        """The rules only show up once a value breaks them."""
+        problems = []
+        if not self._name_ok(self._name.get_text()):
+            problems.append(
+                "A name is up to 32 letters, digits, spaces, dots, underscores "
+                "or hyphens, and no other group may have it."
+            )
+        if not label_ok(self._label.get_text().strip()):
+            problems.append("A label is up to 64 printable characters.")
+        self._basics.set_description(" ".join(problems) or self.HINT)
+
     def _on_rename(self, row: Adw.EntryRow) -> None:
         """A name that is invalid or taken stays red and is not taken on."""
         name = row.get_text().strip()
         ok = self._name_ok(name)
         _entry_error(row, not ok)
+        self._describe()
         if ok:
             self._group.name = name
             self._win.changed()
             self._win.retitle(self._group)
+
+    def _on_label(self, row: Adw.EntryRow) -> None:
+        self._group.label = row.get_text()
+        _entry_error(row, not label_ok(self._group.label.strip()))
+        self._describe()
+        self._win.changed()
+        self._win.retitle(self._group)
 
     def refresh(self) -> None:
         for row in self._combos:
@@ -909,19 +919,19 @@ class TopPage(Adw.PreferencesPage):
         self._win = win
         model = win.model
         hotkeys = Adw.PreferencesGroup(
-            title="Default hotkeys",
+            title="Default Hotkeys",
             description="Used by every group that does not set its own.",
         )
         self._combos = [
             ComboRow(
                 win,
-                "Kill hotkey",
+                "Kill Hotkey",
                 lambda: model.kill,
                 lambda v: setattr(model, "kill", v),
             ),
             ComboRow(
                 win,
-                "Wake hotkey",
+                "Wake Hotkey",
                 lambda: model.wake,
                 lambda v: setattr(model, "wake", v),
             ),
@@ -974,8 +984,8 @@ class TrayPage(Adw.PreferencesPage):
 
         startup = Adw.PreferencesGroup(title="Startup")
         self._at_login = Adw.SwitchRow(
-            title="Start the tray when I log in",
-            subtitle="Just for you; other users keep their own setting.",
+            title="Start at Login",
+            subtitle="Start the tray when you log in; just for you",
         )
         state = tray_at_login()
         self._at_login.set_active(bool(state))
@@ -987,26 +997,24 @@ class TrayPage(Adw.PreferencesPage):
         self.add(startup)
 
         osd = Adw.PreferencesGroup(
-            title="On-screen display",
-            description="Flashed near the bottom of the screen whenever a group turns KILLED or AWAKE.",
+            title="On-Screen Display",
+            description="Shown when a group is killed or woken.",
         )
-        self._enabled = Adw.SwitchRow(title="Show on-screen display", active=enabled)
+        self._enabled = Adw.SwitchRow(title="Show On-Screen Display", active=enabled)
         osd.add(self._enabled)
         self.add(osd)
 
         look = Adw.PreferencesGroup(
             title="Appearance",
-            description="GNOME and KDE draw their own OSD, so these apply only to the "
-            "one kb-kill draws itself (COSMIC, sway and other wlroots desktops). "
-            "Colours, font and corner radius come from the desktop. The tray shows "
-            "a preview after each change.",
+            description="For the display kb-kill draws itself (COSMIC, wlroots); "
+            "GNOME and KDE draw their own.",
         )
         self._margin = Adw.SpinRow.new_with_range(0, OSD_MARGIN_MAX, 1)
-        self._margin.set_title("Distance from the bottom edge")
+        self._margin.set_title("Distance From Bottom")
         self._margin.set_subtitle("Pixels; keep it clear of a dock")
         self._margin.set_value(margin)
         self._opacity = Adw.SpinRow.new_with_range(0.0, 1.0, 0.01)
-        self._opacity.set_title("Background opacity")
+        self._opacity.set_title("Background Opacity")
         self._opacity.set_subtitle("0 is clear, 1 is solid")
         self._opacity.set_digits(2)
         self._opacity.set_value(opacity)
@@ -1023,7 +1031,7 @@ class TrayPage(Adw.PreferencesPage):
         if self._loading:
             return
         if error := set_tray_at_login(row.get_active()):
-            self._win.alert("Tray startup not changed", error)
+            self._win.alert("Tray Startup Not Changed", error)
             self._loading = True
             row.set_active(bool(tray_at_login()))
             self._loading = False
@@ -1833,12 +1841,9 @@ class DesktopPage(Adw.PreferencesPage):
         self._buttons: dict[str, tuple[Gtk.Button, Gtk.Button]] = {}
 
         self._combos = Adw.PreferencesGroup(
-            title="Keep hotkeys away from apps",
-            description="kb-kill reads the keyboard itself, so its hotkeys also reach "
-            "the app in front (a terminal prints a keycode for ctrl+alt+shift+k). "
-            "A desktop shortcut that does nothing takes them first; kb-kill still "
-            "sees them and works as before. These are the hotkeys in the saved "
-            "config:",
+            title="Keep Hotkeys Away From Apps",
+            description="A do-nothing desktop shortcut stops a hotkey reaching the "
+            "app in front; kb-kill still sees it.",
         )
         self.add(self._combos)
 
@@ -1867,8 +1872,8 @@ class DesktopPage(Adw.PreferencesPage):
             self._buttons[backend.title] = (apply, remove)
             if isinstance(backend, CosmicShortcuts):
                 self._float = Adw.SwitchRow(
-                    title="Float the settings window",
-                    subtitle="Instead of tiling it. Takes effect the next time the window opens.",
+                    title="Float Settings Window",
+                    subtitle="Instead of tiling it, from the next time it opens",
                     sensitive=False,  # until refresh() finds COSMIC
                 )
                 self._float_handler = self._float.connect(
@@ -1906,7 +1911,7 @@ class DesktopPage(Adw.PreferencesPage):
             self._combos.add(row)
             self._combo_rows.append(row)
         if not wanted:
-            row = Adw.ActionRow(title="No hotkeys saved yet")
+            row = Adw.ActionRow(title="No Saved Hotkeys")
             self._combos.add(row)
             self._combo_rows.append(row)
 
@@ -1968,14 +1973,14 @@ class DesktopPage(Adw.PreferencesPage):
         try:
             clashes = backend.conflicts(chords)
         except (ValueError, OSError, GLib.Error) as e:
-            self._win.alert("Shortcuts not applied", str(e))
+            self._win.alert("Shortcuts Not Applied", str(e))
             return
         if not clashes:
             self._run_apply(backend, chords, set())
             return
 
         dialog = Adw.AlertDialog(
-            heading="Some hotkeys are already in use",
+            heading="Hotkeys Already in Use",
             body=f"{backend.title} already uses these combos. Turn on the ones kb-kill "
             "should take over; the rest are skipped and keep reaching apps.",
         )
@@ -2011,13 +2016,13 @@ class DesktopPage(Adw.PreferencesPage):
         try:
             report = backend.apply(chords, take)
         except (ValueError, OSError, GLib.Error) as e:
-            self._win.alert("Shortcuts not applied", str(e))
+            self._win.alert("Shortcuts Not Applied", str(e))
             return
         self.refresh()
         text = f"{report.bound} of {len(chords)} hotkeys swallowed by {backend.title}."
         if report.notes:
             self._win.alert(
-                "Shortcuts applied", text + "\n\n" + "\n".join(report.notes)
+                "Shortcuts Applied", text + "\n\n" + "\n".join(report.notes)
             )
         else:
             self._win.toast(text)
@@ -2026,7 +2031,7 @@ class DesktopPage(Adw.PreferencesPage):
         try:
             backend.remove()
         except (ValueError, OSError, GLib.Error) as e:
-            self._win.alert("Shortcuts not removed", str(e))
+            self._win.alert("Shortcuts Not Removed", str(e))
             return
         self.refresh()
         self._win.toast(f"Removed kb-kill's {backend.title} shortcuts")
@@ -2036,7 +2041,7 @@ class DesktopPage(Adw.PreferencesPage):
         try:
             cosmic.set_floating(row.get_active())
         except (ValueError, OSError) as e:
-            self._win.alert("Window rule not changed", str(e))
+            self._win.alert("Window Rule Not Changed", str(e))
 
 
 # --------------------------------------------------------------------------- #
@@ -2046,7 +2051,7 @@ class ConfigWindow(Adw.ApplicationWindow):
     def __init__(self, app: Adw.Application) -> None:
         super().__init__(
             application=app,
-            title="kb-kill settings",
+            title=APP_NAME,
             default_width=920,
             default_height=680,
         )
@@ -2090,13 +2095,26 @@ class ConfigWindow(Adw.ApplicationWindow):
         self._revert = Gtk.Button(label="Revert")
         self._revert.connect("clicked", lambda _b: self.revert())
         header.pack_start(self._revert)
-        menu = Gio.Menu()
-        menu.append(f"Open {os.path.basename(self.path)}…", "win.open-groups-text")
-        menu.append(
+        files = Gio.Menu()
+        files.append(f"Open {os.path.basename(self.path)}…", "win.open-groups-text")
+        files.append(
             f"Open {os.path.basename(tray_config_path())}…", "win.open-tray-text"
         )
-        menu.append("Reload from disk", "win.reload")
-        header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu))
+        files.append("Reload From Disk", "win.reload")
+        about = Gio.Menu()
+        about.append("Keyboard Shortcuts", "win.show-help-overlay")
+        about.append("About kb-kill", "app.about")
+        menu = Gio.Menu()
+        menu.append_section(None, files)
+        menu.append_section(None, about)
+        header.pack_end(
+            Gtk.MenuButton(
+                icon_name="open-menu-symbolic",
+                menu_model=menu,
+                primary=True,
+                tooltip_text="Main Menu",
+            )
+        )
         self._save = Gtk.Button(label="Save", css_classes=["suggested-action"])
         self._save.connect("clicked", lambda _b: self.save())
         header.pack_end(self._save)
@@ -2104,10 +2122,13 @@ class ConfigWindow(Adw.ApplicationWindow):
             ("open-groups-text", self._open_groups_text),
             ("open-tray-text", lambda *_: self._tray.open_text()),
             ("reload", self._reload),
+            ("save", lambda *_: self.save()),
         ):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", handler)
             self.add_action(action)
+        self._save_action = self.lookup_action("save")
+        self.set_help_overlay(shortcuts_window())
 
         self._banner = Adw.Banner(use_markup=False)  # titles quote config text
         self._banner.connect(
@@ -2202,7 +2223,8 @@ class ConfigWindow(Adw.ApplicationWindow):
         for button in (self._save, self._revert):
             button.set_visible(on_groups)
             button.set_sensitive(dirty and self.readable)
-        self.set_title("• kb-kill settings" if dirty else "kb-kill settings")
+        self._save_action.set_enabled(dirty and self.readable)
+        self.set_title(f"• {APP_NAME}" if dirty else APP_NAME)
 
     def add_group(self) -> None:
         taken = {g.name for g in self.model.groups}
@@ -2215,9 +2237,24 @@ class ConfigWindow(Adw.ApplicationWindow):
         self.changed()
 
     def delete_group(self, group: Group) -> None:
-        self.model.groups.remove(group)
+        """Undo from the toast instead of asking first (GNOME HIG)."""
+        model, index = self.model, self.model.groups.index(group)
+        model.groups.remove(group)
         self._rebuild(select="top")
         self.changed()
+        name = group.label.strip() or group.name.strip()
+        toast = Adw.Toast(
+            title=GLib.markup_escape_text(f"Deleted {name}"), button_label="Undo"
+        )
+
+        def undo(_t) -> None:
+            if self.model is model and group not in model.groups:  # not reloaded
+                model.groups.insert(min(index, len(model.groups)), group)
+                self._rebuild(select=group.key)
+                self.changed()
+
+        toast.connect("button-clicked", undo)
+        self._toasts.add_toast(toast)
 
     # -- load / save ---------------------------------------------------------- #
     def _read_text(self) -> str:
@@ -2246,7 +2283,7 @@ class ConfigWindow(Adw.ApplicationWindow):
                 else f"kb-kill.toml is not valid TOML ({e})"
             )
             self._show_banner(
-                f"{problem}. Fix it as text.", "Open as text", self._open_groups_text
+                f"{problem}. Fix it as text.", "Open as Text", self._open_groups_text
             )
         self.model = copy.deepcopy(self.saved)
         self._groups_view.set_sensitive(self.readable)
@@ -2269,23 +2306,23 @@ class ConfigWindow(Adw.ApplicationWindow):
         result, error = ask_daemon("config_check", cmd="check_config", toml=text)
         if result is None:
             self._confirm(
-                "Save without checking?",
+                "Save Without Checking?",
                 f"The daemon could not check this config: {error}. It is valid TOML, "
                 "but kb-kill may still reject it.",
-                "Save anyway",
+                "Save Anyway",
                 lambda: self._commit(text, [], then),
             )
             return
         if not result.get("ok"):
             message = re.sub(r"^config:?\s*", "", str(result.get("error")))
-            self.alert("Not saved", f"kb-kill would reject this config:\n\n{message}")
+            self.alert("Not Saved", f"kb-kill would reject this config:\n\n{message}")
             return
         self._commit(text, result.get("warnings") or [], then)
 
     def _confirm_overwrite(self, then) -> None:
         """The file changed under unsaved edits: never pick a side silently."""
         dialog = Adw.AlertDialog(
-            heading="kb-kill.toml changed on disk",
+            heading="Config Changed on Disk",
             body="It was edited outside this window after you opened it. "
             "Overwrite it with your edits, or reload it and drop them?",
         )
@@ -2308,7 +2345,7 @@ class ConfigWindow(Adw.ApplicationWindow):
         try:
             write_atomic(self.path, text)
         except OSError as e:
-            self.alert("Not saved", f"Cannot write {self.path}: {e}")
+            self.alert("Not Saved", f"Cannot write {self.path}: {e}")
             return
         self.text = text
         for g in self.model.groups:
@@ -2342,7 +2379,7 @@ class ConfigWindow(Adw.ApplicationWindow):
             g = live.get(name)
             if g is None:
                 return ""
-            killed = "KILLED" if g.get("killed") else "AWAKE"
+            killed = "Killed" if g.get("killed") else "Awake"
             n = g.get("targets", 0)
             return f"{killed} · {n} device{'s' if n != 1 else ''}"
 
@@ -2431,7 +2468,7 @@ class ConfigWindow(Adw.ApplicationWindow):
 
     def alert(self, heading: str, body: str) -> None:
         dialog = Adw.AlertDialog(heading=heading, body=body)
-        dialog.add_response("ok", "OK")
+        dialog.add_response("close", "Close")
         dialog.present(self)
 
     def _confirm(self, heading: str, body: str, yes: str, then) -> None:
@@ -2447,7 +2484,7 @@ class ConfigWindow(Adw.ApplicationWindow):
         if self._closing or not self.dirty():
             return False
         dialog = Adw.AlertDialog(
-            heading="Save changes?", body="Your group and hotkey edits are not saved."
+            heading="Save Changes?", body="Your group and hotkey edits are not saved."
         )
         dialog.add_response("cancel", "Cancel")
         dialog.add_response("discard", "Discard")
@@ -2472,17 +2509,93 @@ class ConfigWindow(Adw.ApplicationWindow):
         self.close()
 
 
+SHORTCUTS_UI = """
+<interface>
+  <object class="GtkShortcutsWindow" id="shortcuts">
+    <property name="modal">1</property>
+    <child>
+      <object class="GtkShortcutsSection">
+        <property name="section-name">shortcuts</property>
+        <child>
+          <object class="GtkShortcutsGroup">
+            <property name="title">General</property>
+            <child><object class="GtkShortcutsShortcut">
+              <property name="title">Save Groups</property>
+              <property name="accelerator">&lt;Primary&gt;s</property>
+            </object></child>
+            <child><object class="GtkShortcutsShortcut">
+              <property name="title">Show Keyboard Shortcuts</property>
+              <property name="accelerator">&lt;Primary&gt;question</property>
+            </object></child>
+            <child><object class="GtkShortcutsShortcut">
+              <property name="title">Main Menu</property>
+              <property name="accelerator">F10</property>
+            </object></child>
+            <child><object class="GtkShortcutsShortcut">
+              <property name="title">Close Window</property>
+              <property name="accelerator">&lt;Primary&gt;w</property>
+            </object></child>
+            <child><object class="GtkShortcutsShortcut">
+              <property name="title">Quit</property>
+              <property name="accelerator">&lt;Primary&gt;q</property>
+            </object></child>
+          </object>
+        </child>
+      </object>
+    </child>
+  </object>
+</interface>
+"""
+
+
+def shortcuts_window() -> Gtk.ShortcutsWindow:
+    return Gtk.Builder.new_from_string(SHORTCUTS_UI, -1).get_object("shortcuts")
+
+
 class ConfigApp(Adw.Application):
     """Single instance: launching it again raises the open window."""
+
+    ACCELS = (
+        ("win.save", ["<Primary>s"]),
+        ("win.show-help-overlay", ["<Primary>question"]),
+        ("window.close", ["<Primary>w"]),
+        ("app.quit", ["<Primary>q"]),
+    )
 
     def __init__(self) -> None:
         super().__init__(application_id=APP_ID)
         self._win: ConfigWindow | None = None
 
+    def do_startup(self) -> None:
+        Adw.Application.do_startup(self)
+        for name, handler in (("about", self._on_about), ("quit", self._on_quit)):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", handler)
+            self.add_action(action)
+        for action, accels in self.ACCELS:
+            self.set_accels_for_action(action, accels)
+
     def do_activate(self) -> None:
         if self._win is None:
             self._win = ConfigWindow(self)
         self._win.present()
+
+    def _on_about(self, *_args) -> None:
+        Adw.AboutDialog(
+            application_name="kb-kill",
+            application_icon="kb-kill-awake",
+            developer_name="Steven Eisinger",
+            version=VERSION,
+            website="https://github.com/Shtaiven/kb-kill",
+            issue_url="https://github.com/Shtaiven/kb-kill/issues",
+            license_type=Gtk.License.MIT_X11,
+            copyright="© Steven Eisinger",
+        ).present(self._win)
+
+    def _on_quit(self, *_args) -> None:
+        """Through the window, so unsaved edits still get their prompt."""
+        if self._win is not None:
+            self._win.close()
 
 
 def main() -> int:

@@ -315,7 +315,8 @@ in the tray) edits both of your files, one tab each:
   every group inherits; each `[groups.*]` table has its own page. The **×** on
   a group's hotkey clears it, so the group falls back to the default. **+** next to a matcher lists the devices the daemon
   sees (of that class) and inserts the exact name; you can also type a glob.
-  **Record** captures a hotkey from the keys and mouse buttons you hold together.
+  **Record** captures a hotkey from the keys and mouse buttons you hold together,
+  once you let go (as in GNOME Settings): Esc cancels, Backspace clears.
   **Save** first sends the new file to the daemon's own parser
   (`check_config`). A config it would reject is not written, and you get the
   reason instead of a line in the journal. A config it accepts replaces the
