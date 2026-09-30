@@ -65,7 +65,10 @@ see [Install from a checkout](#install-from-a-checkout).
   inherits. A rejected config is reported in your own journal
   (`journalctl --user -u kb-kill-push`) and in the settings window.
 - **Saving the config is a restart:** every group starts awake again, except
-  the ones marked `start_killed`.
+  the ones marked `start_killed`. 0.5 kept whatever was killed across a save.
+- **Sleep, lid close, lock and switching back keep state.** 0.5 woke every
+  group whenever the seat's active user changed, which logind reports across
+  suspend and lock; now each user gets back exactly what they had killed.
 - Journal, `kb-kill-monitor` and `kb-kill-detect` now say `killed` / `awake`
   in lower case.
 - New: the settings window (`kb-kill-config`), with desktop shortcuts that keep
