@@ -13,7 +13,7 @@ swallowed **except** the **wake** hotkey, so a killed keyboard can always wake
 itself. There is no way to lock yourself out.
 
 It works for **mice and touchpads** too: a group can target pointing devices
-(`pointers`) or any input device (`devices`), and even a keyboard and a mouse
+(`pointers`) or both kinds at once (`devices`), and even a keyboard and a mouse
 together. A killed pointer self-wakes with a mouse-button combo, or you wake it
 from the keyboard. See [Configuration](#configuration).
 
@@ -187,7 +187,7 @@ metacharacter is a **glob**:
 | ----------- | -------------------------------------------------- |
 | `keyboards` | keyboard-class devices only                        |
 | `pointers`  | pointing devices only: mice, trackballs, touchpads |
-| `devices`   | **any** input device, regardless of class          |
+| `devices`   | keyboards and pointers alike, whichever class      |
 
 At least one field is required; set several to target them together. A pointer
 group can **self-wake** if its `wake_combo` is a mouse-button combo; otherwise

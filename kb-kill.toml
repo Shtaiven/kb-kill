@@ -35,7 +35,7 @@
 #     At least ONE is required — set several to target them together:
 #       keyboards = ...   → keyboard-class devices only
 #       pointers  = ...   → pointing devices only (mice, trackballs, touchpads)
-#       devices   = ...   → ANY input device, regardless of class
+#       devices   = ...   → keyboards and pointers alike, whichever class
 #   * Optional per group: label = "Laptop keyboard" — a display name the tray
 #     shows instead of the group's table key. Cosmetic only.
 #   * Optional per group: start_killed = true — the group starts killed whenever

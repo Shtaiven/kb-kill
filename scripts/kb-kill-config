@@ -690,7 +690,7 @@ class RecordDialog(Adw.Dialog):
 MATCHER_INFO = {
     "keyboards": ("Keyboards", "Keyboard-class devices, by name or glob", "kbd"),
     "pointers": ("Pointers", "Mice, trackballs and touchpads, by name or glob", "ptr"),
-    "devices": ("Any Device", "Any input device, by name or glob", None),
+    "devices": ("Any Device", "Keyboards and pointers alike, by name or glob", None),
 }
 VIRTUAL_CHOICES = [
     ("auto", "Auto", "Target the forwarded copy of anything input-remapper fronts"),
@@ -817,12 +817,14 @@ class MatcherList(Adw.PreferencesGroup):
             self._store()
 
         rows.connect("row-activated", activated)
+        # A width of its own: with no horizontal scrolling, min_content_width
+        # is ignored and the list would shrink to its rows' narrowest wrap.
         scroller = Gtk.ScrolledWindow(
             child=rows,
             hscrollbar_policy=Gtk.PolicyType.NEVER,
             propagate_natural_height=True,
             max_content_height=380,
-            min_content_width=360,
+            width_request=296,  # the whole popover then fits a 360 px window
         )
         box.append(scroller)
         popover.set_child(box)
@@ -3029,7 +3031,9 @@ class ConfigWindow(Adw.ApplicationWindow):
             return [], f"No device list: {error}"
         seen: dict[str, str] = {}
         for d in reply.get("devices", []):
-            if cls and d.get("class") != cls:
+            # kb-kill only watches keyboards and pointers: a headphone jack or
+            # a video bus could be matched but never disabled, so not offered.
+            if d.get("class") not in ((cls,) if cls else ("kbd", "ptr")):
                 continue
             name = d.get("name") or ""
             if name and name not in seen:
