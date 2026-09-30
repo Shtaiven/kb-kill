@@ -63,14 +63,19 @@ rebuild the package or re-run `./install.sh`.
   `_sync_latches` is the single place latches are written. `_release_stale_keys`
   only ever drops keys (re-arms, never fires).
 - **Grab deferral.** `_reconcile_grabs` never grabs a device with keys held.
-- **A grab never outlives its config; a user switch starts awake.**
+- **A grab never outlives its config; state survives sleep, lock and switches.**
   `_install_groups` ungrabs first and takes killed state only from `preserve`.
-  Every install (`_start`) begins awake apart from the config's own
-  `start_killed` groups: at login (`_track_sessions` arms a session the first
-  time it is active, including a second session of the same uid; switching back
-  to a known session, a reconnect or a daemon restart does not) and on every re-push (saving is a
-  restart). A kill is never carried over, from another user or across a save,
-  and `_start` refuses to kill a group whose wake hotkey no device can type.
+  State is reset only by a login, a save, or a hotkey/control call. A restart
+  (`_start`) begins awake apart from the config's own `start_killed` groups: at
+  login (`_track_sessions` arms a session the first time it is active,
+  including a second session of the same uid) and on every re-push (saving is
+  a restart; a save while dormant is applied on return, `_saved`). Anything
+  else that makes a uid live again (switching back, the seat going idle across
+  sleep/lid/lock) goes through `_resume`, which reinstalls the groups with the
+  `killed` they kept on the dormant Config. A kill is never carried over from
+  another user or across a save, and `_start` refuses to kill a group whose
+  wake hotkey no device can type. A daemon or push restart loses state (the
+  pushed config is dropped) and starts awake.
 - **Untrusted input stays bounded.** Configs from any uid are capped
   (`MAX_GROUPS`, `MAX_COMBO_TOKENS`, `MAX_LINE`, checked on every line) and
   `RecursionError` counts as bad input. Clients (`socket_path()` in every

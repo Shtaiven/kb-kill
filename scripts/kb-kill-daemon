@@ -703,6 +703,9 @@ class KbKill:
         self._sessions: dict[str, int] | None = None  # None: not looked yet
         self._armed: set[str] = set()  # sessions whose start_killed is due
         self._seen: set[str] = set()  # sessions ever active; they had their login
+        # A dormant user's groups keep their killed state for when they are
+        # live again; a save while dormant restarts them then instead.
+        self._saved: set[int] = set()
         if config is not None:
             self.pushed[os.getuid()] = config
             self.live_uid = os.getuid()
@@ -906,7 +909,7 @@ class KbKill:
     def _install_groups(self, groups: list[Group], preserve: dict[str, bool]) -> None:
         """Make `groups` live. Ungrabs everything first (a grab never outlives its
         config); killed state comes from `preserve` only, so a kill is never
-        inherited: a user switch passes just that user's own start_killed."""
+        inherited: a user switch passes just that user's own state."""
         for path in list(self.grabbed):
             self._ungrab(path)
         for g in groups:
@@ -968,6 +971,17 @@ class KbKill:
             self._reconcile_grabs()  # let go of what the spared group grabbed
             self._maybe_broadcast()
 
+    def _resume(self, groups: list[Group]) -> None:
+        """Reinstall a user's groups as they last were: switching back, or the
+        seat going idle across sleep or lock, is not a restart. Their `killed`
+        is this user's own, kept on the pushed Config while dormant. No
+        lockout check: these kills were live a moment ago, and a device lost
+        across sleep is grabbed again when it returns, as while live."""
+        self._install_groups(groups, {g.name: g.killed for g in groups})
+        for g in self.groups:
+            if g.killed:
+                log_state(f"[{g.name}] killed (kept)")
+
     def _can_wake(
         self, group: Group, devices: dict[str, InputDevice] | None = None
     ) -> bool:
@@ -982,10 +996,14 @@ class KbKill:
         self.live_uid = uid
         cfg = self.pushed.get(uid) if uid is not None else None
         armed = {s for s in self._armed if (self._sessions or {}).get(s) == uid}
-        fresh = cfg is not None and bool(armed)
+        fresh = cfg is not None and (bool(armed) or uid in self._saved)
         if fresh:
             self._armed -= armed
-        self._start(cfg.groups if cfg else [], start_killed=fresh)
+            self._saved.discard(uid)
+        if cfg is None or fresh:
+            self._start(cfg.groups if cfg else [], start_killed=fresh)
+        else:
+            self._resume(cfg.groups)
         if cfg:
             CTRL_LOG.emit(
                 f"live config: uid {uid} -> {len(self.groups)} group(s) [{', '.join(g.name for g in self.groups)}]"
@@ -1017,6 +1035,8 @@ class KbKill:
             CTRL_LOG.emit(f"rejected config from uid {uid}: {e}", PRI_WARN)
             self._send(conn, {"type": "error", "error": _safe(f"config rejected: {e}")})
             return
+        if uid in self.pushed and uid != self.live_uid:
+            self._saved.add(uid)
         self.pushed[uid] = cfg
         if uid == self.live_uid:
             self._start(cfg.groups, start_killed=True)
@@ -1404,6 +1424,7 @@ class KbKill:
             uid, None
         ):
             CTRL_LOG.emit(f"uid {uid} disconnected; dropping its pushed config")
+            self._saved.discard(uid)
             if uid == self.live_uid:
                 self._reevaluate_live()
 

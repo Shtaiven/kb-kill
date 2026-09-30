@@ -40,7 +40,8 @@
 #     shows instead of the group's table key. Cosmetic only.
 #   * Optional per group: start_killed = true — the group starts killed, not
 #     awake, when you log in and whenever this file is saved (not when you
-#     switch back to a running session). Not inherited. Wake it with its
+#     switch back to a running session, or after sleep or lock: those keep
+#     whatever state the group had). Not inherited. Wake it with its
 #     wake_combo as usual.
 #   * TOML rule: top-level keys MUST come before any [groups.*] table.
 #   * Give each group a DISTINCT combo (a shared combo just toggles both groups

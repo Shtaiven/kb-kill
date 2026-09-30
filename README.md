@@ -233,6 +233,11 @@ together. The old name `virtual_keyboard` is accepted as a deprecated alias.
 - `start_killed = true` (per group, not inherited) starts the group **killed**
   when you log in (not when you switch back to a session that is already
   running), and whenever the config is saved.
+- **Sleep, lid close and lock keep state.** A group killed before stays killed
+  after, and an awake one stays awake. logind may report the seat idle for a
+  moment across these; the daemon lets go of the grabs meanwhile and takes them
+  back when you return. Only a save, a login, a hotkey or a tray/control call
+  changes a group's state.
 - **Saving is a restart:** every change to the file (kb-kill-push re-sends it)
   starts every group awake again, except the `start_killed` ones, which start
   killed. A daemon or `kb-kill-push` restart mid-session starts everything
@@ -293,9 +298,10 @@ remapper maps to something else does not.
 push and tray run for every logged-in user, so each session feeds the shared
 daemon its own config. Only the config of the user **currently controlling the
 seat** governs the devices; others are held dormant. On a user switch the daemon
-swaps configs and starts the incoming one **awake** (except the groups that
-user's own config marks `start_killed`), so a kill is never inherited and the
-login greeter can never be disabled.
+swaps configs and restores the incoming user's **own** state: what they had
+killed when they left, or `start_killed` at their first login or after they
+saved the config while away. A kill is never inherited from another user, and
+the login greeter can never be disabled.
 
 ## Commands
 
@@ -508,4 +514,5 @@ is keylogger-*capable*. The design minimizes and contains that:
   devices only while that user is the active seat user; only that user (or root)
   may kill/wake/toggle or read state. Connections, per-user connections, and
   buffered bytes are bounded; idle connections are dropped. Scope is a single seat.
-- **A grab never outlives its config**, and a user switch always starts awake.
+- **A grab never outlives its config**, and a user switch never inherits a kill:
+  each user gets back only their own state.
