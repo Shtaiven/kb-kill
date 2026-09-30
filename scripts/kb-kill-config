@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
@@ -337,6 +338,16 @@ class Model:
             self.wake.strip(),
             tuple(g.norm() for g in self.groups),
         )
+
+
+@dataclass
+class Edit:
+    """One undoable change to the group list, applied to the live model, so
+    edits made elsewhere since are kept when it is undone."""
+
+    title: str
+    undo: Callable[[], None]
+    redo: Callable[[], None]
 
 
 class TopLevelGroupError(ValueError):
@@ -870,9 +881,7 @@ class GroupPage(Adw.PreferencesPage):
         self.add(danger)
 
     def _name_ok(self, name: str) -> bool:
-        name = name.strip()
-        taken = {g.name.strip() for g in self._win.model.groups if g is not self._group}
-        return bool(GROUP_NAME_RE.match(name)) and name not in taken
+        return self._win.name_ok(name, self._group)
 
     HINT = "The tray shows the label, or the name if there is none."
 
@@ -2128,6 +2137,8 @@ class ConfigWindow(Adw.ApplicationWindow):
         self._pages: dict[str, Adw.PreferencesPage] = {}
         self._rows: dict[str, Adw.ActionRow] = {}
         self._closing = False
+        self._undo: list[Edit] = []
+        self._redo: list[Edit] = []
 
         self._stack = Adw.ViewStack()
         if self._stack.find_property("enable-transitions"):  # libadwaita >= 1.7
@@ -2199,11 +2210,35 @@ class ConfigWindow(Adw.ApplicationWindow):
             ("open-tray-text", lambda *_: self._tray.open_text()),
             ("reload", self._reload),
             ("save", lambda *_: self.save()),
+            ("undo", lambda *_: self.undo()),
+            ("redo", lambda *_: self.redo()),
         ):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", handler)
             self.add_action(action)
+        for name, handler in (
+            ("rename-group", self._on_rename_action),
+            ("delete-group", self._on_delete_action),
+        ):  # target: the group's key
+            action = Gio.SimpleAction.new(name, GLib.VariantType.new("s"))
+            action.connect("activate", handler)
+            self.add_action(action)
         self._save_action = self.lookup_action("save")
+        # Bubble phase: a focused text field takes Ctrl+Z for its own typing
+        # first; the group history gets it everywhere else.
+        history = Gtk.ShortcutController()
+        for trigger, action in (
+            ("<Primary>z", "win.undo"),
+            ("<Primary><Shift>z", "win.redo"),
+        ):
+            history.add_shortcut(
+                Gtk.Shortcut.new(
+                    Gtk.ShortcutTrigger.parse_string(trigger),
+                    Gtk.NamedAction.new(action),
+                )
+            )
+        self.add_controller(history)
+        self._sync_history()
         self.set_help_overlay(shortcuts_window())
 
         self._banner = Adw.Banner(use_markup=False)  # titles quote config text
@@ -2235,6 +2270,19 @@ class ConfigWindow(Adw.ApplicationWindow):
     def _build_groups_view(self) -> Gtk.Widget:
         self._list = Gtk.ListBox(css_classes=["navigation-sidebar"])
         self._list.connect("row-selected", self._on_row_selected)
+        keys = Gtk.ShortcutController()
+        for trigger, handler in (
+            ("Delete|KP_Delete", self._delete_selected),
+            ("F2", self._rename_selected),
+            ("<Shift>F10|Menu", self._menu_selected),
+        ):
+            keys.add_shortcut(
+                Gtk.Shortcut.new(
+                    Gtk.ShortcutTrigger.parse_string(trigger),
+                    Gtk.CallbackAction.new(lambda *_a, h=handler: h() or True),
+                )
+            )
+        self._list.add_controller(keys)
         add = Gtk.Button(
             child=Adw.ButtonContent(icon_name="list-add-symbolic", label="Add Group"),
             css_classes=["flat"],
@@ -2291,6 +2339,13 @@ class ConfigWindow(Adw.ApplicationWindow):
 
     def _add_entry(self, key: str, page: Adw.PreferencesPage, title: str) -> None:
         row = Adw.ActionRow(title=GLib.markup_escape_text(title))
+        if key != "top":  # Defaults cannot be renamed or deleted
+            click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+            click.connect("pressed", lambda _g, _n, x, y: self._row_menu(key, x, y))
+            press = Gtk.GestureLongPress(touch_only=True)
+            press.connect("pressed", lambda _g, x, y: self._row_menu(key, x, y))
+            row.add_controller(click)
+            row.add_controller(press)
         self._rows[key] = row
         self._pages[key] = page
         self._list.append(row)
@@ -2335,35 +2390,208 @@ class ConfigWindow(Adw.ApplicationWindow):
         self._save_action.set_enabled(dirty and self.readable)
         self.set_title(f"• {APP_NAME}" if dirty else APP_NAME)
 
+    def name_ok(self, name: str, group: Group) -> bool:
+        name = name.strip()
+        taken = {g.name.strip() for g in self.model.groups if g is not group}
+        return bool(GROUP_NAME_RE.match(name)) and name not in taken
+
+    def _group(self, key: str) -> Group | None:
+        return next((g for g in self.model.groups if g.key == key), None)
+
+    # Every change to the group list goes through here and the history.
+    def _insert(self, group: Group, index: int) -> None:
+        self.model.groups.insert(min(index, len(self.model.groups)), group)
+        self._rebuild(select=group.key)
+        self.changed()
+
+    def _drop(self, group: Group) -> None:
+        self.model.groups.remove(group)
+        self._rebuild(select="top")
+        self.changed()
+
+    def _set_name(self, group: Group, name: str) -> None:
+        group.name = name
+        self._rebuild(select=group.key)
+        self.changed()
+
     def add_group(self) -> None:
         taken = {g.name for g in self.model.groups}
         name = next(
             f"group-{i}" for i in itertools.count(1) if f"group-{i}" not in taken
         )
-        group = Group(name=name)
-        self.model.groups.append(group)
-        self._rebuild(select=group.key)
-        self.changed()
+        group, index = Group(name=name), len(self.model.groups)
+        self._insert(group, index)
+        self._push(
+            Edit(
+                f"Add {name}",
+                undo=lambda: self._drop(group),
+                redo=lambda: self._insert(group, index),
+            )
+        )
 
     def delete_group(self, group: Group) -> None:
-        """Undo from the toast instead of asking first (GNOME HIG)."""
-        model, index = self.model, self.model.groups.index(group)
-        model.groups.remove(group)
-        self._rebuild(select="top")
-        self.changed()
+        """Undo from the toast or Ctrl+Z instead of asking first (GNOME HIG)."""
+        index = self.model.groups.index(group)
+        self._drop(group)
         name = group.label.strip() or group.name.strip()
+        edit = Edit(
+            f"Delete {name}",
+            undo=lambda: self._insert(group, index),
+            redo=lambda: self._drop(group),
+        )
+        self._push(edit)
         toast = Adw.Toast(
             title=GLib.markup_escape_text(f"Deleted {name}"), button_label="Undo"
         )
-
-        def undo(_t) -> None:
-            if self.model is model and group not in model.groups:  # not reloaded
-                model.groups.insert(min(index, len(model.groups)), group)
-                self._rebuild(select=group.key)
-                self.changed()
-
-        toast.connect("button-clicked", undo)
+        toast.connect(
+            "button-clicked",
+            lambda _t: self._undo and self._undo[-1] is edit and self.undo(),
+        )
         self._toasts.add_toast(toast)
+
+    def rename_group(self, group: Group, name: str) -> None:
+        old, name = group.name, name.strip()
+        if name == old:
+            return
+        self._set_name(group, name)
+        self._push(
+            Edit(
+                f"Rename {old}",
+                undo=lambda: self._set_name(group, old),
+                redo=lambda: self._set_name(group, name),
+            )
+        )
+
+    # -- history -------------------------------------------------------------- #
+    def _push(self, edit: Edit) -> None:
+        self._undo.append(edit)
+        self._redo.clear()
+        self._sync_history()
+
+    def undo(self) -> None:
+        if self._undo:
+            edit = self._undo.pop()
+            edit.undo()
+            self._redo.append(edit)
+            self._sync_history()
+
+    def redo(self) -> None:
+        if self._redo:
+            edit = self._redo.pop()
+            edit.redo()
+            self._undo.append(edit)
+            self._sync_history()
+
+    def _clear_history(self) -> None:
+        """The model object is replaced (load, revert): old edits point nowhere."""
+        self._undo.clear()
+        self._redo.clear()
+        self._sync_history()
+
+    def _sync_history(self) -> None:
+        self.lookup_action("undo").set_enabled(bool(self._undo))
+        self.lookup_action("redo").set_enabled(bool(self._redo))
+
+    # -- sidebar actions ------------------------------------------------------ #
+    def _on_rename_action(self, _action, key: GLib.Variant) -> None:
+        self._rename_popover(key.get_string())
+
+    def _on_delete_action(self, _action, key: GLib.Variant) -> None:
+        if group := self._group(key.get_string()):
+            self.delete_group(group)
+
+    def _selected_group(self) -> Group | None:
+        key = self._selected_key()
+        return self._group(key) if key and key != "top" else None
+
+    def _delete_selected(self) -> None:
+        if group := self._selected_group():
+            self.delete_group(group)
+
+    def _rename_selected(self) -> None:
+        if group := self._selected_group():
+            self._rename_popover(group.key)
+
+    def _menu_selected(self) -> None:
+        if group := self._selected_group():
+            self._row_menu(group.key)
+
+    def _row_menu(
+        self, key: str, x: float | None = None, y: float | None = None
+    ) -> None:
+        row = self._rows.get(key)
+        if row is None:
+            return
+        self._list.select_row(row)
+        menu = Gio.Menu()
+        for label, action in (
+            ("Rename…", "win.rename-group"),
+            ("Delete", "win.delete-group"),
+        ):
+            item = Gio.MenuItem.new(label, None)
+            item.set_action_and_target_value(action, GLib.Variant("s", key))
+            menu.append_item(item)
+        popover = Gtk.PopoverMenu.new_from_model(menu)
+        popover.set_parent(row)
+        popover.set_has_arrow(False)
+        if x is not None and y is not None:
+            rect = Gdk.Rectangle()
+            rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+            popover.set_pointing_to(rect)
+        popover.connect("closed", lambda p: GLib.idle_add(p.unparent))
+        popover.popup()
+
+    def _rename_popover(self, key: str) -> None:
+        """Rename in a popover on the row, as GNOME Files does."""
+        group, row = self._group(key), self._rows.get(key)
+        if group is None or row is None:
+            return
+        self._list.select_row(row)
+        popover = Gtk.Popover(position=Gtk.PositionType.RIGHT)
+        popover.set_parent(row)
+        popover.connect("closed", lambda p: GLib.idle_add(p.unparent))
+        entry = Gtk.Entry(text=group.name, hexpand=True, width_chars=20)
+        button = Gtk.Button(label="Rename", css_classes=["suggested-action"])
+        hint = Gtk.Label(
+            label="Up to 32 letters, digits, spaces, dots, underscores or hyphens, "
+            "and not the name of another group.",
+            wrap=True,
+            max_width_chars=32,
+            xalign=0,
+            visible=False,
+            css_classes=["caption", "error"],
+        )
+
+        def check(*_args) -> None:
+            ok = self.name_ok(entry.get_text(), group)
+            button.set_sensitive(ok)
+            _entry_error(entry, not ok)
+            hint.set_visible(not ok)
+
+        def apply(*_args) -> None:
+            if not button.get_sensitive():
+                return
+            name = entry.get_text()
+            popover.popdown()
+            # After the popover has let go of the row the rebuild replaces.
+            GLib.idle_add(lambda: self.rename_group(group, name) and False)
+
+        entry.connect("changed", check)
+        entry.connect("activate", apply)
+        button.connect("clicked", apply)
+        line = Gtk.Box(spacing=6)
+        line.append(entry)
+        line.append(button)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{side}")(6)
+        box.append(Gtk.Label(label="Group Name", xalign=0, css_classes=["heading"]))
+        box.append(line)
+        box.append(hint)
+        popover.set_child(box)
+        popover.popup()
+        entry.grab_focus()
+        entry.select_region(0, -1)
 
     # -- load / save ---------------------------------------------------------- #
     def _read_text(self) -> str:
@@ -2395,6 +2623,7 @@ class ConfigWindow(Adw.ApplicationWindow):
                 f"{problem}. Fix it as text.", "Open as Text", self._open_groups_text
             )
         self.model = copy.deepcopy(self.saved)
+        self._clear_history()
         self._groups_view.set_sensitive(self.readable)
         self._rebuild()
         self.changed()
@@ -2402,6 +2631,7 @@ class ConfigWindow(Adw.ApplicationWindow):
 
     def revert(self) -> None:
         self.model = copy.deepcopy(self.saved)
+        self._clear_history()
         self._rebuild()
         self.changed()
 
@@ -2647,6 +2877,31 @@ SHORTCUTS_UI = """
             <child><object class="GtkShortcutsShortcut">
               <property name="title">Quit</property>
               <property name="accelerator">&lt;Primary&gt;q</property>
+            </object></child>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsGroup">
+            <property name="title">Groups</property>
+            <child><object class="GtkShortcutsShortcut">
+              <property name="title">Undo</property>
+              <property name="accelerator">&lt;Primary&gt;z</property>
+            </object></child>
+            <child><object class="GtkShortcutsShortcut">
+              <property name="title">Redo</property>
+              <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;z</property>
+            </object></child>
+            <child><object class="GtkShortcutsShortcut">
+              <property name="title">Rename Group</property>
+              <property name="accelerator">F2</property>
+            </object></child>
+            <child><object class="GtkShortcutsShortcut">
+              <property name="title">Delete Group</property>
+              <property name="accelerator">Delete</property>
+            </object></child>
+            <child><object class="GtkShortcutsShortcut">
+              <property name="title">Group Menu</property>
+              <property name="accelerator">&lt;Shift&gt;F10</property>
             </object></child>
           </object>
         </child>

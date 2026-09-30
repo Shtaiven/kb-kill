@@ -313,7 +313,10 @@ in the tray) edits both of your files, one tab each:
 
 - **Groups** edits `kb-kill.toml`. **Defaults** holds the hotkeys
   every group inherits; each `[groups.*]` table has its own page. The **×** on
-  a group's hotkey clears it, so the group falls back to the default. **+** next to a matcher lists the devices the daemon
+  a group's hotkey clears it, so the group falls back to the default. In the
+  sidebar, right-click a group (or press Shift+F10) to rename or delete it, or
+  press F2 or Delete; Ctrl+Z and Ctrl+Shift+Z undo and redo adding, renaming
+  and deleting groups (Revert and a reload from disk clear that history). **+** next to a matcher lists the devices the daemon
   sees (of that class) and inserts the exact name; you can also type a glob.
   **Record** captures a hotkey from the keys and mouse buttons you hold together,
   once you let go (as in GNOME Settings): Esc cancels, Backspace clears.
