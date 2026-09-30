@@ -317,7 +317,8 @@ in the tray) edits both of your files, one tab each:
   sees (of that class) and inserts the exact name; you can also type a glob.
   **Record** captures a hotkey from the keys and mouse buttons you hold together,
   once you let go (as in GNOME Settings): Esc cancels, Backspace clears.
-  **Save** first sends the new file to the daemon's own parser
+  **Save** and **Revert** appear at the bottom of the tab once you have unsaved
+  edits (Ctrl+S saves too). **Save** first sends the new file to the daemon's own parser
   (`check_config`). A config it would reject is not written, and you get the
   reason instead of a line in the journal. A config it accepts replaces the
   file in one step, and `kb-kill-push` applies it within about a second. Edits

@@ -2130,6 +2130,8 @@ class ConfigWindow(Adw.ApplicationWindow):
         self._closing = False
 
         self._stack = Adw.ViewStack()
+        if self._stack.find_property("enable-transitions"):  # libadwaita >= 1.7
+            self._stack.set_property("enable-transitions", True)
         self._stack.add_titled_with_icon(
             self._build_groups_view(),
             "groups",
@@ -2172,9 +2174,6 @@ class ConfigWindow(Adw.ApplicationWindow):
             GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE,
         )
         header.pack_start(self._sidebar_button)
-        self._revert = Gtk.Button(label="Revert")
-        self._revert.connect("clicked", lambda _b: self.revert())
-        header.pack_start(self._revert)
         files = Gio.Menu()
         files.append(f"Open {os.path.basename(self.path)}…", "win.open-groups-text")
         files.append(
@@ -2195,9 +2194,6 @@ class ConfigWindow(Adw.ApplicationWindow):
                 tooltip_text="Main Menu",
             )
         )
-        self._save = Gtk.Button(label="Save", css_classes=["suggested-action"])
-        self._save.connect("clicked", lambda _b: self.save())
-        header.pack_end(self._save)
         for name, handler in (
             ("open-groups-text", self._open_groups_text),
             ("open-tray-text", lambda *_: self._tray.open_text()),
@@ -2258,9 +2254,24 @@ class ConfigWindow(Adw.ApplicationWindow):
         # An overlay sidebar, not a navigation split view: that one wants a
         # header bar per pane, and this window already has one for the tabs.
         self._split = Adw.OverlaySplitView(
-            sidebar=sidebar, content=self._content, max_sidebar_width=280
+            sidebar=sidebar, content=self._content, max_sidebar_width=280, vexpand=True
         )
-        self._groups_view = self._split
+        # Save and Revert only while there is something to save or revert
+        # (the rest of the window applies as it changes).
+        revert = Gtk.Button(label="Revert")
+        revert.connect("clicked", lambda _b: self.revert())
+        save = Gtk.Button(label="Save", css_classes=["suggested-action"])
+        save.connect("clicked", lambda _b: self.save())
+        bar = Gtk.ActionBar()
+        bar.pack_start(Gtk.Label(label="Unsaved changes", css_classes=["dim-label"]))
+        bar.pack_end(save)
+        bar.pack_end(revert)
+        self._save_bar = Gtk.Revealer(
+            child=bar, transition_type=Gtk.RevealerTransitionType.SLIDE_UP
+        )
+        self._groups_view = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self._groups_view.append(self._split)
+        self._groups_view.append(self._save_bar)
         return self._groups_view
 
     def _rebuild(self, select: str | None = None) -> None:
@@ -2320,9 +2331,7 @@ class ConfigWindow(Adw.ApplicationWindow):
         on_groups = self._stack.get_visible_child_name() == "groups"
         dirty = self.dirty()
         self._sidebar_button.set_visible(on_groups and self._split.get_collapsed())
-        for button in (self._save, self._revert):
-            button.set_visible(on_groups)
-            button.set_sensitive(dirty and self.readable)
+        self._save_bar.set_reveal_child(dirty and self.readable)
         self._save_action.set_enabled(dirty and self.readable)
         self.set_title(f"• {APP_NAME}" if dirty else APP_NAME)
 
