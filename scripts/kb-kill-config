@@ -1914,8 +1914,8 @@ class DesktopPage(Adw.PreferencesPage):
             rows: list[Gtk.Widget] = [status]
             if isinstance(backend, CosmicShortcuts):
                 self._float = Adw.SwitchRow(
-                    title="Float Settings Window",
-                    subtitle="Instead of tiling it, from the next time it opens",
+                    title="Tiling Window Exception",
+                    subtitle="The settings window floats instead of tiling, from the next time it opens",
                     sensitive=False,  # until refresh() finds COSMIC
                 )
                 self._float_handler = self._float.connect(

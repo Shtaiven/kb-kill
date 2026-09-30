@@ -353,7 +353,7 @@ in the tray) edits both of your files, one tab each:
   clashes.
   - COSMIC: entries tagged `description: Some("kb-kill")` in
     `~/.config/cosmic/com.system76.CosmicSettings.Shortcuts/v1/custom` (the file
-    is saved to `custom.kb-kill-backup` first). **Float the settings window**
+    is saved to `custom.kb-kill-backup` first). **Tiling Window Exception**
     adds a tiling exception for the window, taking effect the next time it opens.
   - GNOME (untested): custom keybindings under
     `org.gnome.settings-daemon.plugins.media-keys`, paths `…/kb-kill-N/`.
