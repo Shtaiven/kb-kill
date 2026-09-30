@@ -56,7 +56,7 @@ rebuild the package or re-run `./install.sh`.
   `_safe()`; group names/labels are charset-checked. Key-rate diagnostics go
   only to a root client that sent `{"cmd":"debug"}`. `check_config` (any uid)
   must log nothing: parser warnings go to the `warn` sink it passes, and back
-  to the caller only. Its `targets` preview (device names, like `devices`) goes
+  to the caller only. Its `matches` preview (device names, like `devices`) goes
   only to the live uid or root, and resolves through the same
   `_resolve_targets` as the live grab, so preview and grab cannot disagree.
 - **Edge-triggered combos.** `_toggle_groups` fires on not-held -> held only and
@@ -65,10 +65,12 @@ rebuild the package or re-run `./install.sh`.
 - **Grab deferral.** `_reconcile_grabs` never grabs a device with keys held.
 - **A grab never outlives its config; a user switch starts awake.**
   `_install_groups` ungrabs first and takes killed state only from `preserve`.
-  The one exception is the incoming user's own `start_killed` groups
-  (`_set_live`), once per session activation (`_track_sessions` arms it when a
-  seat's ACTIVE session changes; a reconnect or daemon restart does not). A kill
-  is still never carried over from another user.
+  Every install (`_start`) begins awake apart from the config's own
+  `start_killed` groups: on a session activation (`_track_sessions` arms it when
+  a seat's ACTIVE session changes, including a second session of the same uid;
+  a reconnect or daemon restart does not) and on every re-push (saving is a
+  restart). A kill is never carried over, from another user or across a save,
+  and `_start` refuses to kill a group whose wake hotkey no device can type.
 - **No root.** Everything needs only group `input`. Never suggest adding a
   login user to `input`. Any new syscall/path/capability widens the sandbox in
   `services/kb-kill-daemon.service`; do it deliberately.

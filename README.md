@@ -55,6 +55,22 @@ Arch users: build from the AUR recipe in `packaging/aur/`
 ([packaging/README.md](packaging/README.md)). To install from a git checkout,
 see [Install from a checkout](#install-from-a-checkout).
 
+## Upgrading to 0.6
+
+- **The top-level "default" group is gone.** `keyboards`, `pointers`, `devices`,
+  `label`, `virtual` or `start_killed` at the top level of `kb-kill.toml` is now
+  a config error, and such a config is rejected (not migrated). Move those keys
+  into a `[groups.<name>]` table; `[groups.default]` keeps the old name. The
+  top level keeps only `kill_combo` / `wake_combo`, the hotkeys every group
+  inherits. A rejected config is reported in your own journal
+  (`journalctl --user -u kb-kill-push`) and in the settings window.
+- **Saving the config is a restart:** every group starts awake again, except
+  the ones marked `start_killed`.
+- Journal, `kb-kill-monitor` and `kb-kill-detect` now say `killed` / `awake`
+  in lower case.
+- New: the settings window (`kb-kill-config`), with desktop shortcuts that keep
+  kb-kill's hotkeys away from apps, and `start_killed`.
+
 ## A note on AI usage
 
 This program is written mostly by agentic AI (Claude). Read the scripts before
@@ -215,11 +231,18 @@ together. The old name `virtual_keyboard` is accepted as a deprecated alias.
   "default" group, and they now belong in a `[groups.<name>]` table
   (`[groups.default]` keeps the old name).
 - `start_killed = true` (per group, not inherited) starts the group **killed**
-  whenever your session becomes the active one: at login, or when you switch
-  back to it. A re-push keeps each group's current state, so saving an edit
-  never kills anything by itself, and neither does a daemon or `kb-kill-push`
-  restart mid-session (the daemon only counts a session as a fresh login if
-  logind created it in the last two minutes).
+  whenever your session becomes the active one (at login, or when you switch
+  back to it), and whenever the config is saved.
+- **Saving is a restart:** every change to the file (kb-kill-push re-sends it)
+  starts every group awake again, except the `start_killed` ones, which start
+  killed. A daemon or `kb-kill-push` restart mid-session starts everything
+  awake (the daemon counts a session as a fresh login only if logind created it
+  in the last two minutes).
+- A group is never started killed when no device the daemon reads can type its
+  wake hotkey: that would disable input at every login with no way back. The
+  journal says so, and the settings window warns on the group's **Start
+  killed** switch.
+- Limits: at most 64 groups, and 16 keys per hotkey.
 - A group **name** is up to 32 characters of letters, digits, space, `.`, `_`, `-`
   (it appears in log lines). A label is up to 64 printable characters.
 - TOML rule: top-level keys come **before** any `[groups.*]` table.
@@ -358,7 +381,8 @@ in the tray) edits both of your files, one tab each:
   swallow would replace). Your desktop's list starts open.
   - COSMIC: entries tagged `description: Some("kb-kill")` in
     `~/.config/cosmic/com.system76.CosmicSettings.Shortcuts/v1/custom` (the file
-    is saved to `custom.kb-kill-backup` first). **COSMIC Tiling Exception**
+    is copied to `custom.kb-kill-backup` before kb-kill first changes it, and
+    that copy is then kept). **COSMIC Tiling Exception**
     adds a tiling exception for the window, taking effect the next time it opens.
   - GNOME (untested): custom keybindings under
     `org.gnome.settings-daemon.plugins.media-keys`, paths `…/kb-kill-N/`.
@@ -392,7 +416,7 @@ layer-shell, hence the split). With no backend available nothing pops.
 **Settings…** in the menu opens the settings window, whose **Tray** tab
 turns the display on and off (on by default) and sets its geometry. The tray
 keeps these in `~/.config/kb-kill/tray.toml`, its own file rather than the config
-pushed to the daemon, and follows it live: every change flashes a preview card.
+pushed to the daemon, and follows it live: turning it on or changing its geometry flashes a preview card.
 The file is plain TOML if you would rather edit it:
 
 ```toml
@@ -414,7 +438,7 @@ to the active user's clients on every change. Config is delivered the same way
 `{"cmd":"check_config","toml":"…"}` parses a candidate without applying it,
 replying `{"type":"config_check","ok":…,"error":…,"warnings":[…],"groups":[…]}`
 (what the settings window checks before it saves); for the active user (or
-root) the reply also carries `"targets":{"<group>":[{path,name,class,virtual,instead_of}]}`,
+root) the reply also carries `"matches":{"<group>":[{path,name,class,virtual,instead_of}]}`,
 what each group would grab right now. `{"cmd":"debug"}` (root only)
 subscribes to key-rate diagnostics.
 

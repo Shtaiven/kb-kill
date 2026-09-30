@@ -68,6 +68,21 @@ def push(sock: socket.socket) -> None:
     log(f"pushed {p}")
 
 
+def report_errors(buf: bytes) -> bytes:
+    """Log the daemon's error replies (a rejected config) to this user's own
+    journal; the daemon's journal is not theirs to read. State lines are
+    ignored. Returns the unfinished line."""
+    *lines, rest = buf.split(b"\n")
+    for line in lines:
+        try:
+            msg = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(msg, dict) and msg.get("type") == "error":
+            log(f"daemon: {msg.get('error')}")
+    return rest[-65536:]  # a line longer than the daemon ever sends: drop it
+
+
 def serve_once() -> None:
     """One connection: push, then re-push on each edit until the socket drops."""
     path = socket_path()
@@ -82,11 +97,14 @@ def serve_once() -> None:
         push(sock)
         mtime = config_mtime()
         sock.settimeout(POLL_SECONDS)
+        buf = b""
         while True:
             try:
-                if not sock.recv(65536):  # daemon replies are drained and ignored
+                chunk = sock.recv(65536)
+                if not chunk:
                     log("daemon closed the connection")
                     return
+                buf = report_errors(buf + chunk)
             except TimeoutError:
                 pass
             if (now := config_mtime()) != mtime:

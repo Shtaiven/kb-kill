@@ -9,8 +9,8 @@ survive: the file is edited in place with tomlkit. Tray settings apply as they
 change; the tray follows the file live.
 
 Needs PyGObject with Gtk 4 and libadwaita >= 1.5, plus tomlkit. Without them
-it opens kb-kill.toml in a text editor instead, so the tray's "kb-kill
-settings…" entry always does something.
+it opens kb-kill.toml in a text editor instead, so the tray's "Settings…"
+entry always does something.
 """
 
 # pyright: reportMissingImports=false
@@ -18,6 +18,7 @@ settings…" entry always does something.
 import copy
 import itertools
 import json
+import math
 import os
 import re
 import shutil
@@ -30,6 +31,7 @@ import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import MappingProxyType
+from typing import TypeGuard
 
 # Rewritten by packaging/bump-version.sh from the repo-root VERSION file.
 VERSION = "0.5.1"
@@ -489,25 +491,40 @@ def render(text: str, old: Model, new: Model) -> str:
     by_orig = {g.name: g for g in old.groups}
     kept = {g.orig for g in new.groups if g.orig}
     sections = doc.get("groups")
-    renamed: list[tuple[Group, object]] = []
+    renamed: list[Group] = []
     for name in by_orig:
         if name not in kept and sections is not None and name in sections:
             del sections[name]
     for g in new.groups:
-        if g.orig is None:
+        if g.orig not in by_orig:  # never saved, or brought back after a save
+            g.orig = None
             continue
         table = sections[g.orig]
         _write_fields(table, by_orig[g.orig], g, combos=True)
-        if g.name.strip() != g.orig:
-            renamed.append((g, table))
-    # Two passes, so a swap (a -> b, b -> a) never overwrites a live table.
-    for g, _table in renamed:
-        del sections[g.orig]
-    for g, table in renamed:
-        moved = tomlkit.table()
-        for key, value in table.items():
-            moved[key] = value
-        sections[g.name.strip()] = moved
+        if g.name.strip() != g.orig.strip():
+            renamed.append(g)
+    # Rename in place: comments, position and inline/dotted form stay. Only a
+    # swap (a -> b while b -> a) needs a detour through temporary keys, which
+    # tomlkit cannot do inside an inline table; that rare case is rebuilt.
+    finals = {g.name.strip() for g in renamed}
+    swap = any(g.orig in finals for g in renamed)
+    if renamed and not swap:
+        for g in renamed:
+            sections.value._replace(g.orig, g.name.strip(), sections[g.orig])
+    elif renamed and not isinstance(sections, tomlkit.items.InlineTable):
+        for n, g in enumerate(renamed):
+            sections.value._replace(g.orig, f"__kb_kill_rename_{n}__", sections[g.orig])
+        for n, g in enumerate(renamed):
+            temp = f"__kb_kill_rename_{n}__"
+            sections.value._replace(temp, g.name.strip(), sections[temp])
+    elif renamed:
+        tables = [(g, sections[g.orig]) for g in renamed]
+        for g, _table in tables:
+            del sections[g.orig]
+        for g, table in tables:
+            moved = tomlkit.inline_table()
+            moved.update(table)
+            sections[g.name.strip()] = moved
     for g in new.groups:
         if g.orig is not None:
             continue
@@ -830,6 +847,7 @@ def group_details(win: "ConfigWindow", group: Group) -> list[Adw.PreferencesGrou
     start.connect("notify::active", toggled)
     startup.add(start)
     out.append(startup)
+    startup.start_row = start  # GroupPage.show_wakeable() warns on it
     advanced = Adw.PreferencesGroup(title="Remappers")
     choice = Adw.ComboRow(
         title="Remapped Devices",
@@ -890,8 +908,10 @@ class GroupPage(Adw.PreferencesPage):
         for row in self._combos:
             hotkeys.add(row)
         self.add(hotkeys)
+        self._start_row: Adw.SwitchRow | None = None
         for section in group_details(win, group):
             self.add(section)
+            self._start_row = getattr(section, "start_row", self._start_row)
 
         self._matched = Adw.PreferencesGroup(
             title="Matched Devices",
@@ -935,6 +955,24 @@ class GroupPage(Adw.PreferencesPage):
         self._win.retitle(self._group)
 
     CLASS_WORDS = MappingProxyType({"kbd": "keyboard", "ptr": "pointer"})
+
+    START_HINT = "At login, or when you switch back to this session"
+
+    def show_wakeable(self, wakeable: bool | None) -> None:
+        """Say on the Start killed switch when the wake hotkey cannot be typed:
+        the daemon would then refuse to start the group killed."""
+        row = self._start_row
+        if row is None:
+            return
+        if wakeable is False:
+            row.set_subtitle(
+                "No device can type this group's wake hotkey, so it will not "
+                "start killed"
+            )
+            row.add_css_class("warning")
+        else:
+            row.set_subtitle(self.START_HINT)
+            row.remove_css_class("warning")
 
     def show_matches(self, devices: list[dict] | None, note: str | None) -> None:
         """The daemon's preview for this group; `note` when there is none."""
@@ -1048,11 +1086,20 @@ def load_tray_settings() -> tuple[bool, int, float]:
         return enabled, margin, opacity
     enabled = bool(doc.get("osd", enabled))
     raw_margin, raw_opacity = doc.get("osd_margin"), doc.get("osd_opacity")
-    if isinstance(raw_margin, int | float) and not isinstance(raw_margin, bool):
+    if _finite(raw_margin):
         margin = max(0, min(round(raw_margin), OSD_MARGIN_MAX))
-    if isinstance(raw_opacity, int | float) and not isinstance(raw_opacity, bool):
+    if _finite(raw_opacity):
         opacity = max(0.0, min(float(raw_opacity), 1.0))
     return enabled, margin, opacity
+
+
+def _finite(value: object) -> TypeGuard[int | float]:
+    """A number TOML may hold that round() and float() take (not nan/inf)."""
+    return (
+        isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
 
 
 class TrayPage(Adw.PreferencesPage):
@@ -1141,8 +1188,9 @@ class TrayPage(Adw.PreferencesPage):
             launch_editor(tray_config_path())
 
     def _watch(self) -> Gio.FileMonitor | None:
-        """Follow hand edits, so the next change here does not undo them."""
-        folder = os.path.dirname(tray_config_path())
+        """Follow hand edits, so the next change here does not undo them.
+        The real file's directory: a symlinked tray.toml is replaced there."""
+        folder = os.path.dirname(os.path.realpath(tray_config_path()))
         try:
             os.makedirs(folder, exist_ok=True)
             monitor = Gio.File.new_for_path(folder).monitor_directory(
@@ -1154,7 +1202,7 @@ class TrayPage(Adw.PreferencesPage):
         return monitor
 
     def _on_disk_event(self, _m, file: Gio.File, other: Gio.File | None, _ev) -> None:
-        name = os.path.basename(tray_config_path())
+        name = os.path.basename(os.path.realpath(tray_config_path()))
         if name not in (file.get_basename(), other and other.get_basename()):
             return
         if self._disk_timer:
@@ -1166,6 +1214,11 @@ class TrayPage(Adw.PreferencesPage):
         if not self._timer:  # an edit waiting to be written wins
             self.load()
         return False
+
+    def flush(self) -> None:
+        if self._timer:
+            GLib.source_remove(self._timer)
+            self._write()
 
     def _schedule(self, *_args) -> None:
         if self._loading:
@@ -1180,8 +1233,11 @@ class TrayPage(Adw.PreferencesPage):
         try:
             with open(path) as fh:
                 doc = tomlkit.parse(fh.read())
-        except (OSError, tomlkit.exceptions.ParseError):
+        except FileNotFoundError:
             doc = tomlkit.parse(TRAY_TEMPLATE)
+        except (OSError, tomlkit.exceptions.ParseError) as e:
+            self._win.toast(f"Not saved: fix tray.toml as text first ({e})")
+            return False
         doc["osd"] = self._enabled.get_active()
         doc["osd_margin"] = int(self._margin.get_value())
         doc["osd_opacity"] = round(self._opacity.get_value(), 2)
@@ -1366,43 +1422,74 @@ class Report:
 
 
 # -- RON, just enough for COSMIC's two files ----------------------------------- #
+def _ron_code(text: str) -> list[bool]:
+    """Per character: True outside strings and // or /* */ comments."""
+    out, i, n = [False] * len(text), 0, len(text)
+    while i < n:
+        if text[i] == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+            i += 1
+        elif text.startswith("//", i):
+            end = text.find("\n", i)
+            i = n if end == -1 else end
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+        else:
+            out[i] = True
+            i += 1
+    return out
+
+
+def _ron_real(item: str) -> bool:
+    """An item with content, not just whitespace and comments."""
+    code = _ron_code(item)
+    return any(code[i] and not c.isspace() for i, c in enumerate(item))
+
+
 def _ron_items(text: str, open_ch: str, close_ch: str) -> tuple[list[str], bool]:
     """Split the top-level map or list in `text` into its items, verbatim
-    (leading whitespace kept, trailing comma dropped). False if unparseable."""
-    start, end = text.find(open_ch), text.rfind(close_ch)
-    if start == -1 or end <= start:
-        return [], not text.strip()
-    body = text[start + 1 : end]
-    items, depth, quote, escape, begin = [], 0, False, False, 0
-    comment = False
-    for i, c in enumerate(body):
-        if comment:
-            comment = c != "\n"
-        elif quote:
-            if escape:
-                escape = False
-            elif c == "\\":
-                escape = True
-            elif c == '"':
-                quote = False
-        elif c == '"':
-            quote = True
-        elif c == "/" and body[i + 1 : i + 2] == "/":
-            comment = True
-        elif c in "([{":
+    (leading whitespace and comments kept, trailing comma dropped). A trailing
+    comment after the last comma stays as an item of its own. False if
+    unparseable. Brackets and commas inside strings and comments are text."""
+    code = _ron_code(text)
+    opens = [i for i, c in enumerate(text) if code[i] and c == open_ch]
+    closes = [i for i, c in enumerate(text) if code[i] and c == close_ch]
+    if not opens or not closes or closes[-1] <= opens[0]:
+        return [], not _ron_real(text)
+    start, end = opens[0], closes[-1]
+    items, depth, begin = [], 0, start + 1
+    for i in range(start + 1, end):
+        if not code[i]:
+            continue
+        if text[i] in "([{":
             depth += 1
-        elif c in ")]}":
+        elif text[i] in ")]}":
             depth -= 1
-        elif c == "," and depth == 0:
-            items.append(body[begin:i])
+        elif text[i] == "," and depth == 0:
+            items.append(text[begin:i])
             begin = i + 1
-    if body[begin:].strip():
-        items.append(body[begin:])
-    return [item for item in items if item.strip()], depth == 0 and not quote
+    items.append(text[begin:end])
+    return [item for item in items if item.strip()], depth == 0
 
 
 def _ron_join(items: list[str], open_ch: str, close_ch: str) -> str:
-    return open_ch + "".join(f"{item}," for item in items) + f"\n{close_ch}\n"
+    """No comma after a comment-only item: "…,\n// note\n," is not RON."""
+    body = "".join(f"{item}," if _ron_real(item) else item for item in items)
+    return f"{open_ch}{body}\n{close_ch}\n"
+
+
+def _ron_write(
+    path: str, old: str, items: list[str], open_ch: str, close_ch: str
+) -> None:
+    """Write COSMIC's file only if kb-kill can read its own output back."""
+    text = _ron_join(items, open_ch, close_ch)
+    back, ok = _ron_items(text, open_ch, close_ch)
+    if not ok or sum(map(_ron_real, back)) != sum(map(_ron_real, items)):
+        raise ValueError(f"not writing {path}: kb-kill could not read back its output")
+    _write_with_backup(path, old, text)
 
 
 def _ron_str(value: str) -> str:
@@ -1418,8 +1505,11 @@ def _read(path: str) -> str:
 
 
 def _write_with_backup(path: str, old: str, new: str) -> None:
-    if old:
-        write_atomic(path + ".kb-kill-backup", old)
+    """The backup is taken once, before kb-kill's first change, and then
+    kept: a later write must not replace it with already-edited content."""
+    backup = path + ".kb-kill-backup"
+    if old and not os.path.exists(backup):
+        write_atomic(backup, old)
     write_atomic(path, new)
 
 
@@ -1529,13 +1619,13 @@ class CosmicShortcuts:
                 f"{self.TAG}): Spawn({_ron_str(NOOP)})"
             )
             report.bound += 1
-        _write_with_backup(self.path, old, _ron_join(entries, "{", "}"))
+        _ron_write(self.path, old, entries, "{", "}")
         return report
 
     def remove(self) -> None:
         old = _read(self.path)
         entries = [e for e in self._entries() if self.TAG not in e]
-        _write_with_backup(self.path, old, _ron_join(entries, "{", "}"))
+        _ron_write(self.path, old, entries, "{", "}")
 
     def label(self, chord: Chord) -> str:
         return "+".join(
@@ -1567,7 +1657,7 @@ class CosmicShortcuts:
             items.append(
                 f'\n  (\n    enabled: true,\n    appid: {_ron_str(APP_ID)},\n    title: ".*"\n  )'
             )
-        _write_with_backup(self.rules, old, _ron_join(items, "[", "]"))
+        _ron_write(self.rules, old, items, "[", "]")
 
 
 class GnomeShortcuts:
@@ -1611,7 +1701,7 @@ class GnomeShortcuts:
     def conflicts(self, chords: list[Chord]) -> dict[Chord, Clash]:
         """Custom shortcuts that do something, and GNOME's own keybindings.
         `where` holds ("custom", path) or (schema id, key)."""
-        wanted = {self._accel(self._binding(c)): c for c in chords}
+        wanted = {a: c for c in chords if (a := self._accel(self._binding(c)))}
         out: dict[Chord, Clash] = {}
         for path in self._paths():
             if path.startswith(self.OURS):
@@ -1681,23 +1771,14 @@ class GnomeShortcuts:
             + chord.keysym
         )
 
-    @staticmethod
-    def _norm(binding: str) -> str:
-        return (
-            binding.lower()
-            .replace("<primary>", "<control>")
-            .replace("<ctrl>", "<control>")
-        )
-
-    def _existing(self) -> dict[str, tuple[str, str]]:
-        """binding -> (path, command) for every custom shortcut."""
+    def _existing(self) -> dict[tuple[int, int], tuple[str, str]]:
+        """Parsed accelerator -> (path, command) for every custom shortcut,
+        matched like conflicts() does (modifier order and spelling ignored)."""
         out = {}
         for path in self._paths():
             child = self._child(path)
-            out[self._norm(child.get_string("binding"))] = (
-                path,
-                child.get_string("command"),
-            )
+            if (accel := self._accel(child.get_string("binding"))) is not None:
+                out[accel] = (path, child.get_string("command"))
         return out
 
     def bound(self, chords: list[Chord]) -> set[Chord]:
@@ -1705,7 +1786,7 @@ class GnomeShortcuts:
         return {
             chord
             for chord in chords
-            if (hit := existing.get(self._norm(self._binding(chord))))
+            if (hit := existing.get(self._accel(self._binding(chord))))
             and (hit[0].startswith(self.OURS) or hit[1].strip() in ("true", NOOP))
         }
 
@@ -1724,7 +1805,7 @@ class GnomeShortcuts:
                     continue
                 dropped = self._free(chord, clashes[chord])
                 paths = [p for p in paths if p not in dropped]
-            elif (hit := existing.get(self._norm(self._binding(chord)))) and hit[
+            elif (hit := existing.get(self._accel(self._binding(chord)))) and hit[
                 1
             ].strip() in ("true", NOOP):
                 report.bound += 1  # your own no-op already swallows it
@@ -1776,7 +1857,7 @@ class KdeShortcuts:
         """Every active shortcut in kglobalshortcutsrc except ours. Each value
         is "active,default,description"; several actives are separated by an
         escaped tab. `where` holds (groups, action, value)."""
-        wanted = {(self._qt(c) or "").lower(): c for c in chords}
+        wanted = {q.lower(): c for c in chords if (q := self._qt(c))}
         out: dict[Chord, Clash] = {}
         group = ""
         for line in _read(os.path.expanduser(self.RC)).splitlines():
@@ -2453,16 +2534,15 @@ class ConfigWindow(Adw.ApplicationWindow):
             cmd="check_config",
             toml=render(self.text, self.saved, self.model),
         )
-        if result is None:
+        if result is None and "unknown command" in str(error):
+            note = "No preview: the kb-kill daemon is older than this window."
+        elif result is None:
             note = f"No preview: {error}"
         elif not result.get("ok"):
             message = re.sub(r"^config:?\s*", "", str(result.get("error")))
             note = f"No preview until the config is valid: {message}"
-        elif "targets" not in result:
-            note = (
-                "No preview: the kb-kill daemon is older than this window, "
-                "or you are not the user at the seat."
-            )
+        elif "matches" not in result:
+            note = "No preview: only the user at the seat can see devices."
         else:
             note = None
         for group, page in pages:
@@ -2470,8 +2550,11 @@ class ConfigWindow(Adw.ApplicationWindow):
                 continue
             if note:
                 page.show_matches(None, note)
+                page.show_wakeable(None)
             else:
-                page.show_matches(result["targets"].get(group.name.strip(), []), None)
+                name = group.name.strip()
+                page.show_matches(result["matches"].get(name, []), None)
+                page.show_wakeable(result.get("wakeable", {}).get(name))
         return False  # one-shot timer
 
     def _sync_header(self) -> None:
@@ -2491,6 +2574,9 @@ class ConfigWindow(Adw.ApplicationWindow):
 
     # Every change to the group list goes through here and the history.
     def _insert(self, group: Group, index: int) -> None:
+        taken = {g.name.strip() for g in self.model.groups}
+        if group.name.strip() in taken:  # taken meanwhile (undo after a relabel)
+            group.name = self.name_for(group.label or group.name, group)
         self.model.groups.insert(min(index, len(self.model.groups)), group)
         self._rebuild(select=group.key)
         self.changed()
@@ -2733,25 +2819,35 @@ class ConfigWindow(Adw.ApplicationWindow):
     def save(self, then=None, overwrite: bool = False) -> None:
         if not self.readable:
             return
+        names = [g.name.strip() for g in self.model.groups]
+        if dup := next((n for n in names if names.count(n) > 1), None):
+            self.alert(
+                "Not Saved",
+                f"Two groups are named {dup}, and one would replace the other. "
+                "Change one of their labels first.",
+            )
+            return
         if not overwrite and self._read_text() != self.text:
             self._confirm_overwrite(then)
             return
         text = render(self.text, self.saved, self.model)
         result, error = ask_daemon("config_check", cmd="check_config", toml=text)
         if result is None:
+            if "unknown command" in str(error):
+                error = "it is older than this window"
             self._confirm(
                 "Save Without Checking?",
                 f"The daemon could not check this config: {error}. It is valid TOML, "
                 "but kb-kill may still reject it.",
                 "Save Anyway",
-                lambda: self._commit(text, [], then),
+                lambda: self._commit(text, [], then, overwrite),
             )
             return
         if not result.get("ok"):
             message = re.sub(r"^config:?\s*", "", str(result.get("error")))
             self.alert("Not Saved", f"kb-kill would reject this config:\n\n{message}")
             return
-        self._commit(text, result.get("warnings") or [], then)
+        self._commit(text, result.get("warnings") or [], then, overwrite)
 
     def _confirm_overwrite(self, then) -> None:
         """The file changed under unsaved edits: never pick a side silently."""
@@ -2775,7 +2871,15 @@ class ConfigWindow(Adw.ApplicationWindow):
         dialog.connect("response", answered)
         dialog.present(self)
 
-    def _commit(self, text: str, warnings: list[str], then) -> None:
+    def _commit(self, text: str, warnings: list[str], then, overwrite=False) -> None:
+        try:
+            tomllib.loads(text)
+        except tomllib.TOMLDecodeError as e:  # never write what cannot be read
+            self.alert("Not Saved", f"The edited config is not valid TOML: {e}")
+            return
+        if not overwrite and self._read_text() != self.text:
+            self._confirm_overwrite(then)  # changed while the check ran
+            return
         try:
             write_atomic(self.path, text)
         except OSError as e:
@@ -2915,6 +3019,7 @@ class ConfigWindow(Adw.ApplicationWindow):
         dialog.present(self)
 
     def _on_close_request(self, _win) -> bool:
+        self._tray.flush()  # a tray edit still waiting on its timer
         if self._closing or not self.dirty():
             return False
         dialog = Adw.AlertDialog(

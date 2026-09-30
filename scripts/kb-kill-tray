@@ -12,6 +12,7 @@ opens; the tray follows tray.toml live.
 # pyright: reportMissingImports=false
 
 import json
+import math
 import os
 import re
 import shutil
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import tomllib
 from collections.abc import Callable
+from typing import TypeGuard
 
 # Rewritten by packaging/bump-version.sh from the repo-root VERSION file.
 VERSION = "0.5.1"
@@ -109,11 +111,20 @@ def load_settings() -> tuple[bool, int, float]:
         return enabled, margin, opacity
     enabled = bool(doc.get("osd", enabled))
     raw_margin, raw_opacity = doc.get("osd_margin"), doc.get("osd_opacity")
-    if isinstance(raw_margin, int | float) and not isinstance(raw_margin, bool):
+    if _finite(raw_margin):
         margin = max(0, min(round(raw_margin), OSD_MARGIN_MAX))
-    if isinstance(raw_opacity, int | float) and not isinstance(raw_opacity, bool):
+    if _finite(raw_opacity):
         opacity = max(0.0, min(float(raw_opacity), 1.0))
     return enabled, margin, opacity
+
+
+def _finite(value: object) -> TypeGuard[int | float]:
+    """A number round() and float() take: TOML also allows nan and inf."""
+    return (
+        isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
 
 
 def corner_radius() -> int:
@@ -572,7 +583,7 @@ class Tray:
     def _watch_settings(self) -> Gio.FileMonitor | None:
         """Watch the directory, not the file: kb-kill-config replaces tray.toml
         atomically, and a file monitor would stay on the replaced inode."""
-        folder = os.path.dirname(tray_config_path())
+        folder = os.path.dirname(os.path.realpath(tray_config_path()))
         try:
             os.makedirs(folder, exist_ok=True)
             monitor = Gio.File.new_for_path(folder).monitor_directory(
@@ -587,7 +598,7 @@ class Tray:
     def _on_settings_event(
         self, _monitor: Gio.FileMonitor, file: Gio.File, other: Gio.File | None, _ev
     ) -> None:
-        name = os.path.basename(tray_config_path())
+        name = os.path.basename(os.path.realpath(tray_config_path()))
         if name not in (file.get_basename(), other and other.get_basename()):
             return
         if self._settings_timer:
