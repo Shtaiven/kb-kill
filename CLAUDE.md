@@ -12,7 +12,8 @@ crash cannot break input. Config is **pushed**: each user's `kb-kill-push` sends
 their TOML to the daemon over a control socket, and the daemon applies only the
 config of the user who currently controls the seat (logind `ACTIVE_UID`).
 
-Pure Python + shell + systemd units. No build step, no test suite. The tray is
+Pure Python + shell + systemd units. No build step. `tests/` is stdlib
+`unittest` over the daemon with logind and evdev faked. The tray is
 GTK3 (AppIndicator has no GTK4 port) and the settings window GTK4; one process
 cannot load both, so they stay separate programs. The primary
 install method is the `.deb`/`.rpm`; `install.sh` is for a git checkout.
@@ -39,6 +40,7 @@ kb-kill-detect                    # groups, devices, targets, grabs (as the acti
 sudo kb-kill-monitor [--debug]    # raw key events + daemon state (+ key-rate diagnostics)
 journalctl -u kb-kill-daemon -f   # live config, killed / awake (rate-limited)
 ./scripts/kb-kill-daemon -c some.toml   # dev run: pins a file config, socket in $XDG_RUNTIME_DIR
+python3 -m unittest discover tests   # daemon state rules (needs python-evdev)
 packaging/check-sync.sh           # installer vs deb/rpm vs AUR payload agreement
 packaging/bump-version.sh X.Y.Z   # the only way to change version literals
 ```
