@@ -81,7 +81,8 @@ rebuild the package or re-run `./install.sh`.
   only EV_KEY/EV_SYN arrive.
 - **Vocabulary:** group state is `KILLED` or `AWAKE`, upper-case, in the
   journal, tray title, monitor and detect. The settings window follows the GNOME
-  HIG instead and writes "Killed" / "Awake".
+  HIG instead and writes "Killed" / "Awake", and the OSD reads "<group> killed" /
+  "<group> awake".
 
 ## Packaging
 

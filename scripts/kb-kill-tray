@@ -143,7 +143,7 @@ def _osd_summary(entries: list[tuple[bool, str]]) -> tuple[str, str]:
 
 
 class Osd:
-    """The transient "<group> KILLED" popup, the volume/airplane-mode kind.
+    """The transient "<group> killed" popup, the volume/airplane-mode kind.
 
     No cross-desktop protocol for this exists. GNOME and KDE each expose their
     own shell OSD on the session bus; everywhere else (COSMIC, wlroots) we draw
@@ -466,8 +466,10 @@ class Tray:
             [
                 (
                     pending[g["name"]],
-                    f"{g.get('label') or g['name']} "
-                    f"{'KILLED' if pending[g['name']] else 'AWAKE'}",
+                    (
+                        f"{g.get('label') or g['name']} "
+                        f"{'killed' if pending[g['name']] else 'awake'}"
+                    ),
                 )
                 for g in self.groups
                 if g["name"] in pending
