@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -288,10 +289,14 @@ def combo_ok(spec: str) -> bool:
 
 
 def name_from_label(label: str, taken: set[str]) -> str:
-    """A group name (GROUP_NAME_RE) made from its label: characters a name
-    cannot hold become _, at most 32, and _2, _3... when another group has it."""
-    base = re.sub(r"[^A-Za-z0-9 ._-]", "_", label.strip())[:32].rstrip()
-    if not base or not re.match(r"[A-Za-z0-9_]", base[0]):
+    """A simple group name (GROUP_NAME_RE) made from its label: lower case,
+    accents dropped, each run of spaces or characters a name cannot hold
+    made one _, at most 32, and _2, _3... when another group has it."""
+    plain = unicodedata.normalize("NFKD", label).encode("ascii", "ignore").decode()
+    base = re.sub(r"[^a-z0-9.-]+", "_", plain.lower()).strip("_")[:32].rstrip("_")
+    if not base:
+        base = "group"
+    if not re.match(r"[a-z0-9_]", base[0]):  # a name cannot start with . or -
         base = ("_" + base)[:32]
     name, n = base, 2
     while name in taken:

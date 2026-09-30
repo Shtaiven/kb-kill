@@ -315,7 +315,8 @@ in the tray) edits both of your files, one tab each:
   every group inherits; each `[groups.*]` table has its own page. The **×** on
   a group's hotkey clears it, so the group falls back to the default. You edit a
   group's label; its name (the `[groups.<name>]` key, also used in the journal)
-  is made from the label, with characters a name cannot hold turned into `_`.
+  is made from the label: lower case, with spaces and characters a name
+  cannot hold turned into `_` ("Laptop Keyboards" → `laptop_keyboards`).
   In the sidebar, right-click a group (or press Shift+F10) to rename it (its
   label) or delete it, or press F2 or Delete; Ctrl+Z and Ctrl+Shift+Z undo and redo adding, renaming
   and deleting groups (Revert and a reload from disk clear that history). **+** next to a matcher lists the devices the daemon
