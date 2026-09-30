@@ -346,14 +346,15 @@ in the tray) edits both of your files, one tab each:
   over removes your own shortcut for it (COSMIC backs the file up first) or
   takes the combo off the desktop's built-in shortcut; on COSMIC, **Remove**
   gives a built-in back, while on GNOME and KDE you reset it in their settings. Mouse-button combos cannot be desktop shortcuts
-  and are listed as skipped. Each desktop's **Shortcuts** row opens into its
+  and are listed as skipped. Each desktop's **Shortcuts** row (under **Current
+  Desktop**, the rest under **Other Desktops**) opens into its
   hotkeys and their state there: swallowed, not yet, or already in use, with
   what uses it (your own shortcuts, or the desktop's built-in ones, which a
   swallow would replace). Your desktop's list opens by itself when a hotkey
   clashes.
   - COSMIC: entries tagged `description: Some("kb-kill")` in
     `~/.config/cosmic/com.system76.CosmicSettings.Shortcuts/v1/custom` (the file
-    is saved to `custom.kb-kill-backup` first). **Tiling Window Exception**
+    is saved to `custom.kb-kill-backup` first). **COSMIC Tiling Exception**
     adds a tiling exception for the window, taking effect the next time it opens.
   - GNOME (untested): custom keybindings under
     `org.gnome.settings-daemon.plugins.media-keys`, paths `…/kb-kill-N/`.

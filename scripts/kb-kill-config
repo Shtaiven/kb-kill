@@ -1898,44 +1898,36 @@ class DesktopPage(Adw.PreferencesPage):
         self.add(self._combos)
 
         # Your desktop up front; the rest only on request (HIG: hide what does
-        # not apply). With no desktop recognised, all of them are up front.
+        # not apply). With no desktop recognised, all of them in one section.
         here = current_desktops()
-        current = [b for b in self._backends if b.title.split()[0].upper() in here]
-        self._sections: list[Adw.PreferencesGroup] = []
+        self._current = {
+            b.title for b in self._backends if b.title.split()[0].upper() in here
+        }
+        front = Adw.PreferencesGroup(
+            title="Current Desktop" if self._current else "Desktops"
+        )
         others = Adw.PreferencesGroup(title="Other Desktops")
         for backend in self._backends:
-            up_front = backend in current or not current
-            # Up front the desktop is the group's title; among the others it
-            # titles the dropdown itself, so no dropdown sits inside another.
-            status = self._status_row(
-                backend, "Shortcuts" if up_front else backend.title
-            )
-            rows: list[Gtk.Widget] = [status]
+            up_front = backend.title in self._current or not self._current
+            status = self._status_row(backend, f"{backend.title} Shortcuts")
+            (front if up_front else others).add(status)
             if isinstance(backend, CosmicShortcuts):
                 self._float = Adw.SwitchRow(
-                    title="Tiling Window Exception",
-                    subtitle="The settings window floats instead of tiling, from the next time it opens",
+                    title="COSMIC Tiling Exception",
+                    subtitle="The settings window floats instead of tiling, "
+                    "from the next time it opens",
                     sensitive=False,  # until refresh() finds COSMIC
                 )
                 self._float_handler = self._float.connect(
                     "notify::active", self._on_float
                 )
                 if up_front:
-                    rows.append(self._float)
+                    front.add(self._float)
                 else:
-                    status.add_row(self._float)
-            if up_front:
-                group = Adw.PreferencesGroup(
-                    title=backend.title,
-                    description="Your current desktop." if current else "",
-                )
-                for row in rows:
-                    group.add(row)
-                self.add(group)
-                self._sections.append(group)
-            else:
-                others.add(status)
-        if len(current) < len(self._backends) and current:
+                    status.add_row(self._float)  # folded away with COSMIC
+        self.add(front)
+        self._sections: list[Adw.PreferencesGroup] = [front]
+        if self._current and len(self._current) < len(self._backends):
             self.add(others)
             self._sections.append(others)
 
@@ -1998,7 +1990,7 @@ class DesktopPage(Adw.PreferencesPage):
             status.set_subtitle(GLib.markup_escape_text(summary))
             for spec, chord in wanted:
                 self._add_hotkey_row(status, title, spec, chord, bound, clashes)
-            if clashes and status.get_title() == "Shortcuts":
+            if clashes and title in self._current:
                 status.set_expanded(True)  # your desktop: show what needs a look
             if isinstance(backend, CosmicShortcuts):
                 self._float.handler_block(self._float_handler)
