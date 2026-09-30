@@ -34,7 +34,7 @@ from types import MappingProxyType
 from typing import TypeGuard
 
 # Rewritten by packaging/bump-version.sh from the repo-root VERSION file.
-VERSION = "0.5.1"
+VERSION = "0.6.0"
 
 APP_ID = "io.github.shtaiven.KbKillConfig"
 APP_NAME = "kb-kill Settings"  # as the launcher names it
