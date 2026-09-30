@@ -80,9 +80,9 @@ rebuild the package or re-run `./install.sh`.
   on `/dev/input`, the 10 s tick is a backstop. Each fd carries an EVIOCSMASK so
   only EV_KEY/EV_SYN arrive.
 - **Vocabulary:** group state is `KILLED` or `AWAKE`, upper-case, in the
-  journal, monitor and detect. What a desktop user sees is not shouted: the
-  settings window writes "Killed" / "Awake" (GNOME HIG), the tray title
-  "kb-kill: killed …" / "kb-kill: awake", and the OSD "<group> killed".
+  journal, monitor and detect. What a desktop user sees is lower case: the
+  settings window ("Start killed", "killed · 2 devices"), the tray title
+  ("kb-kill: killed …" / "kb-kill: awake") and the OSD ("<group> killed").
 
 ## Packaging
 
