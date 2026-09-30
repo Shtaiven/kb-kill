@@ -851,10 +851,11 @@ class GroupPage(Adw.PreferencesPage):
         self._basics = Adw.PreferencesGroup(title="Group", description=self.HINT)
         self._label = Adw.EntryRow(title="Label", text=group.label or group.name)
         self._label.connect("changed", self._on_label)
-        self._name = Adw.ActionRow(
+        self._name = Adw.ActionRow(  # made from the label: shown, not edited
             title="Name",
             subtitle=GLib.markup_escape_text(group.name),
             css_classes=["property"],
+            sensitive=False,
         )
         self._basics.add(self._label)
         self._basics.add(self._name)
