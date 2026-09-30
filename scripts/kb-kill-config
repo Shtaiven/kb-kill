@@ -198,7 +198,7 @@ try:
     gi.require_version("Adw", "1")
     import tomlkit
     from evdev import ecodes
-    from gi.repository import Adw, Gdk, Gio, GLib, Gtk
+    from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk
 except (ImportError, ValueError) as e:
     if __name__ == "__main__":
         sys.exit(
@@ -940,6 +940,24 @@ class TopPage(Adw.PreferencesPage):
             hotkeys.add(row)
         self.add(hotkeys)
 
+        if not model.groups:
+            add = Gtk.Button(
+                label="Add Group",
+                halign=Gtk.Align.CENTER,
+                css_classes=["suggested-action", "pill"],
+            )
+            add.connect("clicked", lambda _b: win.add_group())
+            holder = Adw.PreferencesGroup()
+            holder.add(
+                Adw.StatusPage(
+                    icon_name="input-keyboard-symbolic",
+                    title="No Groups",
+                    description="A group is the devices a hotkey disables.",
+                    child=add,
+                )
+            )
+            self.add(holder)
+
     def refresh(self) -> None:
         for row in self._combos:
             row.refresh()
@@ -1410,6 +1428,9 @@ class CosmicShortcuts:
                 )
         return out
 
+    def has_own(self) -> bool:
+        return any(self.TAG in e for e in self._entries())
+
     def bound(self, chords: list[Chord]) -> set[Chord]:
         """The `chords` a shortcut already swallows: ours, or a no-op of yours.
         The file's key names are compared case-insensitively (F5 vs f5)."""
@@ -1584,6 +1605,9 @@ class GnomeShortcuts:
     def _paths(self) -> list[str]:
         return list(Gio.Settings.new(self.SCHEMA).get_strv("custom-keybindings"))
 
+    def has_own(self) -> bool:
+        return any(p.startswith(self.OURS) for p in self._paths())
+
     def _child(self, path: str) -> "Gio.Settings":
         return Gio.Settings.new_with_path(self.CHILD, path)
 
@@ -1726,6 +1750,9 @@ class KdeShortcuts:
                 check=False,
             )  # fmt: skip
 
+    def has_own(self) -> bool:
+        return bool(self._files())
+
     def _files(self) -> list[str]:
         try:
             return sorted(f for f in os.listdir(self.apps) if f.startswith(self.PREFIX))
@@ -1840,6 +1867,15 @@ class DesktopPage(Adw.PreferencesPage):
         self._status: dict[str, Adw.ActionRow] = {}
         self._buttons: dict[str, tuple[Gtk.Button, Gtk.Button]] = {}
 
+        self._empty = Adw.PreferencesGroup(visible=False)
+        self._empty.add(
+            Adw.StatusPage(
+                icon_name="preferences-desktop-keyboard-shortcuts-symbolic",
+                title="No Hotkeys Yet",
+                description="Save a group with hotkeys; they show up here.",
+            )
+        )
+        self.add(self._empty)
         self._combos = Adw.PreferencesGroup(
             title="Keep Hotkeys Away From Apps",
             description="A do-nothing desktop shortcut stops a hotkey reaching the "
@@ -1847,29 +1883,15 @@ class DesktopPage(Adw.PreferencesPage):
         )
         self.add(self._combos)
 
+        # Your desktop up front; the rest only on request (HIG: hide what does
+        # not apply). With no desktop recognised, all of them are up front.
         here = current_desktops()
+        current = [b for b in self._backends if b.title.split()[0].upper() in here]
+        self._sections: list[Adw.PreferencesGroup] = []
+        self._expanders: dict[str, Adw.ExpanderRow] = {}
+        others = Adw.PreferencesGroup(title="Other Desktops")
         for backend in self._backends:
-            current = backend.title.split()[0].upper() in here
-            group = Adw.PreferencesGroup(
-                title=backend.title,
-                description="Your current desktop." if current else "",
-            )
-            status = Adw.ActionRow(title="Shortcuts")
-            apply = Gtk.Button(
-                label="Apply", valign=Gtk.Align.CENTER, css_classes=["suggested-action"]
-            )
-            remove = Gtk.Button(
-                label="Remove", valign=Gtk.Align.CENTER, css_classes=["flat"]
-            )
-            apply.set_tooltip_text("Bind every hotkey above to a do-nothing shortcut")
-            remove.set_tooltip_text("Remove the shortcuts kb-kill added")
-            apply.connect("clicked", lambda _b, be=backend: self._apply(be))
-            remove.connect("clicked", lambda _b, be=backend: self._remove(be))
-            status.add_suffix(remove)
-            status.add_suffix(apply)
-            group.add(status)
-            self._status[backend.title] = status
-            self._buttons[backend.title] = (apply, remove)
+            rows = [self._status_row(backend)]
             if isinstance(backend, CosmicShortcuts):
                 self._float = Adw.SwitchRow(
                     title="Float Settings Window",
@@ -1879,8 +1901,43 @@ class DesktopPage(Adw.PreferencesPage):
                 self._float_handler = self._float.connect(
                     "notify::active", self._on_float
                 )
-                group.add(self._float)
-            self.add(group)
+                rows.append(self._float)
+            if backend in current or not current:
+                group = Adw.PreferencesGroup(
+                    title=backend.title,
+                    description="Your current desktop." if current else "",
+                )
+                for row in rows:
+                    group.add(row)
+                self.add(group)
+                self._sections.append(group)
+            else:
+                expander = Adw.ExpanderRow(title=backend.title)
+                for row in rows:
+                    expander.add_row(row)
+                others.add(expander)
+                self._expanders[backend.title] = expander
+        if self._expanders:
+            self.add(others)
+            self._sections.append(others)
+
+    def _status_row(self, backend) -> Adw.ActionRow:
+        status = Adw.ActionRow(title="Shortcuts")
+        apply = Gtk.Button(
+            label="Apply", valign=Gtk.Align.CENTER, css_classes=["suggested-action"]
+        )
+        remove = Gtk.Button(
+            label="Remove", valign=Gtk.Align.CENTER, css_classes=["flat"]
+        )
+        apply.set_tooltip_text("Bind every hotkey above to a do-nothing shortcut")
+        remove.set_tooltip_text("Remove the shortcuts kb-kill added")
+        apply.connect("clicked", lambda _b: self._apply(backend))
+        remove.connect("clicked", lambda _b: self._remove(backend))
+        status.add_suffix(remove)
+        status.add_suffix(apply)
+        self._status[backend.title] = status
+        self._buttons[backend.title] = (apply, remove)
+        return status
 
     def refresh(self) -> None:
         for row in self._combo_rows:
@@ -1910,10 +1967,9 @@ class DesktopPage(Adw.PreferencesPage):
                 row.add_prefix(icon)
             self._combos.add(row)
             self._combo_rows.append(row)
-        if not wanted:
-            row = Adw.ActionRow(title="No Saved Hotkeys")
-            self._combos.add(row)
-            self._combo_rows.append(row)
+        self._empty.set_visible(not wanted)
+        for section in (self._combos, *self._sections):
+            section.set_visible(bool(wanted))
 
         for backend in self._backends:
             status, (apply, remove) = (
@@ -1924,17 +1980,23 @@ class DesktopPage(Adw.PreferencesPage):
             if isinstance(backend, CosmicShortcuts):
                 self._float.set_sensitive(why is None)  # never create COSMIC's files
             apply.set_sensitive(why is None and bool(chords))
-            remove.set_sensitive(why is None)
+            remove.set_visible(False)
+            expander = self._expanders.get(backend.title)
             if why:
                 status.set_subtitle(GLib.markup_escape_text(why))
+                if expander:
+                    expander.set_subtitle(GLib.markup_escape_text(why))
                 continue
             try:
                 n = len(backend.bound(chords) & set(chords))
-                status.set_subtitle(f"{n} of {len(chords)} hotkeys swallowed")
+                summary = f"{n} of {len(chords)} hotkeys swallowed"
+                remove.set_visible(backend.has_own())  # only once there is any
             except (ValueError, OSError, GLib.Error) as e:
-                status.set_subtitle(GLib.markup_escape_text(str(e)))
+                summary = str(e)
                 apply.set_sensitive(False)
-                remove.set_sensitive(False)
+            status.set_subtitle(GLib.markup_escape_text(summary))
+            if expander:
+                expander.set_subtitle(GLib.markup_escape_text(summary))
             if isinstance(backend, CosmicShortcuts):
                 self._float.handler_block(self._float_handler)
                 self._float.set_active(backend.floating())
@@ -2087,11 +2149,29 @@ class ConfigWindow(Adw.ApplicationWindow):
         )
         self._stack.connect("notify::visible-child-name", self._on_tab)
 
-        header = Adw.HeaderBar(
-            title_widget=Adw.ViewSwitcher(
-                stack=self._stack, policy=Adw.ViewSwitcherPolicy.WIDE
-            )
+        # Wide: tabs in the header. Narrow: the app name there, tabs at the bottom.
+        switcher = Adw.ViewSwitcher(
+            stack=self._stack, policy=Adw.ViewSwitcherPolicy.WIDE
         )
+        app_title = Adw.WindowTitle(title=APP_NAME, visible=False)
+        titles = Gtk.Box()
+        titles.append(switcher)
+        titles.append(app_title)
+        header = Adw.HeaderBar(title_widget=titles)
+        switcher_bar = Adw.ViewSwitcherBar(stack=self._stack)
+        self._sidebar_button = Gtk.ToggleButton(
+            icon_name="sidebar-show-symbolic", tooltip_text="Show Groups", visible=False
+        )
+        self._sidebar_button.update_property(
+            [Gtk.AccessibleProperty.LABEL], ["Show Groups"]
+        )
+        self._split.bind_property(  # the split view's state wins at start
+            "show-sidebar",
+            self._sidebar_button,
+            "active",
+            GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE,
+        )
+        header.pack_start(self._sidebar_button)
         self._revert = Gtk.Button(label="Revert")
         self._revert.connect("clicked", lambda _b: self.revert())
         header.pack_start(self._revert)
@@ -2139,7 +2219,17 @@ class ConfigWindow(Adw.ApplicationWindow):
         view.add_top_bar(header)
         view.add_top_bar(self._banner)
         view.set_content(self._toasts)
+        view.add_bottom_bar(switcher_bar)
         self.set_content(view)
+
+        self.set_size_request(360, 294)  # the HIG's smallest phone-sized window
+        narrow = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 640sp"))
+        narrow.add_setter(self._split, "collapsed", True)
+        narrow.add_setter(switcher, "visible", False)
+        narrow.add_setter(app_title, "visible", True)
+        narrow.add_setter(switcher_bar, "reveal", True)
+        self.add_breakpoint(narrow)
+        self._split.connect("notify::collapsed", self._on_collapsed)
 
         self.connect("close-request", self._on_close_request)
         self._monitor = self._watch_config()
@@ -2150,14 +2240,14 @@ class ConfigWindow(Adw.ApplicationWindow):
         self._list = Gtk.ListBox(css_classes=["navigation-sidebar"])
         self._list.connect("row-selected", self._on_row_selected)
         add = Gtk.Button(
-            child=Adw.ButtonContent(icon_name="list-add-symbolic", label="Add group"),
+            child=Adw.ButtonContent(icon_name="list-add-symbolic", label="Add Group"),
             css_classes=["flat"],
             margin_start=6,
             margin_end=6,
             margin_bottom=6,
         )
         add.connect("clicked", lambda _b: self.add_group())
-        sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, width_request=250)
+        sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         sidebar.append(
             Gtk.ScrolledWindow(
                 child=self._list, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER
@@ -2165,10 +2255,12 @@ class ConfigWindow(Adw.ApplicationWindow):
         )
         sidebar.append(add)
         self._content = Gtk.Stack(hexpand=True)
-        self._groups_view = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        self._groups_view.append(sidebar)
-        self._groups_view.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
-        self._groups_view.append(self._content)
+        # An overlay sidebar, not a navigation split view: that one wants a
+        # header bar per pane, and this window already has one for the tabs.
+        self._split = Adw.OverlaySplitView(
+            sidebar=sidebar, content=self._content, max_sidebar_width=280
+        )
+        self._groups_view = self._split
         return self._groups_view
 
     def _rebuild(self, select: str | None = None) -> None:
@@ -2197,12 +2289,19 @@ class ConfigWindow(Adw.ApplicationWindow):
         row = self._list.get_selected_row() if hasattr(self, "_list") else None
         return next((k for k, r in self._rows.items() if r is row), None)
 
+    def _on_collapsed(self, split: Adw.OverlaySplitView, _pspec) -> None:
+        """Narrow: the page, with the sidebar a button away. Wide: both."""
+        split.set_show_sidebar(not split.get_collapsed())
+        self._sync_header()
+
     def _on_row_selected(self, _list, row) -> None:
         key = next((k for k, r in self._rows.items() if r is row), None)
         if key is None:
             return
         self._content.set_visible_child_name(key)
         self._pages[key].refresh()
+        if self._split.get_collapsed():
+            self._split.set_show_sidebar(False)  # narrow: show the page picked
 
     def retitle(self, group: Group) -> None:
         if row := self._rows.get(group.key):
@@ -2220,6 +2319,7 @@ class ConfigWindow(Adw.ApplicationWindow):
     def _sync_header(self) -> None:
         on_groups = self._stack.get_visible_child_name() == "groups"
         dirty = self.dirty()
+        self._sidebar_button.set_visible(on_groups and self._split.get_collapsed())
         for button in (self._save, self._revert):
             button.set_visible(on_groups)
             button.set_sensitive(dirty and self.readable)
