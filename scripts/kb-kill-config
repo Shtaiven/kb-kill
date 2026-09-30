@@ -287,6 +287,19 @@ def combo_ok(spec: str) -> bool:
     return bool(tokens) and all(token_ok(t) for t in tokens)
 
 
+def name_from_label(label: str, taken: set[str]) -> str:
+    """A group name (GROUP_NAME_RE) made from its label: characters a name
+    cannot hold become _, at most 32, and _2, _3... when another group has it."""
+    base = re.sub(r"[^A-Za-z0-9 ._-]", "_", label.strip())[:32].rstrip()
+    if not base or not re.match(r"[A-Za-z0-9_]", base[0]):
+        base = ("_" + base)[:32]
+    name, n = base, 2
+    while name in taken:
+        suffix = f"_{n}"
+        name, n = base[: 32 - len(suffix)] + suffix, n + 1
+    return name
+
+
 def label_ok(label: str) -> bool:
     return len(label) <= LABEL_MAX_LEN and not _UNSAFE.search(label)
 
@@ -836,12 +849,15 @@ class GroupPage(Adw.PreferencesPage):
         super().__init__()
         self._win, self._group = win, group
         self._basics = Adw.PreferencesGroup(title="Group", description=self.HINT)
-        self._name = Adw.EntryRow(title="Name", text=group.name)
-        self._name.connect("changed", self._on_rename)
-        self._label = Adw.EntryRow(title="Label", text=group.label)
+        self._label = Adw.EntryRow(title="Label", text=group.label or group.name)
         self._label.connect("changed", self._on_label)
-        self._basics.add(self._name)
+        self._name = Adw.ActionRow(
+            title="Name",
+            subtitle=GLib.markup_escape_text(group.name),
+            css_classes=["property"],
+        )
         self._basics.add(self._label)
+        self._basics.add(self._name)
         self.add(self._basics)
 
         hotkeys = Adw.PreferencesGroup(
@@ -880,38 +896,25 @@ class GroupPage(Adw.PreferencesPage):
         danger.add(delete)
         self.add(danger)
 
-    def _name_ok(self, name: str) -> bool:
-        return self._win.name_ok(name, self._group)
-
-    HINT = "The tray shows the label, or the name if there is none."
-
-    def _describe(self) -> None:
-        """The rules only show up once a value breaks them."""
-        problems = []
-        if not self._name_ok(self._name.get_text()):
-            problems.append(
-                "A name is up to 32 letters, digits, spaces, dots, underscores "
-                "or hyphens, and no other group may have it."
-            )
-        if not label_ok(self._label.get_text().strip()):
-            problems.append("A label is up to 64 printable characters.")
-        self._basics.set_description(" ".join(problems) or self.HINT)
-
-    def _on_rename(self, row: Adw.EntryRow) -> None:
-        """A name that is invalid or taken stays red and is not taken on."""
-        name = row.get_text().strip()
-        ok = self._name_ok(name)
-        _entry_error(row, not ok)
-        self._describe()
-        if ok:
-            self._group.name = name
-            self._win.changed()
-            self._win.retitle(self._group)
+    HINT = (
+        "The tray shows the label. The name is made from it, for kb-kill.toml "
+        "and the journal."
+    )
 
     def _on_label(self, row: Adw.EntryRow) -> None:
-        self._group.label = row.get_text()
-        _entry_error(row, not label_ok(self._group.label.strip()))
-        self._describe()
+        """The name follows the label; a label that breaks the rules stays red
+        and is not taken on."""
+        label = row.get_text().strip()
+        ok = bool(label) and label_ok(label)
+        _entry_error(row, not ok)
+        self._basics.set_description(
+            self.HINT if ok else "A label is 1 to 64 printable characters."
+        )
+        if not ok:
+            return
+        self._group.label = label
+        self._group.name = self._win.name_for(label, self._group)
+        self._name.set_subtitle(GLib.markup_escape_text(self._group.name))
         self._win.changed()
         self._win.retitle(self._group)
 
@@ -2390,10 +2393,9 @@ class ConfigWindow(Adw.ApplicationWindow):
         self._save_action.set_enabled(dirty and self.readable)
         self.set_title(f"• {APP_NAME}" if dirty else APP_NAME)
 
-    def name_ok(self, name: str, group: Group) -> bool:
-        name = name.strip()
+    def name_for(self, label: str, group: Group | None) -> str:
         taken = {g.name.strip() for g in self.model.groups if g is not group}
-        return bool(GROUP_NAME_RE.match(name)) and name not in taken
+        return name_from_label(label, taken)
 
     def _group(self, key: str) -> Group | None:
         return next((g for g in self.model.groups if g.key == key), None)
@@ -2409,21 +2411,22 @@ class ConfigWindow(Adw.ApplicationWindow):
         self._rebuild(select="top")
         self.changed()
 
-    def _set_name(self, group: Group, name: str) -> None:
-        group.name = name
+    def _set_label(self, group: Group, label: str, name: str) -> None:
+        group.label, group.name = label, name
         self._rebuild(select=group.key)
         self.changed()
 
     def add_group(self) -> None:
-        taken = {g.name for g in self.model.groups}
-        name = next(
-            f"group-{i}" for i in itertools.count(1) if f"group-{i}" not in taken
+        shown = {g.label.strip() or g.name.strip() for g in self.model.groups}
+        label = next(
+            f"Group {i}" for i in itertools.count(1) if f"Group {i}" not in shown
         )
-        group, index = Group(name=name), len(self.model.groups)
+        group = Group(label=label, name=self.name_for(label, None))
+        index = len(self.model.groups)
         self._insert(group, index)
         self._push(
             Edit(
-                f"Add {name}",
+                f"Add {label}",
                 undo=lambda: self._drop(group),
                 redo=lambda: self._insert(group, index),
             )
@@ -2449,16 +2452,19 @@ class ConfigWindow(Adw.ApplicationWindow):
         )
         self._toasts.add_toast(toast)
 
-    def rename_group(self, group: Group, name: str) -> None:
-        old, name = group.name, name.strip()
-        if name == old:
+    def rename_group(self, group: Group, label: str) -> None:
+        """Rename sets the label; the name is made from it (one undo step)."""
+        label = label.strip()
+        old = (group.label, group.name)
+        if label == (group.label.strip() or group.name):
             return
-        self._set_name(group, name)
+        new = (label, self.name_for(label, group))
+        self._set_label(group, *new)
         self._push(
             Edit(
-                f"Rename {old}",
-                undo=lambda: self._set_name(group, old),
-                redo=lambda: self._set_name(group, name),
+                f"Rename {old[0] or old[1]}",
+                undo=lambda: self._set_label(group, *old),
+                redo=lambda: self._set_label(group, *new),
             )
         )
 
@@ -2550,11 +2556,10 @@ class ConfigWindow(Adw.ApplicationWindow):
         popover = Gtk.Popover(position=Gtk.PositionType.RIGHT)
         popover.set_parent(row)
         popover.connect("closed", lambda p: GLib.idle_add(p.unparent))
-        entry = Gtk.Entry(text=group.name, hexpand=True, width_chars=20)
+        entry = Gtk.Entry(text=group.label or group.name, hexpand=True, width_chars=20)
         button = Gtk.Button(label="Rename", css_classes=["suggested-action"])
         hint = Gtk.Label(
-            label="Up to 32 letters, digits, spaces, dots, underscores or hyphens, "
-            "and not the name of another group.",
+            label="A label is 1 to 64 printable characters.",
             wrap=True,
             max_width_chars=32,
             xalign=0,
@@ -2563,7 +2568,8 @@ class ConfigWindow(Adw.ApplicationWindow):
         )
 
         def check(*_args) -> None:
-            ok = self.name_ok(entry.get_text(), group)
+            text = entry.get_text().strip()
+            ok = bool(text) and label_ok(text)
             button.set_sensitive(ok)
             _entry_error(entry, not ok)
             hint.set_visible(not ok)
@@ -2571,10 +2577,10 @@ class ConfigWindow(Adw.ApplicationWindow):
         def apply(*_args) -> None:
             if not button.get_sensitive():
                 return
-            name = entry.get_text()
+            label = entry.get_text()
             popover.popdown()
             # After the popover has let go of the row the rebuild replaces.
-            GLib.idle_add(lambda: self.rename_group(group, name) and False)
+            GLib.idle_add(lambda: self.rename_group(group, label) and False)
 
         entry.connect("changed", check)
         entry.connect("activate", apply)
@@ -2585,7 +2591,7 @@ class ConfigWindow(Adw.ApplicationWindow):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         for side in ("top", "bottom", "start", "end"):
             getattr(box, f"set_margin_{side}")(6)
-        box.append(Gtk.Label(label="Group Name", xalign=0, css_classes=["heading"]))
+        box.append(Gtk.Label(label="Group Label", xalign=0, css_classes=["heading"]))
         box.append(line)
         box.append(hint)
         popover.set_child(box)
