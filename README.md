@@ -362,7 +362,7 @@ fires it, and the desktop may keep some combos (often Super) to itself.
 
 ## Tray icon
 
-`kb-kill-tray` shows whether any group is KILLED and toggles groups from its menu
+`kb-kill-tray` shows whether any group is killed and toggles groups from its menu
 (checked = AWAKE). It uses the AppIndicator / StatusNotifierItem protocol, native on
 KDE and COSMIC, and on GNOME with the AppIndicator extension. It runs as your
 user and only talks to the daemon over the control socket.

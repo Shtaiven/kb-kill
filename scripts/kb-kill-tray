@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """kb-kill-tray - tray icon (StatusNotifierItem / AppIndicator) for kb-kill.
 
-Shows whether each group is KILLED or AWAKE and toggles a group from its menu
+Shows whether each group is killed or awake and toggles a group from its menu
 entry, over the daemon's control socket. Runs as the user; needs PyGObject with
 Gtk 3 and AyatanaAppIndicator3 (or the legacy AppIndicator3). On a toggle it
 also flashes an on-screen display (on by default), which gtk-layer-shell
@@ -497,9 +497,9 @@ class Tray:
         if not self.connected:
             self.ind.set_title("kb-kill: connecting…")
         elif killed:
-            self.ind.set_title("kb-kill: KILLED " + ", ".join(killed))
+            self.ind.set_title("kb-kill: killed " + ", ".join(killed))
         else:
-            self.ind.set_title("kb-kill: AWAKE")
+            self.ind.set_title("kb-kill: awake")
         key = (self.connected, tuple((g["name"], g.get("label")) for g in self.groups))
         if key != self._menu_key:
             self._menu_key = key
@@ -531,7 +531,7 @@ class Tray:
             item.set_sensitive(False)
             menu.append(item)
         for g in self.groups if self.connected else []:
-            # dbusmenu renders a CheckMenuItem as a checkmark toggle: checked = AWAKE.
+            # dbusmenu renders a CheckMenuItem as a checkmark toggle: checked = awake.
             item = Gtk.CheckMenuItem(label=g.get("label") or g["name"])
             item.set_active(not g.get("killed"))
             self._handlers[g["name"]] = item.connect(
