@@ -538,7 +538,7 @@ class Tray:
             self._items[g["name"]] = item
             menu.append(item)
         menu.append(Gtk.SeparatorMenuItem())
-        settings_item = Gtk.MenuItem(label="Configuration…")
+        settings_item = Gtk.MenuItem(label="Settings…")
         settings_item.connect("activate", self._on_open_settings)
         menu.append(settings_item)
         quit_item = Gtk.MenuItem(label="Quit tray")

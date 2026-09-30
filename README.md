@@ -40,7 +40,7 @@ sudo dnf install ./kb-kill-*.noarch.rpm
 ```
 
 kb-kill does nothing until you define a group. Open **kb-kill Settings** (from
-the app menu, the tray's **Configuration…**, or `kb-kill-config`), add a
+the app menu, the tray's **Settings…**, or `kb-kill-config`), add a
 group, pick a target device and record a kill and a wake hotkey; or edit
 `~/.config/kb-kill/kb-kill.toml` (created from `/etc/kb-kill/kb-kill.toml`) by
 hand. Then check:
@@ -308,7 +308,7 @@ daemon reporting that it acted. Then:
 
 ## Settings window
 
-`kb-kill-config` (**kb-kill Settings** in the app menu, or **Configuration…**
+`kb-kill-config` (**kb-kill Settings** in the app menu, or **Settings…**
 in the tray) edits both of your files, one tab each:
 
 - **Groups** edits `kb-kill.toml`. **Defaults** holds the hotkeys
@@ -377,7 +377,7 @@ There is no shared protocol for this, so the tray picks a backend at runtime:
 else a `gtk-layer-shell` surface it draws itself (mutter does not support
 layer-shell, hence the split). With no backend available nothing pops.
 
-**Configuration…** in the menu opens the settings window, whose **Tray** tab
+**Settings…** in the menu opens the settings window, whose **Tray** tab
 turns the display on and off (on by default) and sets its geometry. The tray
 keeps these in `~/.config/kb-kill/tray.toml`, its own file rather than the config
 pushed to the daemon, and follows it live: every change flashes a preview card.
