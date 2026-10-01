@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=kb-kill Settings
+GenericName=Input Device Disabler Settings
+Comment=Set up kb-kill groups, hotkeys and the tray
+Exec=/usr/local/bin/kb-kill-config
+Icon=/usr/local/share/kb-kill/icons/kb-kill-awake.svg
+Terminal=false
+Categories=Settings;HardwareSettings;Utility;
+Keywords=keyboard;mouse;touchpad;disable;hotkey;kb-kill;settings;
+StartupNotify=true
+StartupWMClass=io.github.shtaiven.KbKillConfig

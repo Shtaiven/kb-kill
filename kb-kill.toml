@@ -12,19 +12,20 @@
 #
 # ─── How to enable it ─────────────────────────────────────────────────────────
 # 1. Find your device's name:     kb-kill-detect
-# 2. Uncomment the default group below and set `keyboards` (or `pointers` /
-#    `devices`) to that name.
+# 2. Uncomment the default hotkeys and the [groups.laptop] table below, and set
+#    `keyboards` (or `pointers` / `devices`) to that name.
 # 3. Keep (or change) the kill/wake combos — both are REQUIRED; there is no
-#    hidden default. Save; it applies live.
+#    hidden default. Save; it applies live. (Or use the settings window,
+#    kb-kill-config, which writes this file for you.)
 #
 # ─── Groups ──────────────────────────────────────────────────────────────────
 # Each "group" is a set of target devices with its own kill/wake hotkeys:
 #
-#   * Top-level keys (uncommented, below) form the DEFAULT group, if they include
-#     a matcher field. Their kill_combo/wake_combo also act as DEFAULTS inherited
-#     by every [groups.*] table (`virtual` is per-group, never inherited).
-#   * Each [groups.<name>] table adds another group, inheriting kill_combo /
-#     wake_combo it doesn't set. `virtual` defaults to "auto" per group.
+#   * Each [groups.<name>] table is one group.
+#   * The top level holds ONLY kill_combo / wake_combo: the DEFAULT hotkeys every
+#     group inherits when it doesn't set its own. Group keys (keyboards, label,
+#     virtual, ...) at the top level are an error: they belong in a group.
+#   * `virtual` is per group, never inherited, and defaults to "auto".
 #   * A group is matched by up to three name fields (case-insensitive; each a
 #     string or list of strings). An entry is matched against the WHOLE device
 #     name: EXACTLY if it has no wildcard, otherwise as a bash-style glob
@@ -34,9 +35,14 @@
 #     At least ONE is required — set several to target them together:
 #       keyboards = ...   → keyboard-class devices only
 #       pointers  = ...   → pointing devices only (mice, trackballs, touchpads)
-#       devices   = ...   → ANY input device, regardless of class
+#       devices   = ...   → keyboards and pointers alike, whichever class
 #   * Optional per group: label = "Laptop keyboard" — a display name the tray
 #     shows instead of the group's table key. Cosmetic only.
+#   * Optional per group: start_killed = true — the group starts killed, not
+#     awake, when you log in and whenever this file is saved (not when you
+#     switch back to a running session, or after sleep or lock: those keep
+#     whatever state the group had). Not inherited. Wake it with its
+#     wake_combo as usual.
 #   * TOML rule: top-level keys MUST come before any [groups.*] table.
 #   * Give each group a DISTINCT combo (a shared combo just toggles both groups
 #     together — which is how you kill a physical + a virtual target at once).
@@ -48,10 +54,14 @@
 # KEY_* name, or a numeric keycode.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ─── Default group (uncomment + edit to enable) ───────────────────────────────
-# keyboards  = "AT Translated Set 2 keyboard"   # exact name (see kb-kill-detect)
-# kill_combo = "ctrl+alt+shift+k"               # required — no default
-# wake_combo = "ctrl+alt+shift+w"               # required — no default
+# ─── Default hotkeys (uncomment + edit) ────────────────────────────────────────
+# kill_combo = "ctrl+alt+shift+k"   # inherited by every group that sets none
+# wake_combo = "ctrl+alt+shift+w"
+
+# ─── A keyboard group (uncomment + edit to enable) ────────────────────────────
+# [groups.laptop]
+# label     = "Laptop keyboard"                # optional: shown in the tray
+# keyboards = "AT Translated Set 2 keyboard"   # exact name (see kb-kill-detect)
 #
 # `virtual` says what to do about a remapper that "fronts" a device (grabs it and
 # re-emits its events through a virtual "forwarded" copy):

@@ -36,6 +36,7 @@ import struct
 import sys
 import time
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
 
 try:
@@ -52,7 +53,7 @@ except ImportError:
     sys.exit(1)
 
 # Rewritten by packaging/bump-version.sh from the repo-root VERSION file.
-VERSION = "0.5.1"
+VERSION = "0.6.0"
 
 _CTRL = frozenset({ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL})
 _ALT = frozenset({ecodes.KEY_LEFTALT, ecodes.KEY_RIGHTALT})
@@ -92,6 +93,10 @@ HANDSHAKE_SECONDS = 10  # drop a connection that never sends a command
 GROUP_NAME_RE = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9 ._-]{0,31}\Z")
 LABEL_MAX_LEN = 64
 SEATS_DIR = "/run/systemd/seats"
+SESSIONS_DIR = "/run/systemd/sessions"
+# A session this young when the daemon first sees it counts as a fresh login
+# (the daemon started at boot); an older one means the daemon restarted.
+START_KILLED_GRACE = 120.0
 INPUT_DIR = "/dev/input"
 
 _IN_ATTRIB, _IN_CLOSE_WRITE, _IN_MOVED_TO, _IN_CREATE, _IN_DELETE = (
@@ -158,7 +163,7 @@ def log_warn(msg: str) -> None:
 
 
 class _RateLimiter:
-    """Token bucket. Global on purpose: it is the only bound on the KILLED/AWAKE
+    """Token bucket. Global on purpose: it is the only bound on the killed/awake
     channel, and there is no cap on group count."""
 
     def __init__(self, burst: int, refill: float) -> None:
@@ -195,25 +200,61 @@ def log_state(msg: str, pri: int = PRI_INFO) -> None:
 # --------------------------------------------------------------------------- #
 # logind seat + inotify
 # --------------------------------------------------------------------------- #
-def active_uids() -> set[int]:
-    """uids owning a foreground session, one per seat (empty when headless)."""
-    uids: set[int] = set()
+def active_sessions() -> dict[str, int]:
+    """session id -> uid of each seat's foreground session."""
+    out: dict[str, int] = {}
     try:
         names = os.listdir(SEATS_DIR)
     except OSError:
-        return uids
+        return out
     for name in names:
+        fields: dict[str, str] = {}
         try:
             with open(os.path.join(SEATS_DIR, name)) as fh:
                 for line in fh:
-                    if line.startswith("ACTIVE_UID="):
-                        val = line.strip().split("=", 1)[1]
-                        if val.isdigit():
-                            uids.add(int(val))
-                        break
+                    key, _, val = line.strip().partition("=")
+                    fields[key] = val
         except OSError:
             continue
-    return uids
+        sid, uid = fields.get("ACTIVE", ""), fields.get("ACTIVE_UID", "")
+        if sid.isalnum() and uid.isdigit():
+            out[sid] = int(uid)
+    return out
+
+
+def session_age(sid: str) -> float | None:
+    """Seconds since logind created session `sid`, or None if unknown. On the
+    monotonic clock (logind's MONOTONIC=), so a wall-clock step (NTP fixing a
+    fast RTC after boot) cannot turn a daemon restart into a login."""
+    fields: dict[str, str] = {}
+    try:
+        with open(os.path.join(SESSIONS_DIR, sid)) as fh:
+            for line in fh:
+                key, _, val = line.strip().partition("=")
+                fields[key] = val
+    except OSError:
+        return None
+    try:
+        if "MONOTONIC" in fields:
+            return time.monotonic() - int(fields["MONOTONIC"]) / 1e6
+        if "REALTIME" in fields:
+            return time.time() - int(fields["REALTIME"]) / 1e6
+    except ValueError:
+        pass
+    return None
+
+
+def _existing_sessions() -> set[str]:
+    """Every session logind still has, active or not."""
+    try:
+        return {n for n in os.listdir(SESSIONS_DIR) if n.isalnum()}
+    except OSError:
+        return set()
+
+
+def _is_new_session(sid: str) -> bool:
+    age = session_age(sid)
+    return age is not None and age < START_KILLED_GRACE
 
 
 class InotifyWatch:
@@ -274,6 +315,7 @@ class Group:
         kill_raw: str,
         wake_raw: str,
         virtual: bool | None,
+        start_killed: bool = False,
     ) -> None:
         self.name = name
         self.label = label
@@ -285,6 +327,7 @@ class Group:
         self.kill_combo = _parse_combo(kill_raw)
         self.wake_combo = _parse_combo(wake_raw)
         self.virtual = virtual  # None = "auto" (pair with a fronting remapper copy)
+        self.start_killed = start_killed  # killed when its user becomes live
         # runtime
         self.targets: dict[str, InputDevice] = {}
         self.killed = False
@@ -325,6 +368,8 @@ def _parse_combo(spec: str) -> list[frozenset[int]]:
     tokens = [tok for tok in spec.split("+") if tok.strip()]
     if not tokens:
         raise ConfigError(f"empty combo: {spec!r}")
+    if len(tokens) > MAX_COMBO_TOKENS:
+        raise ConfigError(f"a combo has at most {MAX_COMBO_TOKENS} keys")
     return [_parse_token(tok) for tok in tokens]
 
 
@@ -336,10 +381,16 @@ _GROUP_KEYS = {
     "wake_combo",
     "virtual",
     "virtual_keyboard",
+    "start_killed",
 }
+_TOP_KEYS = {"kill_combo", "wake_combo"}
 _GLOB_META_RE = re.compile(r"[*?]|\[[!^]?\]?[^]]*\]")
 _NEG_CLASS_RE = re.compile(r"\[\^([^]]*\])")
 MAX_PATTERNS_PER_ENTRY = 256  # brace expansion cap; configs come from any local uid
+# Parse cost (and check_config's reply) grows with combo keys x groups; any
+# local uid can send a config, and the loop reads no key events meanwhile.
+MAX_COMBO_TOKENS = 16
+MAX_GROUPS = 64
 
 
 def _is_glob(pattern: str) -> bool:
@@ -402,19 +453,25 @@ def _as_names(value: object, where: str, field: str) -> list[str]:
     return names
 
 
-def _warn_unknown_keys(table: dict, where: str) -> None:
+Warn = Callable[[str], None]
+
+
+def _journal_warn(msg: str) -> None:
+    CTRL_LOG.emit(f"warning: {msg}", PRI_WARN)
+
+
+def _warn_unknown_keys(table: dict, where: str, warn: Warn) -> None:
     unknown = [key for key in table if key not in _GROUP_KEYS]
     for key in unknown[:4]:
-        CTRL_LOG.emit(f"warning: {where}: unknown key {key!r} (ignored)", PRI_WARN)
+        warn(f"{where}: unknown key {key!r} (ignored)")
     if len(unknown) > 4:
-        CTRL_LOG.emit(
-            f"warning: {where}: {len(unknown) - 4} further unknown key(s) ignored",
-            PRI_WARN,
-        )
+        warn(f"{where}: {len(unknown) - 4} further unknown key(s) ignored")
 
 
-def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
-    _warn_unknown_keys(table, where)
+def _build_group(
+    name: str, table: dict, defaults: dict, where: str, warn: Warn
+) -> Group:
+    _warn_unknown_keys(table, where, warn)
     matchers = {f: _as_names(table[f], where, f) for f in _MATCH_KEYS if f in table}
     if not matchers:
         raise ConfigError(
@@ -426,10 +483,7 @@ def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
             f"{where}: set 'virtual' or its deprecated alias 'virtual_keyboard', not both"
         )
     if "virtual_keyboard" in table:
-        CTRL_LOG.emit(
-            f"warning: {where}: 'virtual_keyboard' is deprecated, use 'virtual'",
-            PRI_WARN,
-        )
+        warn(f"{where}: 'virtual_keyboard' is deprecated, use 'virtual'")
     virtual = table.get("virtual", table.get("virtual_keyboard", "auto"))
     if isinstance(virtual, str) and virtual.strip().lower() == "auto":
         virtual = None
@@ -445,6 +499,10 @@ def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
             raise ConfigError(
                 f"{where}: invalid 'label' {_safe(label)!r}: up to {LABEL_MAX_LEN} printable characters"
             )
+
+    start_killed = table.get("start_killed", False)
+    if not isinstance(start_killed, bool):
+        raise ConfigError(f"{where}: 'start_killed' must be true or false")
 
     kill_raw = table.get("kill_combo", defaults["kill_combo"])
     wake_raw = table.get("wake_combo", defaults["wake_combo"])
@@ -465,14 +523,16 @@ def _build_group(name: str, table: dict, defaults: dict, where: str) -> Group:
             kill_raw,
             wake_raw,
             virtual,
+            start_killed,
         )
     except ConfigError as e:
         raise ConfigError(f"{where}: {e}")
 
 
-def parse_config(doc: object, source: str) -> Config:
-    """Top-level keys form the "default" group (if they include a matcher) and
-    supply combo defaults for every [groups.*] table."""
+def parse_config(doc: object, source: str, warn: Warn = _journal_warn) -> Config:
+    """The top level holds only kill_combo/wake_combo, the defaults every
+    [groups.*] table inherits. Warnings go to `warn`, the journal unless a
+    caller (check_config) must keep them out of it."""
     if not isinstance(doc, dict):
         raise ConfigError(f"{source}: top level must be a table")
     sections = doc.pop("groups", {})
@@ -483,11 +543,22 @@ def parse_config(doc: object, source: str) -> Config:
         "wake_combo": doc.get("wake_combo"),
     }
 
+    # There used to be a "default" group made of top-level keys. Refuse it
+    # rather than guess: it now belongs in a [groups.<name>] table.
+    stray = [k for k in doc if k in _GROUP_KEYS and k not in _TOP_KEYS]
+    if stray:
+        raise ConfigError(
+            f"{source} [top-level]: {', '.join(repr(k) for k in stray[:4])} "
+            "must be in a [groups.<name>] table (the top-level default group is "
+            "gone; the top level only holds kill_combo and wake_combo)"
+        )
+    _warn_unknown_keys(
+        {k: v for k, v in doc.items() if k not in _TOP_KEYS}, source, warn
+    )
+
     groups = []
-    if any(f in doc for f in _MATCH_KEYS):
-        groups.append(_build_group("default", doc, defaults, f"{source} [top-level]"))
-    else:
-        _warn_unknown_keys(doc, source)
+    if len(sections) > MAX_GROUPS:
+        raise ConfigError(f"{source}: at most {MAX_GROUPS} groups")
     for name, table in sections.items():
         if not GROUP_NAME_RE.match(name):
             raise ConfigError(
@@ -496,9 +567,11 @@ def parse_config(doc: object, source: str) -> Config:
             )
         if not isinstance(table, dict):
             raise ConfigError(f"{source}: [groups.{name}] must be a table")
-        groups.append(_build_group(name, table, defaults, f"{source} [groups.{name}]"))
+        groups.append(
+            _build_group(name, table, defaults, f"{source} [groups.{name}]", warn)
+        )
     if not groups:
-        CTRL_LOG.emit(f"{source}: no groups defined; inert (monitor only)")
+        warn(f"{source}: no groups defined; inert (monitor only)")
     return Config(groups, source)
 
 
@@ -513,11 +586,13 @@ def load_config_file(path: str) -> Config:
         raise ConfigError(f"{p}: {e}")
 
 
-def load_config_text(text: str, source: str) -> Config:
+def load_config_text(text: str, source: str, warn: Warn = _journal_warn) -> Config:
     try:
-        return parse_config(tomllib.loads(text), source)
-    except (tomllib.TOMLDecodeError, TypeError, ValueError) as e:
-        raise ConfigError(f"{source}: {e}")
+        return parse_config(tomllib.loads(text), source, warn)
+    except (tomllib.TOMLDecodeError, TypeError, ValueError, RecursionError) as e:
+        raise ConfigError(
+            f"{source}: {'nested too deeply' if isinstance(e, RecursionError) else e}"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -623,10 +698,20 @@ class KbKill:
         self.live_uid: int | None = None
         self.groups: list[Group] = []
         self.forced = config is not None  # -c: pinned live, no arbitration
+        # start_killed fires once per session, at login: never when a session
+        # is switched back to, nor on a reconnect or daemon restart within it.
+        self._sessions: dict[str, int] | None = None  # None: not looked yet
+        self._armed: set[str] = set()  # sessions whose start_killed is due
+        self._seen: set[str] = set()  # sessions ever active; they had their login
+        # A dormant user's groups keep their killed state for when they are
+        # live again; a save while dormant restarts them then instead.
+        self._saved: set[int] = set()
         if config is not None:
             self.pushed[os.getuid()] = config
             self.live_uid = os.getuid()
             self.groups = config.groups
+            for g in self.groups:
+                g.killed = g.start_killed
         self.clients: dict[
             socket.socket, dict
         ] = {}  # conn -> {buf, uid, born, hello, debug}
@@ -693,15 +778,24 @@ class KbKill:
             elif until <= now:
                 del self._fronted_until[path]
 
-    def _resolve_targets(self, group: Group) -> dict[str, InputDevice]:
+    def _resolve_targets(
+        self,
+        group: Group,
+        devices: dict[str, InputDevice] | None = None,
+        fronting: dict[str, tuple[str, InputDevice]] | None = None,
+    ) -> dict[str, InputDevice]:
+        """What `group` grabs. The live devices by default; check_config's
+        preview passes its own set, so both go through this one function."""
+        devices = self.devices if devices is None else devices
+        fronting = self._fronting if fronting is None else fronting
         now = time.monotonic()
         out: dict[str, InputDevice] = {}
-        for path, dev in self.devices.items():
+        for path, dev in devices.items():
             if not self._dev_matches(group, dev):
                 continue
             if group.virtual is False:
                 out[path] = dev
-            elif (front := self._fronting.get(path)) is not None:
+            elif (front := fronting.get(path)) is not None:
                 out[front[0]] = front[1]  # the remapper's copy instead of the hardware
             elif self._fronted_until.get(path, 0.0) <= now:
                 out[path] = dev
@@ -814,8 +908,8 @@ class KbKill:
     # -- live config ---------------------------------------------------------- #
     def _install_groups(self, groups: list[Group], preserve: dict[str, bool]) -> None:
         """Make `groups` live. Ungrabs everything first (a grab never outlives its
-        config); killed state comes from `preserve`, so a user switch (empty map)
-        always starts awake."""
+        config); killed state comes from `preserve` only, so a kill is never
+        inherited: a user switch passes just that user's own state."""
         for path in list(self.grabbed):
             self._ungrab(path)
         for g in groups:
@@ -829,10 +923,87 @@ class KbKill:
         self._sync_latches(self._global_pressed())
         self.rescan()
 
+    def _track_sessions(self) -> dict[str, int]:
+        """Arm start_killed for each session active for the first time: a
+        login. One switched back to was seen before and is not armed again.
+        Already active when the daemon started, only a young session counts
+        (a login at boot rather than a daemon restart)."""
+        now = active_sessions()
+        first = self._sessions is None
+        for sid in now.keys() - self._seen:
+            if not first or _is_new_session(sid):
+                self._armed.add(sid)
+        self._seen |= now.keys()
+        self._seen &= _existing_sessions() | now.keys()  # forget ended ones
+        self._armed &= now.keys()
+        self._sessions = now
+        return now
+
+    def _start(self, groups: list[Group], start_killed: bool) -> None:
+        """Install `groups` awake, or with their start_killed groups killed.
+        Never kills a group whose wake hotkey no device we read can type:
+        that would disable input at every login with no way back."""
+        self._install_groups(
+            groups,
+            {g.name: True for g in groups if g.start_killed} if start_killed else {},
+        )
+        spared = False
+        for g in self.groups:
+            if not g.killed:
+                continue
+            if not self._can_wake(g):
+                g.killed = False
+                self._once(
+                    f"lockout:{g.name}",
+                    f"[{g.name}] not started killed: no device can type its wake hotkey",
+                    PRI_WARN,
+                )
+                spared = True
+                continue
+            if not g.targets:
+                self._once(
+                    f"notarget:{g.name}",
+                    f"[{g.name}] no target device present; will grab one when it appears",
+                    PRI_WARN,
+                )
+            log_state(f"[{g.name}] killed (start_killed)")
+        if spared:
+            self._reconcile_grabs()  # let go of what the spared group grabbed
+            self._maybe_broadcast()
+
+    def _resume(self, groups: list[Group]) -> None:
+        """Reinstall a user's groups as they last were: switching back, or the
+        seat going idle across sleep or lock, is not a restart. Their `killed`
+        is this user's own, kept on the pushed Config while dormant. No
+        lockout check: these kills were live a moment ago, and a device lost
+        across sleep is grabbed again when it returns, as while live."""
+        self._install_groups(groups, {g.name: g.killed for g in groups})
+        for g in self.groups:
+            if g.killed:
+                log_state(f"[{g.name}] killed (kept)")
+
+    def _can_wake(
+        self, group: Group, devices: dict[str, InputDevice] | None = None
+    ) -> bool:
+        """Every key of the wake hotkey exists on some device we read (a
+        killed device is still read, so its own keys count too)."""
+        caps: set[int] = set()
+        for d in (self.devices if devices is None else devices).values():
+            caps |= set(d.capabilities().get(ecodes.EV_KEY, []))
+        return all(token & caps for token in group.wake_combo)
+
     def _set_live(self, uid: int | None) -> None:
         self.live_uid = uid
         cfg = self.pushed.get(uid) if uid is not None else None
-        self._install_groups(cfg.groups if cfg else [], preserve={})
+        armed = {s for s in self._armed if (self._sessions or {}).get(s) == uid}
+        fresh = cfg is not None and (bool(armed) or uid in self._saved)
+        if fresh:
+            self._armed -= armed
+            self._saved.discard(uid)
+        if cfg is None or fresh:
+            self._start(cfg.groups if cfg else [], start_killed=fresh)
+        else:
+            self._resume(cfg.groups)
         if cfg:
             CTRL_LOG.emit(
                 f"live config: uid {uid} -> {len(self.groups)} group(s) [{', '.join(g.name for g in self.groups)}]"
@@ -845,26 +1016,115 @@ class KbKill:
     def _reevaluate_live(self) -> None:
         if self.forced:
             return
+        sessions = self._track_sessions()
         desired = next(
-            (uid for uid in sorted(active_uids()) if uid in self.pushed), None
+            (uid for uid in sorted(set(sessions.values())) if uid in self.pushed), None
         )
-        if desired != self.live_uid:
+        # A new session of the same user (a second login) is an activation too.
+        armed = any(sessions.get(s) == desired for s in self._armed)
+        if desired != self.live_uid or (desired is not None and armed):
             self._set_live(desired)
 
-    def _on_set_config(self, uid: int, text: str) -> None:
+    def _on_set_config(self, uid: int, text: str, conn: socket.socket) -> None:
+        """A re-push is a restart: every group starts awake, and the ones
+        marked start_killed killed. The sender hears about a rejection (the
+        journal is not its user's to read)."""
         try:
             cfg = load_config_text(text, f"uid {uid}")
         except ConfigError as e:
             CTRL_LOG.emit(f"rejected config from uid {uid}: {e}", PRI_WARN)
+            self._send(conn, {"type": "error", "error": _safe(f"config rejected: {e}")})
             return
+        if uid in self.pushed and uid != self.live_uid:
+            self._saved.add(uid)
         self.pushed[uid] = cfg
         if uid == self.live_uid:
-            self._install_groups(cfg.groups, {g.name: g.killed for g in self.groups})
+            self._start(cfg.groups, start_killed=True)
             CTRL_LOG.emit(
                 f"live config updated by uid {uid}: {len(self.groups)} group(s)"
             )
         else:
             self._reevaluate_live()
+
+    def _check_config(self, text: str, uid: int | None = None) -> dict:
+        """Parse a candidate config for a settings editor. Nothing reaches the
+        journal: warnings and errors go back to the caller only. The live user
+        (or root) also gets `matches` and `wakeable` (see _preview): device
+        names are theirs to see (as with `devices`), not every local uid's."""
+        warnings: list[str] = []
+        reply: dict = {"type": "config_check", "warnings": warnings}
+        try:
+            cfg = load_config_text(text, "config", warnings.append)
+        except ConfigError as e:
+            reply.update(ok=False, error=_safe(e), groups=[])
+        else:
+            reply.update(ok=True, error=None, groups=self._group_summaries(cfg))
+            if uid in (0, self.live_uid):
+                reply.update(self._preview(cfg))
+        reply["warnings"] = [_safe(w) for w in warnings]
+        return reply
+
+    @staticmethod
+    def _group_summaries(cfg: Config) -> list[dict]:
+        return [
+            {
+                "name": g.name,
+                "label": g.label or g.name,
+                "kill": g.kill_raw,
+                "wake": g.wake_raw,
+                "virtual": g.virtual_label,
+                "start_killed": g.start_killed,
+            }
+            for g in cfg.groups
+        ]
+
+    def _preview(self, cfg: Config) -> dict:
+        """`matches`: per group of `cfg`, the devices it would grab.
+        `wakeable`: per group, whether some device can type its wake hotkey
+        (else start_killed is refused). Pointers the live config does not
+        watch are opened just for this, then closed."""
+        want_pointers = any(g.pointers or g.devices for g in cfg.groups)
+        devices = {
+            p: d
+            for p, d in self.devices.items()
+            if is_keyboard(d) or (want_pointers and is_pointer(d))
+        }
+        opened: list[InputDevice] = []
+        try:
+            # Every keyboard is watched already; only pointers can be missing.
+            unwatched = (
+                set(list_devices()) - self.devices.keys() if want_pointers else ()
+            )
+            for path in sorted(unwatched):
+                try:
+                    dev = InputDevice(path)
+                except (OSError, SystemError):  # SystemError: unplugged mid-open
+                    continue
+                opened.append(dev)
+                if is_pointer(dev) or is_keyboard(dev):
+                    devices[path] = dev
+            fronting = fronting_map(devices)
+            copy_of = {copy: devices[hw].name for hw, (copy, _d) in fronting.items()}
+            wakeable = {g.name: self._can_wake(g, devices) for g in cfg.groups}
+            matches = {
+                g.name: [
+                    {
+                        "path": path,
+                        "name": _safe(dev.name),
+                        "class": device_class(dev),
+                        "virtual": is_virtual(dev),
+                        "instead_of": _safe(copy_of[path]) if path in copy_of else None,
+                    }
+                    for path, dev in sorted(
+                        self._resolve_targets(g, devices, fronting).items()
+                    )
+                ]
+                for g in cfg.groups
+            }
+            return {"matches": matches, "wakeable": wakeable}
+        finally:
+            for dev in opened:
+                dev.close()
 
     # -- grabs ---------------------------------------------------------------- #
     def _grab(self, path: str) -> bool:
@@ -969,9 +1229,9 @@ class KbKill:
                     f"[{group.name}] note: cannot wake itself; use the wake hotkey on another device",
                     PRI_WARN,
                 )
-            log_state(f"[{group.name}] KILLED ({len(group.targets)} device(s)){via}")
+            log_state(f"[{group.name}] killed ({len(group.targets)} device(s)){via}")
         else:
-            log_state(f"[{group.name}] AWAKE{via}")
+            log_state(f"[{group.name}] awake{via}")
         self._maybe_broadcast()
 
     # -- events --------------------------------------------------------------- #
@@ -1164,6 +1424,7 @@ class KbKill:
             uid, None
         ):
             CTRL_LOG.emit(f"uid {uid} disconnected; dropping its pushed config")
+            self._saved.discard(uid)
             if uid == self.live_uid:
                 self._reevaluate_live()
 
@@ -1189,7 +1450,9 @@ class KbKill:
             self._drop_client(conn)
             return
         *lines, rest = (info["buf"] + data).split(b"\n")
-        if len(rest) > MAX_LINE:
+        # Every line, finished or not: one recv can complete a line far longer
+        # than MAX_LINE, which checking only the unfinished tail would pass.
+        if max(map(len, [rest, *lines])) > MAX_LINE:
             CTRL_LOG.emit("control: dropping client (over-long line)", PRI_WARN)
             self._drop_client(conn)
             return
@@ -1197,7 +1460,7 @@ class KbKill:
         for line in lines:
             try:
                 obj = json.loads(line) if line.strip() else None
-            except ValueError:
+            except (ValueError, RecursionError):  # deep nesting: bad input
                 continue
             if isinstance(obj, dict):
                 info["hello"] = True
@@ -1207,7 +1470,15 @@ class KbKill:
         cmd = obj.get("cmd")
         if cmd == "set_config":  # any uid; governs only while that uid is live
             if isinstance(obj.get("toml"), str):
-                self._on_set_config(uid, obj["toml"])
+                self._on_set_config(uid, obj["toml"], conn)
+            return
+        if cmd == "check_config":  # any uid; parses only, installs nothing
+            if isinstance(obj.get("toml"), str):
+                self._send(conn, self._check_config(obj["toml"], uid))
+            else:  # a request/reply client would otherwise wait out its timeout
+                self._send(
+                    conn, {"type": "error", "error": "check_config needs 'toml'"}
+                )
             return
         if uid not in (0, self.live_uid):
             CTRL_LOG.emit(

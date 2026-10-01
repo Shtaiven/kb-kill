@@ -13,7 +13,7 @@ swallowed **except** the **wake** hotkey, so a killed keyboard can always wake
 itself. There is no way to lock yourself out.
 
 It works for **mice and touchpads** too: a group can target pointing devices
-(`pointers`) or any input device (`devices`), and even a keyboard and a mouse
+(`pointers`) or both kinds at once (`devices`), and even a keyboard and a mouse
 together. A killed pointer self-wakes with a mouse-button combo, or you wake it
 from the keyboard. See [Configuration](#configuration).
 
@@ -39,9 +39,11 @@ sudo apt install ./kb-kill_*_all.deb
 sudo dnf install ./kb-kill-*.noarch.rpm
 ```
 
-kb-kill does nothing until you define a group: edit
-`~/.config/kb-kill/kb-kill.toml` (created from `/etc/kb-kill/kb-kill.toml`) to
-name a target device and a `kill_combo`/`wake_combo`. Then check:
+kb-kill does nothing until you define a group. Open **kb-kill Settings** (from
+the app menu, the tray's **Settings…**, or `kb-kill-config`), add a
+group, pick a target device and record a kill and a wake hotkey; or edit
+`~/.config/kb-kill/kb-kill.toml` (created from `/etc/kb-kill/kb-kill.toml`) by
+hand. Then check:
 
 ```sh
 kb-kill-detect                           # what the daemon matches and would grab
@@ -52,6 +54,25 @@ systemctl --user status kb-kill-push     # your config pusher
 Arch users: build from the AUR recipe in `packaging/aur/`
 ([packaging/README.md](packaging/README.md)). To install from a git checkout,
 see [Install from a checkout](#install-from-a-checkout).
+
+## Upgrading to 0.6
+
+- **The top-level "default" group is gone.** `keyboards`, `pointers`, `devices`,
+  `label`, `virtual` or `start_killed` at the top level of `kb-kill.toml` is now
+  a config error, and such a config is rejected (not migrated). Move those keys
+  into a `[groups.<name>]` table; `[groups.default]` keeps the old name. The
+  top level keeps only `kill_combo` / `wake_combo`, the hotkeys every group
+  inherits. A rejected config is reported in your own journal
+  (`journalctl --user -u kb-kill-push`) and in the settings window.
+- **Saving the config is a restart:** every group starts awake again, except
+  the ones marked `start_killed`. 0.5 kept whatever was killed across a save.
+- **Sleep, lid close, lock and switching back keep state.** 0.5 woke every
+  group whenever the seat's active user changed, which logind reports across
+  suspend and lock; now each user gets back exactly what they had killed.
+- Journal, `kb-kill-monitor` and `kb-kill-detect` now say `killed` / `awake`
+  in lower case.
+- New: the settings window (`kb-kill-config`), with desktop shortcuts that keep
+  kb-kill's hotkeys away from apps, and `start_killed`.
 
 ## A note on AI usage
 
@@ -88,23 +109,28 @@ installing this on your system; never run scripts you don't trust.
 - The tray (optional) additionally needs PyGObject + GTK 3 + `AyatanaAppIndicator3`.
   Its on-screen display comes from the shell itself on GNOME and KDE; on COSMIC,
   sway and other wlroots compositors it needs `gtk-layer-shell` (GTK 3), and
-  without it the menu entry is greyed out and nothing pops. The `.deb`/`.rpm`
-  pull all of these in as weak dependencies; the commands below are for a
-  checkout install.
+  without it nothing pops.
+- The settings window `kb-kill-config` (optional) needs GTK 4, libadwaita ≥ 1.5
+  and `tomlkit`. Without them it opens `kb-kill.toml` in a text editor instead.
+  The `.deb`/`.rpm` pull all of these in as weak dependencies; the commands
+  below are for a checkout install.
 
 ```sh
 # Ubuntu / Debian / Pop!_OS
 sudo apt install python3 python3-evdev                                     # daemon
 sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 # tray
-sudo apt install gir1.2-gtklayershell-0.1                                  # tray OSD
+sudo apt install gir1.2-gtklayershell-0.1 python3-gi-cairo                 # tray OSD
+sudo apt install gir1.2-gtk-4.0 gir1.2-adw-1 python3-tomlkit               # settings
 # Fedora
 sudo dnf install python3 python3-evdev                                     # daemon
 sudo dnf install python3-gobject gtk3 libayatana-appindicator-gtk3         # tray
 sudo dnf install gtk-layer-shell                                           # tray OSD
+sudo dnf install gtk4 libadwaita python3-tomlkit                           # settings
 # Arch / Manjaro
 sudo pacman -S python python-evdev                                         # daemon
 sudo pacman -S python-gobject gtk3 libayatana-appindicator                 # tray
 sudo pacman -S gtk-layer-shell                                             # tray OSD
+sudo pacman -S gtk4 libadwaita python-tomlkit                              # settings
 ```
 
 ## Install from a checkout
@@ -137,6 +163,7 @@ killed only by a combo you set, and both `kill_combo` and `wake_combo` are
 A simple single-keyboard config:
 
 ```toml
+[groups.laptop]
 keyboards  = "AT Translated Set 2 keyboard"   # exact name (kb-kill-detect shows it)
 kill_combo = "ctrl+alt+shift+k"
 wake_combo = "ctrl+alt+shift+u"
@@ -163,7 +190,7 @@ metacharacter is a **glob**:
 | ----------- | -------------------------------------------------- |
 | `keyboards` | keyboard-class devices only                        |
 | `pointers`  | pointing devices only: mice, trackballs, touchpads |
-| `devices`   | **any** input device, regardless of class          |
+| `devices`   | keyboards and pointers alike, whichever class      |
 
 At least one field is required; set several to target them together. A pointer
 group can **self-wake** if its `wake_combo` is a mouse-button combo; otherwise
@@ -199,10 +226,31 @@ together. The old name `virtual_keyboard` is accepted as a deprecated alias.
 
 ### Groups
 
-- The **top-level** keys form the **default group** (when they include a matcher
-  field) and supply `kill_combo`/`wake_combo` defaults for every `[groups.*]`.
-- Each **`[groups.<name>]`** table adds a group. `virtual` is per group and not
+- Each **`[groups.<name>]`** table is a group. `virtual` is per group and not
   inherited. An optional `label = "…"` is the display name the tray shows.
+- The **top level** holds only `kill_combo`/`wake_combo`: the default hotkeys
+  every group inherits when it sets none. Group keys there (`keyboards`,
+  `label`, `virtual`, …) are a config error; older kb-kill read them as a
+  "default" group, and they now belong in a `[groups.<name>]` table
+  (`[groups.default]` keeps the old name).
+- `start_killed = true` (per group, not inherited) starts the group **killed**
+  when you log in (not when you switch back to a session that is already
+  running), and whenever the config is saved.
+- **Sleep, lid close and lock keep state.** A group killed before stays killed
+  after, and an awake one stays awake. logind may report the seat idle for a
+  moment across these; the daemon lets go of the grabs meanwhile and takes them
+  back when you return. Only a save, a login, a hotkey or a tray/control call
+  changes a group's state.
+- **Saving is a restart:** every change to the file (kb-kill-push re-sends it)
+  starts every group awake again, except the `start_killed` ones, which start
+  killed. A daemon or `kb-kill-push` restart mid-session starts everything
+  awake (the daemon counts a session as a fresh login only if logind created it
+  in the last two minutes).
+- A group is never started killed when no device the daemon reads can type its
+  wake hotkey: that would disable input at every login with no way back. The
+  journal says so, and the settings window warns on the group's **Start
+  killed** switch.
+- Limits: at most 64 groups, and 16 keys per hotkey.
 - A group **name** is up to 32 characters of letters, digits, space, `.`, `_`, `-`
   (it appears in log lines). A label is up to 64 printable characters.
 - TOML rule: top-level keys come **before** any `[groups.*]` table.
@@ -214,7 +262,8 @@ together. The old name `virtual_keyboard` is accepted as a deprecated alias.
 ```toml
 wake_combo = "ctrl+alt+shift+u"               # inherited below
 
-keyboards  = "AT Translated Set 2 keyboard"   # default group (the laptop)
+[groups.laptop]
+keyboards  = "AT Translated Set 2 keyboard"
 kill_combo = "ctrl+alt+shift+k"
 
 [groups.externals]
@@ -252,14 +301,16 @@ remapper maps to something else does not.
 push and tray run for every logged-in user, so each session feeds the shared
 daemon its own config. Only the config of the user **currently controlling the
 seat** governs the devices; others are held dormant. On a user switch the daemon
-swaps configs and starts the incoming one **awake**, so a kill is never inherited
-and the login greeter can never be disabled.
+swaps configs and restores the incoming user's **own** state: what they had
+killed when they left, or `start_killed` at their first login or after they
+saved the config while away. A kill is never inherited from another user, and
+the login greeter can never be disabled.
 
 ## Commands
 
 ```sh
 kb-kill-detect                 # groups, every device, which one each group targets, grabs
-sudo kb-kill-monitor           # raw key events + the daemon's real KILLED/AWAKE transitions
+sudo kb-kill-monitor           # raw key events + the daemon's real killed/awake transitions
 sudo kb-kill-monitor --debug   # ... plus the daemon's key-rate diagnostics (grab deferral, wake progress)
 journalctl -u kb-kill-daemon -f
 ```
@@ -272,7 +323,7 @@ needs `sudo`; nothing it prints is written anywhere but your terminal.
 
 Run `sudo kb-kill-monitor` and press the combo one key at a time. Each key line
 shows the device it came from; a `<<< kill combo held [group]` tag marks the
-instant the held keys form the combo, and `>>> daemon: [group] -> KILLED` is the
+instant the held keys form the combo, and `>>> daemon: [group] -> killed` is the
 daemon reporting that it acted. Then:
 
 - **No tag ever appears:** the combo never completes on evdev. A remapper is
@@ -287,10 +338,77 @@ daemon reporting that it acted. Then:
   tokens are held, which device delivered the last event, and why a grab is being
   deferred. It goes only to your terminal, never to the journal.
 
+## Settings window
+
+`kb-kill-config` (**kb-kill Settings** in the app menu, or **Settings…**
+in the tray) edits both of your files, one tab each:
+
+- **Groups** edits `kb-kill.toml`. **Defaults** holds the hotkeys
+  every group inherits; each `[groups.*]` table has its own page. The **×** on
+  a group's hotkey clears it, so the group falls back to the default. You edit a
+  group's label; its name (the `[groups.<name>]` key, also used in the journal)
+  is made from the label: lower case, with spaces and characters a name
+  cannot hold turned into `_` ("Laptop Keyboards" → `laptop_keyboards`).
+  In the sidebar, right-click a group (or press Shift+F10) to rename it (its
+  label) or delete it, or press F2 or Delete; Ctrl+Z and Ctrl+Shift+Z undo and redo adding, renaming
+  and deleting groups (Revert and a reload from disk clear that history).
+  **Matched Devices** at the bottom of a group's page shows what its kill hotkey
+  would disable right now, unsaved edits included, as the daemon itself works
+  it out (globs, and input-remapper's copy in place of the hardware); a group
+  that matches nothing says so. **+** next to a matcher lists the devices the daemon
+  sees (of that class) and inserts the exact name; you can also type a glob.
+  **Record** captures a hotkey from the keys and mouse buttons you hold together,
+  once you let go (as in GNOME Settings): Esc cancels, Backspace clears.
+  **Save** and **Revert** appear at the bottom of the tab once you have unsaved
+  edits (Ctrl+S saves too). **Save** first sends the new file to the daemon's own parser
+  (`check_config`). A config it would reject is not written, and you get the
+  reason instead of a line in the journal. A config it accepts replaces the
+  file in one step, and `kb-kill-push` applies it within about a second. Edits
+  change the file in place, so comments, key order and keys the editor does not
+  know are kept.
+- **Tray** edits `tray.toml` and applies as you change it (see
+  [Tray icon](#tray-icon)). **Start the tray when I log in** turns the tray's
+  user unit on or off for you alone (off masks it, since it is enabled for
+  every user; on unmasks it).
+- **Desktop** stops kb-kill's hotkeys from also reaching the app in front: a
+  terminal otherwise prints a keycode for ctrl+alt+shift+k. **Apply** binds each
+  hotkey in the saved config to a do-nothing desktop shortcut (`/bin/true`);
+  the desktop then takes the key, while kb-kill, which reads the keyboard
+  itself, still sees it and works as before. Nothing changes until you press
+  **Apply**, so re-apply after changing hotkeys; **Remove** deletes only the
+  shortcuts kb-kill added. A shortcut you already bound to a no-op counts as
+  done and is left alone. If a combo is already used for something else,
+  **Apply** asks first: a dialog lists each clash and what taking it over does,
+  every one off by default, and the ones you leave off are skipped. Taking one
+  over removes your own shortcut for it (COSMIC backs the file up first) or
+  takes the combo off the desktop's built-in shortcut; on COSMIC, **Remove**
+  gives a built-in back, while on GNOME and KDE you reset it in their settings. Mouse-button combos cannot be desktop shortcuts
+  and are listed as skipped. Each desktop's **Shortcuts** row (under **Current
+  Desktop**, the rest under **Other Desktops**) opens into its
+  hotkeys and their state there: swallowed, not yet, or already in use, with
+  what uses it (your own shortcuts, or the desktop's built-in ones, which a
+  swallow would replace). Your desktop's list starts open.
+  - COSMIC: entries tagged `description: Some("kb-kill")` in
+    `~/.config/cosmic/com.system76.CosmicSettings.Shortcuts/v1/custom` (the file
+    is copied to `custom.kb-kill-backup` before kb-kill first changes it, and
+    that copy is then kept). **COSMIC Tiling Exception**
+    adds a tiling exception for the window, taking effect the next time it opens.
+  - GNOME (untested): custom keybindings under
+    `org.gnome.settings-daemon.plugins.media-keys`, paths `…/kb-kill-N/`.
+  - KDE Plasma (untested): `~/.local/share/applications/kb-kill-swallow-N.desktop`
+    command shortcuts, keys in `kglobalshortcutsrc`, then a restart of
+    `plasma-kglobalaccel` (or a re-login).
+
+For anything the form does not cover, the window's menu opens either file in
+your text editor: **Open kb-kill.toml…** or **Open tray.toml…**. If a
+file changes on disk while the window is open, the tab reloads it (or offers
+to, if you have unsaved group edits). Recording a hotkey that kb-kill already uses
+fires it, and the desktop may keep some combos (often Super) to itself.
+
 ## Tray icon
 
-`kb-kill-tray` shows whether any group is KILLED and toggles groups from its menu
-(checked = AWAKE). It uses the AppIndicator / StatusNotifierItem protocol, native on
+`kb-kill-tray` shows whether any group is killed and toggles groups from its menu
+(checked = awake). It uses the AppIndicator / StatusNotifierItem protocol, native on
 KDE and COSMIC, and on GNOME with the AppIndicator extension. It runs as your
 user and only talks to the daemon over the control socket.
 
@@ -302,34 +420,36 @@ a moment to show them as one stack).
 There is no shared protocol for this, so the tray picks a backend at runtime:
 `org.gnome.Shell.ShowOSD` on GNOME, `org.kde.osdService` on KDE, and everywhere
 else a `gtk-layer-shell` surface it draws itself (mutter does not support
-layer-shell, hence the split). With no backend available the menu entry is
-greyed out and nothing pops.
+layer-shell, hence the split). With no backend available nothing pops.
 
-**On-screen display** in the menu turns it on and off — on by default. The tray
-writes that choice to `~/.config/kb-kill/tray.toml`, which is its own file, not
-the config pushed to the daemon — hence two separate menu entries: **Edit groups
-& hotkeys…** opens `kb-kill.toml` (what `kb-kill-push` sends to the daemon) and
-**Edit tray settings…** opens `tray.toml`, creating it from the current values
-if it does not exist yet:
+**Settings…** in the menu opens the settings window, whose **Tray** tab
+turns the display on and off (on by default) and sets its geometry. The tray
+keeps these in `~/.config/kb-kill/tray.toml`, its own file rather than the config
+pushed to the daemon, and follows it live: turning it on or changing its geometry flashes a preview card.
+The file is plain TOML if you would rather edit it:
 
 ```toml
-osd = true          # the menu writes this one
+osd = true          # show the on-screen display
 osd_margin = 96     # px above the bottom of the screen
 osd_opacity = 0.92  # 0.0 clear .. 1.0 solid
 ```
 
 Colours, font and (on COSMIC) corner radius come from the desktop, so only the
-geometry is here. Edited values apply the next time the tray starts; the menu
-toggle leaves them alone, and anything missing, malformed or out of range falls
-back to the defaults above.
+geometry is here. Anything missing, malformed or out of range falls back to the
+defaults above.
 
 The socket is a small newline-delimited JSON protocol if you want to script it:
 `{"cmd":"kill|wake|toggle","group":"<name>"}`, `{"cmd":"status"}`,
 `{"cmd":"devices","all":true}`; the daemon replies and broadcasts
 `{"type":"state","groups":[{name,label,killed,targets,kill,wake,kill_codes,wake_codes}]}`
 to the active user's clients on every change. Config is delivered the same way
-(`{"cmd":"set_config","toml":"…"}`, what `kb-kill-push` sends). `{"cmd":"debug"}`
-(root only) subscribes to key-rate diagnostics.
+(`{"cmd":"set_config","toml":"…"}`, what `kb-kill-push` sends), and
+`{"cmd":"check_config","toml":"…"}` parses a candidate without applying it,
+replying `{"type":"config_check","ok":…,"error":…,"warnings":[…],"groups":[…]}`
+(what the settings window checks before it saves); for the active user (or
+root) the reply also carries `"matches":{"<group>":[{path,name,class,virtual,instead_of}]}`,
+what each group would grab right now. `{"cmd":"debug"}` (root only)
+subscribes to key-rate diagnostics.
 
 ## input-remapper coexistence
 
@@ -373,10 +493,17 @@ is keylogger-*capable*. The design minimizes and contains that:
   devices, not typed keys.
 - **Nothing keystroke-paced reaches the journal.** The journal is readable by
   group adm/wheel, and any local uid may push a config, so a hostile config (one
-  group per key) could otherwise turn `KILLED`/`AWAKE` lines into a keylogger.
+  group per key) could otherwise turn killed/awake lines into a keylogger.
   State lines pass a global token bucket (burst 4, then one per 5 s); logged text
   is flattened to one printable line; group names and labels are charset-checked
   so a TOML key containing `\n` cannot forge journal records.
+- **Clients only talk to a socket they can trust.** `/run/kb-kill` (made by
+  systemd) and `$XDG_RUNTIME_DIR` (private to you) are used as found; the `/tmp`
+  fallback of a dev daemon only when you own it, since anyone could otherwise
+  create it, read the config sent to it and answer in the daemon's name.
+- **Any local uid may send a config, so parsing is bounded:** at most 64
+  groups and 16 keys per hotkey, and nesting too deep for the parser is a
+  rejected config, not a crash.
 - **Not root.** The daemon runs as a systemd `DynamicUser` with
   `SupplementaryGroups=input`; that is the whole privilege. Do **not** add your
   login user to group `input`: that would give every process you run the same
@@ -390,4 +517,5 @@ is keylogger-*capable*. The design minimizes and contains that:
   devices only while that user is the active seat user; only that user (or root)
   may kill/wake/toggle or read state. Connections, per-user connections, and
   buffered bytes are bounded; idle connections are dropped. Scope is a single seat.
-- **A grab never outlives its config**, and a user switch always starts awake.
+- **A grab never outlives its config**, and a user switch never inherits a kill:
+  each user gets back only their own state.

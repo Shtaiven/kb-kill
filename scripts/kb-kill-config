@@ -1,0 +1,3243 @@
+#!/usr/bin/env python3
+"""kb-kill-config - settings for kb-kill: groups & hotkeys, and the tray.
+
+Edits ~/.config/kb-kill/kb-kill.toml (what kb-kill-push sends to the daemon)
+and ~/.config/kb-kill/tray.toml (the tray's own file). Group edits are checked
+by the daemon's own parser (`check_config`) before they are written; the file
+is then replaced atomically and kb-kill-push applies it. Comments and layout
+survive: the file is edited in place with tomlkit. Tray settings apply as they
+change; the tray follows the file live.
+
+Needs PyGObject with Gtk 4 and libadwaita >= 1.5, plus tomlkit. Without them
+it opens kb-kill.toml in a text editor instead, so the tray's "Settings…"
+entry always does something.
+"""
+
+# pyright: reportMissingImports=false
+
+import copy
+import itertools
+import json
+import math
+import os
+import re
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import tomllib
+import unicodedata
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import TypeGuard
+from xml.sax.saxutils import escape as xml_escape
+
+# Rewritten by packaging/bump-version.sh from the repo-root VERSION file.
+VERSION = "0.6.0"
+
+APP_ID = "io.github.shtaiven.KbKillConfig"
+APP_NAME = "kb-kill Settings"  # as the launcher names it
+HERE = os.path.dirname(os.path.realpath(__file__))
+SOCKET_TIMEOUT = 3.0
+STATUS_DELAY_MS = 1500  # kb-kill-push notices a save within ~1 s
+TRAY_WRITE_DELAY_MS = 300
+PREVIEW_DELAY_MS = 400  # after the last edit, ask the daemon what would match
+DISK_DEBOUNCE_MS = 300
+
+# Mirrors of the daemon's limits (scripts/kb-kill-daemon); the daemon's
+# check_config has the final word, these only drive inline feedback.
+GROUP_NAME_RE = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9 ._-]{0,31}\Z")
+LABEL_MAX_LEN = 64
+_UNSAFE = re.compile(r"[\x00-\x1f\x7f]")
+MATCH_KEYS = ("keyboards", "pointers", "devices")
+
+# Tray settings: the same keys, defaults and clamps as kb-kill-tray.
+OSD_MARGIN, OSD_MARGIN_MAX, OSD_OPACITY = 96, 2000, 0.92
+
+
+def socket_path() -> str:
+    """The daemon's socket. /run/kb-kill (made by systemd) and
+    $XDG_RUNTIME_DIR (private to this user) are used as found. The /tmp
+    fallback of a dev daemon only when this user owns it: anyone can create a
+    file there, and would then read what is sent and answer as the daemon."""
+    candidates = ["/run/kb-kill/control.sock"]
+    if base := os.environ.get("XDG_RUNTIME_DIR"):
+        candidates.append(os.path.join(base, "kb-kill.sock"))
+    found = next((c for c in candidates if os.path.exists(c)), None)
+    if found:
+        return found
+    tmp = f"/tmp/kb-kill-{os.getuid()}.sock"
+    try:
+        st = os.lstat(tmp)
+        if stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid():
+            return tmp
+    except OSError:
+        pass
+    return candidates[0]
+
+
+def user_config_path() -> str:
+    return os.path.expanduser(
+        os.environ.get("KB_KILL_CONFIG") or "~/.config/kb-kill/kb-kill.toml"
+    )
+
+
+def tray_config_path() -> str:
+    return os.path.expanduser("~/.config/kb-kill/tray.toml")
+
+
+def seed_path() -> str | None:
+    """What a user without a config of their own starts from."""
+    return next(
+        (
+            c
+            for c in (
+                "/etc/kb-kill/kb-kill.toml",
+                os.path.join(HERE, os.pardir, "kb-kill.toml"),
+            )
+            if os.path.isfile(c)
+        ),
+        None,
+    )
+
+
+def seed_user_config(path: str) -> bool:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if seed := seed_path():
+            shutil.copyfile(seed, path)
+        else:
+            open(path, "a").close()
+    except OSError as e:
+        sys.stderr.write(f"kb-kill-config: cannot create {path}: {e}\n")
+        return False
+    return True
+
+
+def launch_editor(path: str) -> None:
+    """Resolve the editor ourselves: xdg-open has no association for
+    application/toml and may fall back to the browser."""
+    desktop = ""
+    for mime in ("application/toml", "text/plain"):
+        try:
+            desktop = subprocess.run(
+                ["xdg-mime", "query", "default", mime],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.strip()
+        except OSError:
+            desktop = ""
+        if desktop:
+            break
+    cmd = ["gtk-launch", desktop, path] if desktop else ["xdg-open", path]
+    try:
+        subprocess.Popen(cmd, start_new_session=True)
+    except OSError as e:
+        sys.stderr.write(f"kb-kill-config: could not open {path}: {e}\n")
+
+
+def write_atomic(path: str, text: str) -> None:
+    """Replace `path` in one step, so kb-kill-push never reads half a file.
+    Writes through a symlink (a dotfiles checkout) rather than over it."""
+    path = os.path.realpath(path)
+    folder = os.path.dirname(path)
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=".kb-kill-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:
+            os.chmod(tmp, os.stat(path).st_mode & 0o777)
+        except FileNotFoundError:
+            os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def ask_daemon(want: str, **cmd: object) -> tuple[dict | None, str | None]:
+    """One request, one reply, one connection. The daemon may send its state
+    unprompted on connect, so the reply is matched by type."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(SOCKET_TIMEOUT)
+            sock.connect(socket_path())
+            sock.sendall((json.dumps(cmd) + "\n").encode())
+            with sock.makefile("rb") as replies:
+                for line in replies:
+                    msg = json.loads(line)
+                    if msg.get("type") == "error":
+                        return None, str(msg.get("error"))
+                    if msg.get("type") == want:
+                        return msg, None
+        return None, "the daemon closed the connection"
+    except (OSError, ValueError, RecursionError) as e:
+        return None, f"cannot reach the kb-kill daemon ({e})"
+
+
+def watch_file(path: str, on_change) -> "Gio.FileMonitor | None":
+    """Call on_change() shortly after `path` is written or replaced. Watches
+    the real file's directory: an atomic replace (or a symlinked file) swaps
+    the inode a file monitor would stay on, and one save is several events."""
+    folder, name = os.path.split(os.path.realpath(path))
+    timer = 0
+
+    def fire() -> bool:
+        nonlocal timer
+        timer = 0
+        on_change()
+        return False  # one-shot timer
+
+    def changed(_m, file: "Gio.File", other: "Gio.File | None", _ev) -> None:
+        nonlocal timer
+        if name not in (file.get_basename(), other and other.get_basename()):
+            return
+        if timer:
+            GLib.source_remove(timer)
+        timer = GLib.timeout_add(DISK_DEBOUNCE_MS, fire)
+
+    try:
+        os.makedirs(folder, exist_ok=True)
+        monitor = Gio.File.new_for_path(folder).monitor_directory(
+            Gio.FileMonitorFlags.WATCH_MOVES, None
+        )
+    except (OSError, GLib.Error):
+        return None
+    monitor.connect("changed", changed)
+    return monitor
+
+
+def ask_daemon_async(done, want: str, **cmd: object) -> None:
+    """ask_daemon on a worker thread, so a slow or stuck daemon never freezes
+    the window; done(reply, error) then runs on the GTK main loop. Only the
+    socket work happens off it."""
+
+    def work() -> None:
+        reply, error = ask_daemon(want, **cmd)
+        GLib.idle_add(lambda: done(reply, error) and False)
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def fallback(why: str) -> int:
+    path = user_config_path()
+    sys.stderr.write(f"kb-kill-config: {why}; opening {path} in a text editor\n")
+    if not os.path.exists(path) and not seed_user_config(path):
+        return 1
+    launch_editor(path)
+    return 0
+
+
+if __name__ == "__main__" and sys.argv[1:] and sys.argv[1] in ("-V", "--version"):
+    print(f"kb-kill-config {VERSION} ({os.path.realpath(__file__)})")
+    sys.exit(0)
+
+try:
+    import gi
+
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    import tomlkit
+    from evdev import ecodes
+    from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk
+except (ImportError, ValueError) as e:
+    if __name__ == "__main__":
+        sys.exit(
+            fallback(
+                f"{e} (needs Gtk 4, libadwaita and tomlkit: Debian/Ubuntu "
+                "gir1.2-gtk-4.0 gir1.2-adw-1 python3-tomlkit)"
+            )
+        )
+    raise
+
+if __name__ == "__main__" and (Adw.get_major_version(), Adw.get_minor_version()) < (
+    1,
+    5,
+):
+    sys.exit(fallback("libadwaita 1.5 or newer is required"))
+
+
+# --------------------------------------------------------------------------- #
+# Hotkey tokens
+# --------------------------------------------------------------------------- #
+_SIDED = {
+    ecodes.KEY_LEFTCTRL: ("ctrl", "lctrl"),
+    ecodes.KEY_RIGHTCTRL: ("ctrl", "rctrl"),
+    ecodes.KEY_LEFTALT: ("alt", "lalt"),
+    ecodes.KEY_RIGHTALT: ("alt", "ralt"),
+    ecodes.KEY_LEFTSHIFT: ("shift", "lshift"),
+    ecodes.KEY_RIGHTSHIFT: ("shift", "rshift"),
+    ecodes.KEY_LEFTMETA: ("super", "lsuper"),
+    ecodes.KEY_RIGHTMETA: ("super", "rsuper"),
+}
+_MOD_ORDER = ["ctrl", "lctrl", "rctrl", "alt", "lalt", "ralt"]
+_MOD_ORDER += ["shift", "lshift", "rshift", "super", "lsuper", "rsuper"]
+_BUTTON_TOKENS = {
+    ecodes.BTN_LEFT: "mouseleft",
+    ecodes.BTN_RIGHT: "mouseright",
+    ecodes.BTN_MIDDLE: "mousemiddle",
+}
+# Gdk button number -> evdev code.
+_GDK_BUTTONS = {
+    1: ecodes.BTN_LEFT,
+    2: ecodes.BTN_MIDDLE,
+    3: ecodes.BTN_RIGHT,
+    8: ecodes.BTN_SIDE,
+    9: ecodes.BTN_EXTRA,
+}
+XKB_OFFSET = 8  # an XKB keycode (Gdk's hardware keycode) is the evdev code + 8
+
+
+def key_token(code: int, pin_side: bool) -> str:
+    if code in _SIDED:
+        return _SIDED[code][pin_side]
+    if code in _BUTTON_TOKENS:
+        return _BUTTON_TOKENS[code]
+    name = ecodes.KEY.get(code) or ecodes.BTN.get(code)
+    if isinstance(name, list):
+        name = name[0]
+    if isinstance(name, str):
+        return name[4:].lower() if name.startswith("KEY_") else name
+    return str(code)
+
+
+def combo_text(codes: list[int], pin_side: bool) -> str:
+    tokens = list(dict.fromkeys(key_token(c, pin_side) for c in codes))
+    mods = sorted((t for t in tokens if t in _MOD_ORDER), key=_MOD_ORDER.index)
+    return "+".join(mods + [t for t in tokens if t not in _MOD_ORDER])
+
+
+def token_ok(token: str) -> bool:
+    """The daemon's _parse_token, minus the parsing."""
+    t = token.strip().lower()
+    return bool(t) and (t in MODIFIER_NAMES or _token_code(t) is not None)
+
+
+def combo_ok(spec: str) -> bool:
+    tokens = [t for t in spec.split("+") if t.strip()]
+    return bool(tokens) and all(token_ok(t) for t in tokens)
+
+
+def name_from_label(label: str, taken: set[str]) -> str:
+    """A simple group name (GROUP_NAME_RE) made from its label: lower case,
+    accents dropped, each run of spaces or characters a name cannot hold
+    made one _, at most 32, and _2, _3... when another group has it."""
+    plain = unicodedata.normalize("NFKD", label).encode("ascii", "ignore").decode()
+    base = re.sub(r"[^a-z0-9.-]+", "_", plain.lower()).strip("_")[:32].rstrip("_")
+    if not base:
+        base = "group"
+    if not re.match(r"[a-z0-9_]", base[0]):  # a name cannot start with . or -
+        base = ("_" + base)[:32]
+    name, n = base, 2
+    while name in taken:
+        suffix = f"_{n}"
+        name, n = base[: 32 - len(suffix)] + suffix, n + 1
+    return name
+
+
+def label_ok(label: str) -> bool:
+    return len(label) <= LABEL_MAX_LEN and not _UNSAFE.search(label)
+
+
+# --------------------------------------------------------------------------- #
+# Model: what the editor shows, and how it lands in the TOML document
+# --------------------------------------------------------------------------- #
+_keys = itertools.count(1)
+
+
+@dataclass
+class Group:
+    name: str = ""
+    orig: str | None = None  # the table's name in the file; None until saved
+    label: str = ""
+    keyboards: list[str] = field(default_factory=list)
+    pointers: list[str] = field(default_factory=list)
+    devices: list[str] = field(default_factory=list)
+    kill: str = ""  # a [groups.*] leaves these empty to inherit the top level
+    wake: str = ""
+    virtual: str = "auto"  # "auto" | "true" | "false"
+    start_killed: bool = False
+    key: str = field(default_factory=lambda: f"g{next(_keys)}")
+
+    def matchers(self, name: str) -> list[str]:
+        return [v.strip() for v in getattr(self, name) if v.strip()]
+
+    def norm(self) -> tuple:
+        return (
+            self.name.strip(),
+            self.label.strip(),
+            *(tuple(self.matchers(m)) for m in MATCH_KEYS),
+            self.kill.strip(),
+            self.wake.strip(),
+            self.virtual,
+            self.start_killed,
+        )
+
+
+@dataclass
+class Model:
+    kill: str = ""  # top level: the hotkeys every group inherits
+    wake: str = ""
+    groups: list[Group] = field(default_factory=list)
+
+    def norm(self) -> tuple:
+        return (
+            self.kill.strip(),
+            self.wake.strip(),
+            tuple(g.norm() for g in self.groups),
+        )
+
+
+@dataclass
+class Edit:
+    """One undoable change to the group list, applied to the live model, so
+    edits made elsewhere since are kept when it is undone."""
+
+    title: str
+    undo: Callable[[], None]
+    redo: Callable[[], None]
+
+
+class TopLevelGroupError(ValueError):
+    """The old top-level "default" group, which the daemon now refuses."""
+
+
+# Keys that only make sense in a [groups.<name>] table.
+GROUP_ONLY_KEYS = (*MATCH_KEYS, "label", "virtual", "virtual_keyboard", "start_killed")
+
+
+def _names(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [v for v in value if isinstance(v, str)]
+    return []
+
+
+def _group_from(name: str, table: dict, orig: str | None) -> Group:
+    virtual = table.get("virtual", table.get("virtual_keyboard", "auto"))
+    label = table.get("label")
+    return Group(
+        name=name,
+        orig=orig,
+        label=label if isinstance(label, str) else "",
+        keyboards=_names(table.get("keyboards")),
+        pointers=_names(table.get("pointers")),
+        devices=_names(table.get("devices")),
+        kill=str(table.get("kill_combo") or ""),
+        wake=str(table.get("wake_combo") or ""),
+        virtual="true" if virtual is True else "false" if virtual is False else "auto",
+        start_killed=table.get("start_killed") is True,
+    )
+
+
+def model_from(text: str) -> Model:
+    """Raises tomllib.TOMLDecodeError or TopLevelGroupError; the editor then
+    offers the text editor. Nothing is moved for the user: that is their call."""
+    doc = tomllib.loads(text)
+    if stray := [k for k in GROUP_ONLY_KEYS if k in doc]:
+        raise TopLevelGroupError(
+            f"{', '.join(stray)} at the top level must move into a [groups.<name>] "
+            "table: the top-level default group is gone, and kb-kill rejects this config"
+        )
+    sections = doc.get("groups")
+    sections = sections if isinstance(sections, dict) else {}
+    return Model(
+        kill=str(doc.get("kill_combo") or ""),
+        wake=str(doc.get("wake_combo") or ""),
+        groups=[
+            _group_from(name, table, name)
+            for name, table in sections.items()
+            if isinstance(table, dict)
+        ],
+    )
+
+
+def _first_table_index(doc: "tomlkit.TOMLDocument") -> int | None:
+    for i, (_key, item) in enumerate(doc.body):
+        if isinstance(item, tomlkit.items.Table | tomlkit.items.AoT):
+            return i
+    return None
+
+
+def _set(container, key: str, value: object) -> None:
+    """Set or drop one key. None/""/[] drop it. A new top-level key goes ahead
+    of the first table: TOML would otherwise file it under that table."""
+    if value in (None, "", []):
+        if key in container:
+            del container[key]
+        return
+    if isinstance(value, list):
+        value = value[0] if len(value) == 1 else value
+    if key in container or not isinstance(container, tomlkit.TOMLDocument):
+        container[key] = value
+        return
+    index = _first_table_index(container)
+    if index is None:
+        container[key] = value
+    else:
+        container._insert_at(index, key, value)
+
+
+def _write_combos(container, old_kill, old_wake, new_kill, new_wake) -> None:
+    for key, a, b in (
+        ("kill_combo", old_kill, new_kill),
+        ("wake_combo", old_wake, new_wake),
+    ):
+        if a.strip() != b.strip():
+            _set(container, key, b.strip())
+
+
+def _write_fields(container, old: Group, new: Group) -> None:
+    """Only the fields that changed, so untouched ones keep their formatting."""
+    if old.label.strip() != new.label.strip():
+        _set(container, "label", new.label.strip())
+    for m in MATCH_KEYS:
+        if old.matchers(m) != new.matchers(m):
+            _set(container, m, new.matchers(m))
+    if old.virtual != new.virtual:
+        _set(container, "virtual_keyboard", None)
+        _set(
+            container,
+            "virtual",
+            None if new.virtual == "auto" else new.virtual == "true",
+        )
+    if old.start_killed != new.start_killed:
+        _set(container, "start_killed", True if new.start_killed else None)
+    _write_combos(container, old.kill, old.wake, new.kill, new.wake)
+
+
+def render(text: str, old: Model, new: Model) -> str:
+    """`text` edited from `old` to `new`, keeping everything the editor does
+    not model (comments, unknown keys, order) as it was."""
+    doc = tomlkit.parse(text)
+    _write_combos(doc, old.kill, old.wake, new.kill, new.wake)
+
+    by_orig = {g.name: g for g in old.groups}
+    kept = {g.orig for g in new.groups if g.orig}
+    sections = doc.get("groups")
+    renamed: list[Group] = []
+    for name in by_orig:
+        if name not in kept and sections is not None and name in sections:
+            del sections[name]
+    for g in new.groups:
+        if g.orig not in by_orig:  # never saved, or brought back after a save
+            g.orig = None
+            continue
+        table = sections[g.orig]
+        _write_fields(table, by_orig[g.orig], g)
+        if g.name.strip() != g.orig.strip():
+            renamed.append(g)
+    # Rename in place: comments, position and inline/dotted form stay. Only a
+    # swap (a -> b while b -> a) needs a detour through temporary keys, which
+    # tomlkit cannot do inside an inline table; that rare case is rebuilt.
+    finals = {g.name.strip() for g in renamed}
+    swap = any(g.orig in finals for g in renamed)
+    if renamed and not swap:
+        for g in renamed:
+            sections.value._replace(g.orig, g.name.strip(), sections[g.orig])
+    elif renamed and not isinstance(sections, tomlkit.items.InlineTable):
+        for n, g in enumerate(renamed):
+            sections.value._replace(g.orig, f"__kb_kill_rename_{n}__", sections[g.orig])
+        for n, g in enumerate(renamed):
+            temp = f"__kb_kill_rename_{n}__"
+            sections.value._replace(temp, g.name.strip(), sections[temp])
+    elif renamed:
+        tables = [(g, sections[g.orig]) for g in renamed]
+        for g, _table in tables:
+            del sections[g.orig]
+        for g, table in tables:
+            moved = tomlkit.inline_table()
+            moved.update(table)
+            sections[g.name.strip()] = moved
+    for g in new.groups:
+        if g.orig is not None:
+            continue
+        if sections is None:
+            doc["groups"] = tomlkit.table(is_super_table=True)
+            sections = doc["groups"]
+        table = tomlkit.table()
+        if len(sections):
+            table.trivia.indent = "\n"  # a blank line after the previous table
+        _write_fields(table, Group(), g)
+        sections[g.name.strip()] = table
+    if sections is not None and not sections:
+        del doc["groups"]
+    return tomlkit.dumps(doc)
+
+
+# --------------------------------------------------------------------------- #
+# Hotkey recorder
+# --------------------------------------------------------------------------- #
+class RecordDialog(Adw.Dialog):
+    """Records a hotkey the way GNOME Settings does: the keys (and mouse
+    buttons) held together count once they are all let go. Esc on its own
+    cancels, Backspace on its own clears."""
+
+    def __init__(self, title: str, on_done) -> None:
+        super().__init__(title=title, content_width=440)
+        self._on_done = on_done
+        self._held: set[int] = set()
+        self._chord: list[int] = []
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{side}")(18)
+        self._shown = Gtk.Label(label=self.PROMPT, css_classes=["title-2"], wrap=True)
+        box.append(self._shown)
+        box.append(
+            Gtk.Label(
+                label="Press Esc to cancel or Backspace to clear.",
+                css_classes=["dim-label"],
+            )
+        )
+
+        pad = Gtk.Label(
+            label="Click here to add a mouse button",
+            css_classes=["card", "dim-label"],
+            height_request=72,
+        )
+        click = Gtk.GestureClick(button=0)
+        click.connect("pressed", self._on_click, True)
+        click.connect("released", self._on_click, False)
+        pad.add_controller(click)
+        box.append(pad)
+
+        self._pin = Gtk.CheckButton(label="Only the side I pressed (lctrl, not ctrl)")
+        box.append(self._pin)
+        box.append(
+            Gtk.Label(
+                label="A hotkey kb-kill already uses fires as you press it.",
+                wrap=True,
+                xalign=0,
+                css_classes=["dim-label", "caption"],
+            )
+        )
+
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar())
+        view.set_content(box)
+        self.set_child(view)
+
+        keys = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self._on_key_pressed)
+        keys.connect("key-released", self._on_key_released)
+        self.add_controller(keys)
+
+    PROMPT = "Press a hotkey…"
+
+    def _press(self, code: int) -> None:
+        if not self._held:
+            self._chord = []  # a fresh chord once everything was let go
+        self._held.add(code)
+        if code not in self._chord:
+            self._chord.append(code)
+        self._shown.set_label(self._text() or self.PROMPT)
+
+    def _release(self, code: int) -> None:
+        self._held.discard(code)
+        # Modifiers alone are no hotkey: wait for a key or button with them.
+        if not self._held and any(c not in _SIDED for c in self._chord):
+            self._finish(self._text())
+
+    def _on_key_pressed(self, _ctl, _keyval: int, keycode: int, _state) -> bool:
+        code = keycode - XKB_OFFSET
+        if not self._held and code == ecodes.KEY_ESC:
+            self.close()
+        elif not self._held and code == ecodes.KEY_BACKSPACE:
+            self._finish("")
+        else:
+            self._press(code)
+        return True
+
+    def _on_key_released(self, _ctl, _keyval: int, keycode: int, _state) -> None:
+        if keycode - XKB_OFFSET in self._held:
+            self._release(keycode - XKB_OFFSET)
+
+    def _on_click(
+        self, gesture: Gtk.GestureClick, _n: int, _x: float, _y: float, down: bool
+    ) -> None:
+        code = _GDK_BUTTONS.get(gesture.get_current_button())
+        if code is None:
+            return
+        if down:
+            self._press(code)
+        elif code in self._held:
+            self._release(code)
+
+    def _text(self) -> str:
+        return combo_text(self._chord, self._pin.get_active())
+
+    def _finish(self, text: str) -> None:
+        self._on_done(text)
+        self.close()
+
+
+# --------------------------------------------------------------------------- #
+# Group editing widgets
+# --------------------------------------------------------------------------- #
+MATCHER_INFO = {
+    "keyboards": ("Keyboards", "Keyboard-class devices, by name or glob", "kbd"),
+    "pointers": ("Pointers", "Mice, trackballs and touchpads, by name or glob", "ptr"),
+    "devices": ("Any Device", "Keyboards and pointers alike, by name or glob", None),
+}
+VIRTUAL_CHOICES = [
+    ("auto", "Auto", "Target the forwarded copy of anything input-remapper fronts"),
+    ("true", "Virtual Devices Only", "Never grab a physical device"),
+    ("false", "Exactly as Matched", "Grab what the patterns name, fronted or not"),
+]
+
+
+def _entry_error(row: Gtk.Widget, bad: bool) -> None:
+    if bad:
+        row.add_css_class("error")
+    else:
+        row.remove_css_class("error")
+
+
+def icon_button(icon: str, tooltip: str, on_clicked, css=("flat",)) -> Gtk.Button:
+    """An icon-only button; a tooltip is no accessible name in GTK 4, so the
+    same text is set as the button's label for screen readers."""
+    button = Gtk.Button(
+        icon_name=icon,
+        tooltip_text=tooltip,
+        css_classes=list(css),
+        valign=Gtk.Align.CENTER,
+    )
+    button.update_property([Gtk.AccessibleProperty.LABEL], [tooltip])
+    button.connect("clicked", lambda _b: on_clicked())
+    return button
+
+
+def clear_button(tooltip: str, on_clicked) -> Gtk.Button:
+    """The one clear control every editable row uses."""
+    return icon_button("edit-clear-symbolic", tooltip, on_clicked)
+
+
+def remove_button(tooltip: str, on_clicked) -> Gtk.Button:
+    """A flat x that takes the whole row away, unlike clear_button's <x| on a field."""
+    return icon_button(
+        "window-close-symbolic", tooltip, on_clicked, css=("flat", "circular")
+    )
+
+
+class MatcherList(Adw.PreferencesGroup):
+    """One matcher field: a list of exact names or globs."""
+
+    def __init__(self, win: "ConfigWindow", group: Group, field_name: str) -> None:
+        title, description, self._cls = MATCHER_INFO[field_name]
+        super().__init__(title=title, description=description)
+        self._win, self._group, self._field = win, group, field_name
+        self._rows: list[Adw.EntryRow] = []
+        add = icon_button(
+            "list-add-symbolic", f"Add to {title}", lambda: self._on_add(add)
+        )
+        self.set_header_suffix(add)
+        for value in getattr(group, field_name):
+            self._add_row(value)
+
+    def _add_row(self, value: str, focus: bool = False) -> None:
+        row = Adw.EntryRow(title="Device", text=value)
+        row.add_suffix(remove_button("Remove this pattern", lambda: self._remove(row)))
+        row.connect("changed", lambda _r: self._store())
+        self.add(row)
+        self._rows.append(row)
+        if focus:
+            row.grab_focus()
+
+    def _remove(self, row: Adw.EntryRow) -> None:
+        self.remove(row)
+        self._rows.remove(row)
+        self._store()
+
+    def _store(self) -> None:
+        setattr(self._group, self._field, [r.get_text() for r in self._rows])
+        self._win.changed()
+
+    def _on_add(self, button: Gtk.Button) -> None:
+        popover = Gtk.Popover()
+        popover.set_parent(button)
+        popover.connect("closed", lambda p: GLib.idle_add(p.unparent))
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        rows = Gtk.ListBox(
+            selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"]
+        )
+        rows.append(
+            Adw.ActionRow(
+                title="Name or Pattern…",
+                subtitle="Type it yourself, glob wildcards allowed",
+                activatable=True,
+            )
+        )
+        names: list[tuple[str, str]] = []
+        looking = Adw.ActionRow(title="Looking for devices…", activatable=False)
+        rows.append(looking)
+
+        def listed(found: list[tuple[str, str]], error: str | None) -> None:
+            rows.remove(looking)
+            names.extend(found)
+            for name, subtitle in found:
+                rows.append(
+                    Adw.ActionRow(
+                        title=GLib.markup_escape_text(name),
+                        subtitle=subtitle,
+                        activatable=True,
+                    )
+                )
+            if error:
+                box.append(
+                    Gtk.Label(
+                        label=error,
+                        wrap=True,
+                        max_width_chars=44,
+                        css_classes=["dim-label", "caption"],
+                    )
+                )
+
+        self._win.device_names(self._cls, listed)
+
+        def activated(_list, row: Gtk.ListBoxRow) -> None:
+            popover.popdown()
+            index = row.get_index()
+            if index == 0:
+                self._add_row("", focus=True)
+            else:
+                self._add_row(names[index - 1][0])
+            self._store()
+
+        rows.connect("row-activated", activated)
+        # A width of its own: with no horizontal scrolling, min_content_width
+        # is ignored and the list would shrink to its rows' narrowest wrap.
+        scroller = Gtk.ScrolledWindow(
+            child=rows,
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            propagate_natural_height=True,
+            max_content_height=380,
+            width_request=296,  # the whole popover then fits a 360 px window
+        )
+        box.append(scroller)
+        popover.set_child(box)
+        popover.popup()
+
+
+class ComboRow(Adw.EntryRow):
+    """A hotkey: typed, or recorded from the keyboard and mouse."""
+
+    def __init__(
+        self, win: "ConfigWindow", title: str, get, put, inherited=None
+    ) -> None:
+        super().__init__(title=title, text=get())
+        self._win, self._title, self._put, self._inherited = win, title, put, inherited
+        record = Gtk.Button(
+            label="Record", css_classes=["flat"], valign=Gtk.Align.CENTER
+        )
+        record.connect("clicked", self._on_record)
+        self._clear = clear_button(
+            "Clear: use the hotkey from Defaults" if inherited else "Clear: no hotkey",
+            lambda: self.set_text(""),
+        )
+        self.add_suffix(self._clear)
+        self.add_suffix(record)
+        self.connect("changed", self._on_changed)
+        self.refresh()
+
+    def _on_changed(self, _row) -> None:
+        self._put(self.get_text())
+        self.refresh()
+        self._win.changed()
+
+    def _on_record(self, _b) -> None:
+        RecordDialog(self._title, self.set_text).present(self._win)
+
+    def refresh(self) -> None:
+        """Show what an empty field falls back to (a [groups.*] inherits)."""
+        text = self.get_text().strip()
+        _entry_error(self, bool(text) and not combo_ok(text))
+        self._clear.set_visible(bool(self.get_text()))
+        if self._inherited is None or text:
+            self.set_title(self._title)
+            return
+        inherited = self._inherited().strip()
+        self.set_title(
+            f"{self._title} · Default {GLib.markup_escape_text(inherited)}"
+            if inherited
+            else f"{self._title} · Required"
+        )
+
+
+def group_details(win: "ConfigWindow", group: Group) -> list[Adw.PreferencesGroup]:
+    """Matchers, startup state and remapper choice for one group's page."""
+    out: list[Adw.PreferencesGroup] = [MatcherList(win, group, m) for m in MATCH_KEYS]
+    startup = Adw.PreferencesGroup(title="Startup")
+    start = Adw.SwitchRow(
+        title="Start killed",
+        subtitle=GroupPage.START_HINT,
+        active=group.start_killed,
+    )
+
+    def toggled(row, _pspec) -> None:
+        group.start_killed = row.get_active()
+        win.changed()
+
+    start.connect("notify::active", toggled)
+    startup.add(start)
+    out.append(startup)
+    startup.start_row = start  # GroupPage.show_wakeable() warns on it
+    advanced = Adw.PreferencesGroup(title="Remappers")
+    choice = Adw.ComboRow(
+        title="Remapped Devices",
+        model=Gtk.StringList.new([label for _v, label, _s in VIRTUAL_CHOICES]),
+    )
+    values = [v for v, _l, _s in VIRTUAL_CHOICES]
+    choice.set_selected(values.index(group.virtual))
+    choice.set_subtitle(VIRTUAL_CHOICES[choice.get_selected()][2])
+
+    def picked(row, _pspec) -> None:
+        group.virtual = values[row.get_selected()]
+        row.set_subtitle(VIRTUAL_CHOICES[row.get_selected()][2])
+        win.changed()
+
+    choice.connect("notify::selected", picked)
+    advanced.add(choice)
+    out.append(advanced)
+    return out
+
+
+class GroupPage(Adw.PreferencesPage):
+    def __init__(self, win: "ConfigWindow", group: Group) -> None:
+        super().__init__()
+        self._win, self._group = win, group
+        self._basics = Adw.PreferencesGroup(title="Group", description=self.HINT)
+        self._label = Adw.EntryRow(title="Label", text=group.label or group.name)
+        self._label.connect("changed", self._on_label)
+        self._name = Adw.ActionRow(  # made from the label: shown, not edited
+            title="Name",
+            subtitle=GLib.markup_escape_text(group.name),
+            css_classes=["property"],
+            sensitive=False,
+        )
+        self._basics.add(self._label)
+        self._basics.add(self._name)
+        self.add(self._basics)
+
+        hotkeys = Adw.PreferencesGroup(
+            title="Hotkeys",
+            description="Leave one empty to use the hotkey from Defaults.",
+        )
+        self._combos = [
+            ComboRow(
+                win,
+                "Kill Hotkey",
+                lambda: group.kill,
+                lambda v: setattr(group, "kill", v),
+                lambda: win.model.kill,
+            ),
+            ComboRow(
+                win,
+                "Wake Hotkey",
+                lambda: group.wake,
+                lambda v: setattr(group, "wake", v),
+                lambda: win.model.wake,
+            ),
+        ]
+        for row in self._combos:
+            hotkeys.add(row)
+        self.add(hotkeys)
+        self._start_row: Adw.SwitchRow | None = None
+        for section in group_details(win, group):
+            self.add(section)
+            self._start_row = getattr(section, "start_row", self._start_row)
+
+        self._matched = Adw.PreferencesGroup(
+            title="Matched Devices",
+            description="What the kill hotkey would disable right now, "
+            "including unsaved edits.",
+        )
+        self._matched_rows: list[Adw.PreferencesRow] = []
+        self.add(self._matched)
+        self.show_matches(None, "Looking…")
+
+        danger = Adw.PreferencesGroup()
+        delete = Gtk.Button(
+            label="Delete Group",
+            halign=Gtk.Align.CENTER,
+            css_classes=["destructive-action", "pill"],
+        )
+        delete.connect("clicked", lambda _b: win.delete_group(group))
+        danger.add(delete)
+        self.add(danger)
+
+    HINT = (
+        "The tray shows the label. The name is made from it, for kb-kill.toml "
+        "and the journal."
+    )
+
+    def _on_label(self, row: Adw.EntryRow) -> None:
+        """The name follows the label; a label that breaks the rules stays red
+        and is not taken on."""
+        label = row.get_text().strip()
+        ok = bool(label) and label_ok(label)
+        _entry_error(row, not ok)
+        self._basics.set_description(
+            self.HINT if ok else "A label is 1 to 64 printable characters."
+        )
+        if not ok:
+            return
+        self._group.label = label
+        self._group.name = self._win.name_for(label, self._group)
+        self._name.set_subtitle(GLib.markup_escape_text(self._group.name))
+        self._win.changed()
+        self._win.retitle(self._group)
+
+    CLASS_WORDS = MappingProxyType({"kbd": "keyboard", "ptr": "pointer"})
+
+    START_HINT = "At login, and when you save"
+
+    def show_wakeable(self, wakeable: bool | None) -> None:
+        """Say on the Start killed switch when the wake hotkey cannot be typed:
+        the daemon would then refuse to start the group killed."""
+        row = self._start_row
+        if row is None:
+            return
+        if wakeable is False:
+            row.set_subtitle(
+                "No device can type this group's wake hotkey, so it will not "
+                "start killed"
+            )
+            row.add_css_class("warning")
+        else:
+            row.set_subtitle(self.START_HINT)
+            row.remove_css_class("warning")
+
+    def show_matches(self, devices: list[dict] | None, note: str | None) -> None:
+        """The daemon's preview for this group; `note` when there is none."""
+        for row in self._matched_rows:
+            self._matched.remove(row)
+        self._matched_rows = []
+        rows: list[Adw.PreferencesRow] = []
+        if devices is None:
+            rows.append(Adw.ActionRow(subtitle=GLib.markup_escape_text(note or "")))
+        elif not devices:
+            empty = Adw.ActionRow(
+                title="No Device Matches",
+                subtitle="Nothing would be disabled; check the names with the + "
+                "buttons above.",
+            )
+            empty.add_prefix(
+                Gtk.Image(icon_name="dialog-warning-symbolic", css_classes=["warning"])
+            )
+            rows.append(empty)
+        for d in devices or []:
+            kind = "virtual" if d.get("virtual") else "physical"
+            what = self.CLASS_WORDS.get(d.get("class"), "device")
+            parts = [f"{kind} {what}", str(d.get("path", ""))]
+            if d.get("instead_of"):
+                parts.append(f"input-remapper's copy of {d['instead_of']}")
+            rows.append(
+                Adw.ActionRow(
+                    title=GLib.markup_escape_text(str(d.get("name", ""))),
+                    subtitle=GLib.markup_escape_text(" · ".join(parts)),
+                )
+            )
+        for row in rows:
+            self._matched.add(row)
+            self._matched_rows.append(row)
+
+    def refresh(self) -> None:
+        for row in self._combos:
+            row.refresh()
+
+
+class TopPage(Adw.PreferencesPage):
+    """Defaults: the top-level hotkeys every group inherits."""
+
+    def __init__(self, win: "ConfigWindow") -> None:
+        super().__init__()
+        self._win = win
+        model = win.model
+        hotkeys = Adw.PreferencesGroup(
+            title="Default Hotkeys",
+            description="Used by every group that does not set its own.",
+        )
+        self._combos = [
+            ComboRow(
+                win,
+                "Kill Hotkey",
+                lambda: model.kill,
+                lambda v: setattr(model, "kill", v),
+            ),
+            ComboRow(
+                win,
+                "Wake Hotkey",
+                lambda: model.wake,
+                lambda v: setattr(model, "wake", v),
+            ),
+        ]
+        for row in self._combos:
+            hotkeys.add(row)
+        self.add(hotkeys)
+
+        if not model.groups:
+            add = Gtk.Button(
+                label="Add Group",
+                halign=Gtk.Align.CENTER,
+                css_classes=["suggested-action", "pill"],
+            )
+            add.connect("clicked", lambda _b: win.add_group())
+            holder = Adw.PreferencesGroup()
+            holder.add(
+                Adw.StatusPage(
+                    icon_name="input-keyboard-symbolic",
+                    title="No Groups",
+                    description="A group is the devices a hotkey disables.",
+                    child=add,
+                )
+            )
+            self.add(holder)
+
+    def refresh(self) -> None:
+        for row in self._combos:
+            row.refresh()
+
+
+# --------------------------------------------------------------------------- #
+# Tray settings
+# --------------------------------------------------------------------------- #
+TRAY_TEMPLATE = """\
+# kb-kill-tray settings, written by kb-kill-config. The tray applies them live.
+osd = true
+osd_margin = 96  # px above the bottom of the screen
+osd_opacity = 0.92  # 0.0 clear .. 1.0 solid
+"""
+
+
+def load_tray_settings() -> tuple[bool, int, float]:
+    """kb-kill-tray's load_settings: defaults for anything missing or wrong."""
+    enabled, margin, opacity = True, OSD_MARGIN, OSD_OPACITY
+    try:
+        with open(tray_config_path(), "rb") as fh:
+            doc = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError, ValueError):
+        return enabled, margin, opacity
+    enabled = bool(doc.get("osd", enabled))
+    raw_margin, raw_opacity = doc.get("osd_margin"), doc.get("osd_opacity")
+    if _finite(raw_margin):
+        margin = max(0, min(round(raw_margin), OSD_MARGIN_MAX))
+    if _finite(raw_opacity):
+        opacity = max(0.0, min(float(raw_opacity), 1.0))
+    return enabled, margin, opacity
+
+
+def _finite(value: object) -> TypeGuard[int | float]:
+    """A number TOML may hold that round() and float() take (not nan/inf)."""
+    return (
+        isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+class TrayPage(Adw.PreferencesPage):
+    def __init__(self, win: "ConfigWindow") -> None:
+        super().__init__()
+        self._win = win
+        self._timer = 0
+        self._loading = False
+        enabled, margin, opacity = load_tray_settings()
+
+        startup = Adw.PreferencesGroup(title="Startup")
+        self._at_login = Adw.SwitchRow(
+            title="Start at Login",
+            subtitle="Start the tray when you log in; just for you",
+        )
+        state = tray_at_login()
+        self._at_login.set_active(bool(state))
+        self._at_login.set_sensitive(state is not None)
+        if state is None:
+            self._at_login.set_subtitle(f"{TRAY_UNIT} is not installed as a user unit")
+        self._at_login.connect("notify::active", self._on_at_login)
+        startup.add(self._at_login)
+        self.add(startup)
+
+        osd = Adw.PreferencesGroup(
+            title="On-Screen Display",
+            description="Shown when a group is killed or woken.",
+        )
+        self._enabled = Adw.SwitchRow(title="Show On-Screen Display", active=enabled)
+        osd.add(self._enabled)
+        self.add(osd)
+
+        look = Adw.PreferencesGroup(
+            title="Appearance",
+            description="For the display kb-kill draws itself (COSMIC, wlroots); "
+            "GNOME and KDE draw their own.",
+        )
+        self._margin = Adw.SpinRow.new_with_range(0, OSD_MARGIN_MAX, 1)
+        self._margin.set_title("Distance From Bottom")
+        self._margin.set_subtitle("Pixels; keep it clear of a dock")
+        self._margin.set_value(margin)
+        self._opacity = Adw.SpinRow.new_with_range(0.0, 1.0, 0.01)
+        self._opacity.set_title("Background Opacity")
+        self._opacity.set_subtitle("0 is clear, 1 is solid")
+        self._opacity.set_digits(2)
+        self._opacity.set_value(opacity)
+        look.add(self._margin)
+        look.add(self._opacity)
+        self.add(look)
+
+        self._enabled.connect("notify::active", self._schedule)
+        self._margin.connect("notify::value", self._schedule)
+        self._opacity.connect("notify::value", self._schedule)
+        # Follow hand edits, so the next change here does not undo them.
+        self._monitor = watch_file(tray_config_path(), self._on_disk_changed)
+
+    def _on_at_login(self, row, _pspec) -> None:
+        if self._loading:
+            return
+        if error := set_tray_at_login(row.get_active()):
+            self._win.alert("Tray Startup Not Changed", error)
+            self._loading = True
+            row.set_active(bool(tray_at_login()))
+            self._loading = False
+
+    def load(self) -> None:
+        """Show what tray.toml holds now, without writing it back."""
+        enabled, margin, opacity = load_tray_settings()
+        self._loading = True
+        try:
+            self._enabled.set_active(enabled)
+            self._margin.set_value(margin)
+            self._opacity.set_value(opacity)
+        finally:
+            self._loading = False
+
+    def open_text(self) -> None:
+        """Write what is shown first: a pending edit, or for a missing file a
+        documented template rather than an empty buffer."""
+        if self._timer:
+            GLib.source_remove(self._timer)
+            self._write()  # clears _timer
+        elif not os.path.exists(tray_config_path()):
+            self._write()
+        if os.path.exists(tray_config_path()):
+            launch_editor(tray_config_path())
+
+    def _on_disk_changed(self) -> None:
+        if not self._timer:  # an edit waiting to be written wins
+            self.load()
+
+    def flush(self) -> None:
+        if self._timer:
+            GLib.source_remove(self._timer)
+            self._write()
+
+    def _schedule(self, *_args) -> None:
+        if self._loading:
+            return
+        if self._timer:
+            GLib.source_remove(self._timer)
+        self._timer = GLib.timeout_add(TRAY_WRITE_DELAY_MS, self._write)
+
+    def _write(self) -> bool:
+        self._timer = 0
+        path = tray_config_path()
+        try:
+            with open(path) as fh:
+                doc = tomlkit.parse(fh.read())
+        except FileNotFoundError:
+            doc = tomlkit.parse(TRAY_TEMPLATE)
+        except (OSError, tomlkit.exceptions.ParseError) as e:
+            self._win.toast(f"Not saved: fix tray.toml as text first ({e})")
+            return False
+        doc["osd"] = self._enabled.get_active()
+        doc["osd_margin"] = int(self._margin.get_value())
+        doc["osd_opacity"] = round(self._opacity.get_value(), 2)
+        try:
+            write_atomic(path, tomlkit.dumps(doc))
+        except OSError as e:
+            self._win.toast(f"Cannot write {path}: {e}")
+        return False  # one-shot timer
+
+
+# --------------------------------------------------------------------------- #
+# Tray at login
+# --------------------------------------------------------------------------- #
+TRAY_UNIT = "kb-kill-tray.service"
+_ON_STATES = ("enabled", "enabled-runtime", "linked", "linked-runtime", "alias")
+
+
+def systemctl_user(*args: str) -> tuple[int, str]:
+    try:
+        done = subprocess.run(
+            ["systemctl", "--user", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+    return done.returncode, (done.stdout + done.stderr).strip()
+
+
+def tray_at_login() -> bool | None:
+    """None when there is no tray unit to switch (not installed, no systemd)."""
+    _rc, out = systemctl_user("is-enabled", TRAY_UNIT)
+    state = out.splitlines()[0] if out else ""
+    if state in _ON_STATES:
+        return True
+    if state in ("disabled", "masked", "masked-runtime", "indirect"):
+        return False
+    return None
+
+
+def set_tray_at_login(on: bool) -> str | None:
+    """The unit is enabled globally (every user), which a per-user `disable`
+    cannot undo: turning it off masks it for this user, on unmasks it."""
+    if on:
+        systemctl_user("unmask", TRAY_UNIT)
+        if not tray_at_login():
+            systemctl_user("enable", TRAY_UNIT)
+    else:
+        systemctl_user("disable", TRAY_UNIT)
+        if tray_at_login():
+            systemctl_user("mask", TRAY_UNIT)
+    if tray_at_login() != on:
+        _rc, out = systemctl_user("is-enabled", TRAY_UNIT)
+        return f"{TRAY_UNIT} is still {out or 'unknown'}"
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Desktop integration: swallow kb-kill's hotkeys before they reach apps
+# --------------------------------------------------------------------------- #
+# kb-kill reads the keyboard itself, so a desktop shortcut that does nothing
+# still leaves the hotkey working -- it only stops the focused app from also
+# getting it (a terminal printing a keycode for ctrl+alt+shift+k).
+NOOP = "/bin/true"
+_MODS = {
+    "ctrl": "ctrl", "control": "ctrl", "lctrl": "ctrl", "rctrl": "ctrl",
+    "alt": "alt", "lalt": "alt", "ralt": "alt", "altgr": "alt",
+    "shift": "shift", "lshift": "shift", "rshift": "shift",
+    "super": "super", "meta": "super", "win": "super", "cmd": "super",
+    "lsuper": "super", "lmeta": "super", "rsuper": "super", "rmeta": "super",
+}  # fmt: skip
+# Every token the daemon takes as a modifier or mouse button (its
+# MODIFIER_ALIASES keys), for inline feedback; the daemon has the final word.
+MODIFIER_NAMES = frozenset(_MODS) | {"mouseleft", "mouseright", "mousemiddle"}
+_MOD_NAMES = ("super", "ctrl", "alt", "shift")
+
+
+@dataclass(frozen=True)
+class Chord:
+    mods: frozenset[str]  # of _MOD_NAMES; a desktop cannot tell left from right
+    keysym: str  # xkb keysym name, as the desktop's own settings write it
+
+
+def _token_code(token: str) -> int | None:
+    """The daemon's _parse_token for a single, non-modifier key."""
+    t = token.strip().lower()
+    upper = t.upper()
+    for name in (f"KEY_{upper}", upper if upper.startswith(("KEY_", "BTN_")) else ""):
+        code = getattr(ecodes, name, None) if name else None
+        if isinstance(code, int):
+            return code
+    return int(t) if t.isdigit() else None
+
+
+def _keysym(code: int) -> str | None:
+    """The keysym that key produces unshifted in the first layout."""
+    display = Gdk.Display.get_default()
+    if display is None:
+        return None
+    ok, keys, keyvals = display.map_keycode(code + XKB_OFFSET)
+    if not ok:
+        return None
+    for key, keyval in zip(keys, keyvals, strict=False):
+        if key.group == 0 and key.level == 0:
+            return Gdk.keyval_name(keyval)
+    return None
+
+
+def chord_of(spec: str) -> Chord | str:
+    """A desktop shortcut for a kb-kill combo, or why there cannot be one."""
+    mods: set[str] = set()
+    codes: list[int] = []
+    for token in (t for t in spec.split("+") if t.strip()):
+        t = token.strip().lower()
+        if t in _MODS:
+            mods.add(_MODS[t])
+        elif t.startswith("mouse") or t.upper().startswith("BTN_"):
+            return "uses a mouse button, which a desktop shortcut cannot"
+        elif (code := _token_code(t)) is None:
+            return f"unknown key {token.strip()!r}"
+        else:
+            codes.append(code)
+    if len(codes) != 1:
+        return "a desktop shortcut is modifiers plus exactly one key"
+    if not mods:
+        return "has no modifier; binding a bare key would take it from every app"
+    if codes[0] >= ecodes.BTN_MISC and codes[0] < ecodes.KEY_OK:
+        return "uses a button, which a desktop shortcut cannot"
+    keysym = _keysym(codes[0])
+    if not keysym:
+        return "the current keyboard layout has no key for it"
+    return Chord(frozenset(mods), keysym)
+
+
+def wanted_chords(model: Model) -> list[tuple[str, Chord | str]]:
+    """Each distinct combo the saved config uses, with its desktop shortcut."""
+    specs: list[str] = []
+    for g in model.groups:
+        specs += [g.kill or model.kill, g.wake or model.wake]
+    out: list[tuple[str, Chord | str]] = []
+    seen: set[Chord] = set()
+    for spec in dict.fromkeys(s.strip() for s in specs if s.strip()):
+        chord = chord_of(spec)
+        if isinstance(chord, Chord):
+            if chord in seen:
+                continue
+            seen.add(chord)
+        out.append((spec, chord))
+    return out
+
+
+_COSMIC_MODS = {"super": "Super", "ctrl": "Ctrl", "alt": "Alt", "shift": "Shift"}
+_GNOME_MODS = {
+    "super": "<Super>",
+    "ctrl": "<Control>",
+    "alt": "<Alt>",
+    "shift": "<Shift>",
+}
+_KDE_MODS = {"super": "Meta", "ctrl": "Ctrl", "alt": "Alt", "shift": "Shift"}
+_QT_NAMES = {
+    "space": "Space", "Return": "Return", "Tab": "Tab", "Escape": "Esc",
+    "BackSpace": "Backspace", "Delete": "Del", "Insert": "Ins", "Home": "Home",
+    "End": "End", "Prior": "PgUp", "Next": "PgDown", "Left": "Left",
+    "Right": "Right", "Up": "Up", "Down": "Down", "Print": "Print",
+}  # fmt: skip
+
+
+@dataclass
+class Clash:
+    """A combo a desktop already uses for something else."""
+
+    what: str  # what uses it now
+    effect: str  # what taking it over does
+    where: list = field(default_factory=list)  # backend-specific locations
+
+
+class Report:
+    """What an apply did, for one dialog."""
+
+    def __init__(self) -> None:
+        self.bound = 0
+        self.notes: list[str] = []
+
+
+# -- RON, just enough for COSMIC's two files ----------------------------------- #
+def _ron_code(text: str) -> list[bool]:
+    """Per character: True outside strings and // or /* */ comments."""
+    out, i, n = [False] * len(text), 0, len(text)
+    while i < n:
+        if text[i] == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+            i += 1
+        elif text.startswith("//", i):
+            end = text.find("\n", i)
+            i = n if end == -1 else end
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+        else:
+            out[i] = True
+            i += 1
+    return out
+
+
+def _ron_real(item: str) -> bool:
+    """An item with content, not just whitespace and comments."""
+    code = _ron_code(item)
+    return any(code[i] and not c.isspace() for i, c in enumerate(item))
+
+
+def _ron_items(text: str, open_ch: str, close_ch: str) -> tuple[list[str], bool]:
+    """Split the top-level map or list in `text` into its items, verbatim
+    (leading whitespace and comments kept, trailing comma dropped). A trailing
+    comment after the last comma stays as an item of its own. False if
+    unparseable. Brackets and commas inside strings and comments are text."""
+    code = _ron_code(text)
+    opens = [i for i, c in enumerate(text) if code[i] and c == open_ch]
+    closes = [i for i, c in enumerate(text) if code[i] and c == close_ch]
+    if not opens or not closes or closes[-1] <= opens[0]:
+        return [], not _ron_real(text)
+    start, end = opens[0], closes[-1]
+    items, depth, begin = [], 0, start + 1
+    for i in range(start + 1, end):
+        if not code[i]:
+            continue
+        if text[i] in "([{":
+            depth += 1
+        elif text[i] in ")]}":
+            depth -= 1
+        elif text[i] == "," and depth == 0:
+            items.append(text[begin:i])
+            begin = i + 1
+    items.append(text[begin:end])
+    return [item for item in items if item.strip()], depth == 0
+
+
+def _ron_join(items: list[str], open_ch: str, close_ch: str) -> str:
+    """No comma after a comment-only item: "…,\n// note\n," is not RON."""
+    body = "".join(f"{item}," if _ron_real(item) else item for item in items)
+    return f"{open_ch}{body}\n{close_ch}\n"
+
+
+def _ron_write(
+    path: str, old: str, items: list[str], open_ch: str, close_ch: str
+) -> None:
+    """Write COSMIC's file only if kb-kill can read its own output back."""
+    text = _ron_join(items, open_ch, close_ch)
+    back, ok = _ron_items(text, open_ch, close_ch)
+    if not ok or sum(map(_ron_real, back)) != sum(map(_ron_real, items)):
+        raise ValueError(f"not writing {path}: kb-kill could not read back its output")
+    _write_with_backup(path, old, text)
+
+
+def _ron_str(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _read(path: str) -> str:
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return ""
+
+
+def _write_with_backup(path: str, old: str, new: str) -> None:
+    """The backup is taken once, before kb-kill's first change, and then
+    kept: a later write must not replace it with already-edited content."""
+    backup = path + ".kb-kill-backup"
+    if old and not os.path.exists(backup):
+        write_atomic(backup, old)
+    write_atomic(path, new)
+
+
+class CosmicShortcuts:
+    title = "COSMIC"
+    TAG = 'description: Some("kb-kill")'
+
+    def __init__(self) -> None:
+        base = os.path.expanduser("~/.config/cosmic")
+        self._base = base
+        self.path = f"{base}/com.system76.CosmicSettings.Shortcuts/v1/custom"
+        self.rules = (
+            f"{base}/com.system76.CosmicSettings.WindowRules/v1/tiling_exception_custom"
+        )
+
+    def unavailable(self) -> str | None:
+        return None if os.path.isdir(self._base) else "COSMIC's settings are not here"
+
+    def _entries(self) -> list[str]:
+        items, ok = _ron_items(_read(self.path), "{", "}")
+        if not ok:
+            raise ValueError(f"cannot read {self.path}")
+        return items
+
+    @staticmethod
+    def _chord_of_entry(entry: str) -> Chord | None:
+        mods = re.search(r"modifiers:\s*\[([^\]]*)\]", entry)
+        key = re.search(r'key:\s*"((?:[^"\\]|\\.)*)"', entry)
+        if not (mods and key):
+            return None
+        words = {w.strip().lower() for w in mods.group(1).split(",") if w.strip()}
+        return Chord(frozenset(words), key.group(1).lower())
+
+    @staticmethod
+    def _action(entry: str) -> str:
+        depth = 0
+        for i, c in enumerate(entry):
+            depth += c in "(["
+            depth -= c in ")]"
+            if c == ":" and depth == 0:
+                return entry[i + 1 :].strip()
+        return ""
+
+    def _norm(self, chord: Chord) -> Chord:
+        return Chord(chord.mods, chord.keysym.lower())
+
+    DEFAULTS = "/usr/share/cosmic/com.system76.CosmicSettings.Shortcuts/v1/defaults"
+
+    def conflicts(self, chords: list[Chord]) -> dict[Chord, Clash]:
+        """Combos COSMIC already uses for something: yours first (they win),
+        then its built-in defaults."""
+        custom = {self._chord_of_entry(e): self._action(e) for e in self._entries()}
+        defaults = {
+            self._chord_of_entry(e): self._action(e)
+            for e in _ron_items(_read(self.DEFAULTS), "{", "}")[0]
+        }
+        out = {}
+        for chord in chords:
+            key = self._norm(chord)
+            if key in custom:
+                if NOOP not in custom[key]:
+                    out[chord] = Clash(
+                        f"your shortcut {custom[key]}",
+                        "Your shortcut is removed (the file is backed up first).",
+                    )
+            elif key in defaults and defaults[key] != "Disable":
+                out[chord] = Clash(
+                    f"built-in {defaults[key]}",
+                    "kb-kill's shortcut overrides it; Remove gives it back.",
+                )
+        return out
+
+    def has_own(self) -> bool:
+        return any(self.TAG in e for e in self._entries())
+
+    def bound(self, chords: list[Chord]) -> set[Chord]:
+        """The `chords` a shortcut already swallows: ours, or a no-op of yours.
+        The file's key names are compared case-insensitively (F5 vs f5)."""
+        swallowed = {
+            self._chord_of_entry(entry)
+            for entry in self._entries()
+            if self.TAG in entry or NOOP in self._action(entry)
+        }
+        return {chord for chord in chords if self._norm(chord) in swallowed}
+
+    def apply(self, chords: list[Chord], take: set[Chord]) -> Report:
+        """Swallow `chords`; a clashing one only if it is in `take`."""
+        report = Report()
+        old = _read(self.path)
+        clashes = self.conflicts(chords)
+        entries = [e for e in self._entries() if self.TAG not in e]
+        for chord in chords:
+            key = self._norm(chord)
+            if chord in clashes and chord not in take:
+                report.notes.append(
+                    f"{self.label(chord)}: left to {clashes[chord].what}"
+                )
+                continue
+            mine = [e for e in entries if self._chord_of_entry(e) == key]
+            if mine and chord not in clashes:
+                report.bound += 1  # your own no-op already swallows it
+                continue
+            entries = [e for e in entries if e not in mine]  # taken over
+            mods = ", ".join(_COSMIC_MODS[m] for m in _MOD_NAMES if m in chord.mods)
+            entries.append(
+                f"\n    (modifiers: [{mods}], key: {_ron_str(chord.keysym)}, "
+                f"{self.TAG}): Spawn({_ron_str(NOOP)})"
+            )
+            report.bound += 1
+        _ron_write(self.path, old, entries, "{", "}")
+        return report
+
+    def remove(self) -> None:
+        old = _read(self.path)
+        entries = [e for e in self._entries() if self.TAG not in e]
+        _ron_write(self.path, old, entries, "{", "}")
+
+    def label(self, chord: Chord) -> str:
+        return "+".join(
+            [*(_COSMIC_MODS[m] for m in _MOD_NAMES if m in chord.mods), chord.keysym]
+        )
+
+    # -- the settings window floats instead of tiling --------------------------- #
+    def _rule_items(self) -> list[str]:
+        items, ok = _ron_items(_read(self.rules), "[", "]")
+        if not ok:
+            raise ValueError(f"cannot read {self.rules}")
+        return items
+
+    def _is_ours(self, item: str) -> bool:
+        return re.search(r'appid:\s*"' + re.escape(APP_ID) + '"', item) is not None
+
+    def floating(self) -> bool:
+        try:
+            return any(
+                self._is_ours(i) and "enabled: true" in i for i in self._rule_items()
+            )
+        except ValueError:
+            return False
+
+    def set_floating(self, on: bool) -> None:
+        old = _read(self.rules)
+        items = [i for i in self._rule_items() if not self._is_ours(i)]
+        if on:
+            items.append(
+                f'\n  (\n    enabled: true,\n    appid: {_ron_str(APP_ID)},\n    title: ".*"\n  )'
+            )
+        _ron_write(self.rules, old, items, "[", "]")
+
+
+class GnomeShortcuts:
+    title = "GNOME"
+    SCHEMA = "org.gnome.settings-daemon.plugins.media-keys"
+    CHILD = SCHEMA + ".custom-keybinding"
+    BASE = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/"
+    OURS = BASE + "kb-kill-"
+
+    def unavailable(self) -> str | None:
+        source = Gio.SettingsSchemaSource.get_default()
+        if source is None or not all(
+            source.lookup(s, True) for s in (self.SCHEMA, self.CHILD)
+        ):
+            return "GNOME's keybinding settings are not installed"
+        return None
+
+    BUILTIN = MappingProxyType(
+        {
+            "org.gnome.desktop.wm.keybindings": "window manager",
+            "org.gnome.shell.keybindings": "shell",
+            "org.gnome.mutter.keybindings": "mutter",
+            "org.gnome.mutter.wayland.keybindings": "mutter",
+            "org.gnome.settings-daemon.plugins.media-keys": "media keys",
+        }
+    )
+
+    @staticmethod
+    def _accel(text: str) -> tuple[int, int] | None:
+        ok, keyval, mods = Gtk.accelerator_parse(text)
+        return (Gdk.keyval_to_lower(keyval), int(mods)) if ok and keyval else None
+
+    @staticmethod
+    def _accels(settings: "Gio.Settings", key: str) -> list[str]:
+        value = settings.get_value(key)
+        kind = value.get_type_string()
+        return (
+            value.unpack() if kind == "as" else [value.unpack()] if kind == "s" else []
+        )
+
+    def conflicts(self, chords: list[Chord]) -> dict[Chord, Clash]:
+        """Custom shortcuts that do something, and GNOME's own keybindings.
+        `where` holds ("custom", path) or (schema id, key)."""
+        wanted = {a: c for c in chords if (a := self._accel(self._binding(c)))}
+        out: dict[Chord, Clash] = {}
+        for path in self._paths():
+            if path.startswith(self.OURS):
+                continue
+            child = self._child(path)
+            chord = wanted.get(self._accel(child.get_string("binding")))
+            if chord and child.get_string("command").strip() not in ("true", NOOP):
+                clash = out.setdefault(
+                    chord,
+                    Clash(
+                        f"your shortcut {child.get_string('name')!r}",
+                        "Your shortcut is removed.",
+                    ),
+                )
+                clash.where.append(("custom", path))
+        source = Gio.SettingsSchemaSource.get_default()
+        for schema_id, label in self.BUILTIN.items():
+            schema = source.lookup(schema_id, True) if source else None
+            if schema is None:
+                continue
+            settings = Gio.Settings.new(schema_id)
+            for key in schema.list_keys():
+                for accel in self._accels(settings, key):
+                    if (chord := wanted.get(self._accel(accel))) is not None:
+                        clash = out.setdefault(
+                            chord,
+                            Clash(
+                                f"built-in {key} ({label})",
+                                "GNOME's own shortcut loses this combo; Remove does not "
+                                "give it back (reset it in Settings > Keyboard).",
+                            ),
+                        )
+                        clash.where.append((schema_id, key))
+        return out
+
+    def _free(self, chord: Chord, clash: Clash) -> list[str]:
+        """Take the combo off whatever uses it; returns the paths dropped."""
+        target = self._accel(self._binding(chord))
+        dropped = []
+        for kind, name in clash.where:
+            if kind == "custom":
+                child = self._child(name)
+                for key in ("name", "command", "binding"):
+                    child.reset(key)
+                dropped.append(name)
+                continue
+            settings = Gio.Settings.new(kind)
+            rest = [a for a in self._accels(settings, name) if self._accel(a) != target]
+            if settings.get_value(name).get_type_string() == "as":
+                settings.set_strv(name, rest)
+            else:
+                settings.set_string(name, "")
+        return dropped
+
+    def _paths(self) -> list[str]:
+        return list(Gio.Settings.new(self.SCHEMA).get_strv("custom-keybindings"))
+
+    def has_own(self) -> bool:
+        return any(p.startswith(self.OURS) for p in self._paths())
+
+    def _child(self, path: str) -> "Gio.Settings":
+        return Gio.Settings.new_with_path(self.CHILD, path)
+
+    def _binding(self, chord: Chord) -> str:
+        return (
+            "".join(_GNOME_MODS[m] for m in _MOD_NAMES if m in chord.mods)
+            + chord.keysym
+        )
+
+    def _existing(self) -> dict[tuple[int, int], tuple[str, str]]:
+        """Parsed accelerator -> (path, command) for every custom shortcut,
+        matched like conflicts() does (modifier order and spelling ignored)."""
+        out = {}
+        for path in self._paths():
+            child = self._child(path)
+            if (accel := self._accel(child.get_string("binding"))) is not None:
+                out[accel] = (path, child.get_string("command"))
+        return out
+
+    def bound(self, chords: list[Chord]) -> set[Chord]:
+        existing = self._existing()
+        return {
+            chord
+            for chord in chords
+            if (hit := existing.get(self._accel(self._binding(chord))))
+            and (hit[0].startswith(self.OURS) or hit[1].strip() in ("true", NOOP))
+        }
+
+    def apply(self, chords: list[Chord], take: set[Chord]) -> Report:
+        report = Report()
+        self.remove()
+        clashes = self.conflicts(chords)
+        existing = self._existing()
+        paths = self._paths()
+        for i, chord in enumerate(chords):
+            if chord in clashes:
+                if chord not in take:
+                    report.notes.append(
+                        f"{self._binding(chord)}: left to {clashes[chord].what}"
+                    )
+                    continue
+                dropped = self._free(chord, clashes[chord])
+                paths = [p for p in paths if p not in dropped]
+            elif (hit := existing.get(self._accel(self._binding(chord)))) and hit[
+                1
+            ].strip() in ("true", NOOP):
+                report.bound += 1  # your own no-op already swallows it
+                continue
+            path = f"{self.OURS}{i}/"
+            child = self._child(path)
+            child.set_string("name", f"kb-kill: {self.label(chord)} (swallowed)")
+            child.set_string("command", NOOP)
+            child.set_string("binding", self._binding(chord))
+            paths.append(path)
+            report.bound += 1
+        Gio.Settings.new(self.SCHEMA).set_strv("custom-keybindings", paths)
+        Gio.Settings.sync()
+        return report
+
+    def remove(self) -> None:
+        paths = self._paths()
+        for path in paths:
+            if path.startswith(self.OURS):
+                child = self._child(path)
+                for key in ("name", "command", "binding"):
+                    child.reset(key)
+        Gio.Settings.new(self.SCHEMA).set_strv(
+            "custom-keybindings", [p for p in paths if not p.startswith(self.OURS)]
+        )
+        Gio.Settings.sync()
+
+    def label(self, chord: Chord) -> str:
+        return self._binding(chord)
+
+
+class KdeShortcuts:
+    title = "KDE Plasma"
+    PREFIX = "kb-kill-swallow-"
+
+    def __init__(self) -> None:
+        self.apps = os.path.expanduser("~/.local/share/applications")
+        self.tool = shutil.which("kwriteconfig6") or shutil.which("kwriteconfig5")
+        self.reader = shutil.which("kreadconfig6") or shutil.which("kreadconfig5")
+
+    def unavailable(self) -> str | None:
+        return (
+            None if self.tool and self.reader else "KDE's kwriteconfig is not installed"
+        )
+
+    RC = "~/.config/kglobalshortcutsrc"
+
+    def conflicts(self, chords: list[Chord]) -> dict[Chord, Clash]:
+        """Every active shortcut in kglobalshortcutsrc except ours. Each value
+        is "active,default,description"; several actives are separated by an
+        escaped tab. `where` holds (groups, action, value)."""
+        wanted = {q.lower(): c for c in chords if (q := self._qt(c))}
+        out: dict[Chord, Clash] = {}
+        group = ""
+        for line in _read(os.path.expanduser(self.RC)).splitlines():
+            line = line.strip()
+            if line.startswith("["):
+                group = line
+                continue
+            if "=" not in line or group.startswith(f"[services][{self.PREFIX}"):
+                continue
+            action, value = line.split("=", 1)
+            for accel in value.split(",", 1)[0].split("\\t"):
+                if (chord := wanted.get(accel.strip().lower())) is not None:
+                    groups = group[1:-1].split("][")
+                    clash = out.setdefault(
+                        chord,
+                        Clash(
+                            f"{' / '.join(groups)}: {action}",
+                            "KDE's shortcut loses this combo; Remove does not give "
+                            "it back (reset it in System Settings > Shortcuts).",
+                        ),
+                    )
+                    clash.where.append((groups, action, value))
+        return out
+
+    def _free(self, chord: Chord, clash: Clash) -> None:
+        """Take the combo off an action's active shortcuts. The file holds
+        KConfig-escaped text (several shortcuts joined by an escaped tab);
+        kwriteconfig escapes what it is given, so it gets the plain text."""
+        target = (self._qt(chord) or "").lower()
+        for groups, action, value in clash.where:
+            active, _sep, rest = value.partition(",")
+            kept = [a for a in active.split("\\t") if a.strip().lower() != target]
+            plain = "\t".join(_kconfig_unescape(a) for a in kept) or "none"
+            if rest:
+                plain = f"{plain},{_kconfig_unescape(rest)}"
+            args = [a for g in groups for a in ("--group", g)]
+            subprocess.run(
+                [self.tool, "--file", "kglobalshortcutsrc", *args,
+                 "--key", action, plain],
+                check=False,
+            )  # fmt: skip
+
+    def has_own(self) -> bool:
+        return bool(self._files())
+
+    def _files(self) -> list[str]:
+        try:
+            return sorted(f for f in os.listdir(self.apps) if f.startswith(self.PREFIX))
+        except OSError:
+            return []
+
+    def _qt(self, chord: Chord) -> str | None:
+        key = chord.keysym
+        if re.fullmatch(r"F\d{1,2}", key) or key in _QT_NAMES:
+            name = _QT_NAMES.get(key, key)
+        else:
+            char = chr(Gdk.keyval_to_unicode(Gdk.keyval_from_name(key)) or 0)
+            if not char.isprintable() or char.isspace() or char == "\0":
+                return None
+            name = char.upper()
+        mods = [
+            _KDE_MODS[m] for m in ("ctrl", "alt", "shift", "super") if m in chord.mods
+        ]
+        return "+".join([*mods, name])
+
+    @staticmethod
+    def _entry(name: str) -> list[str]:
+        """kconfig arguments for one shortcut's key in kglobalshortcutsrc."""
+        return ["--file", "kglobalshortcutsrc", "--group", "services"] + [
+            "--group", name, "--key", "_launch",
+        ]  # fmt: skip
+
+    def _kwrite(self, name: str, value: str | None) -> None:
+        cmd = [self.tool, *self._entry(name)]
+        subprocess.run(
+            [*cmd, "--delete"] if value is None else [*cmd, value], check=False
+        )
+
+    def bound(self, chords: list[Chord]) -> set[Chord]:
+        wanted = {self._qt(c): c for c in chords}
+        out = set()
+        for name in self._files():
+            done = subprocess.run(
+                [self.reader, *self._entry(name)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if (chord := wanted.get(done.stdout.strip())) is not None:
+                out.add(chord)
+        return out
+
+    def apply(self, chords: list[Chord], take: set[Chord]) -> Report:
+        report = Report()
+        self.remove(reload=False)
+        clashes = self.conflicts(chords)
+        os.makedirs(self.apps, exist_ok=True)
+        for i, chord in enumerate(chords):
+            qt = self._qt(chord)
+            if qt is None:
+                report.notes.append(f"{chord.keysym} has no KDE key name kb-kill knows")
+                continue
+            if chord in clashes:
+                if chord not in take:
+                    report.notes.append(f"{qt}: left to {clashes[chord].what}")
+                    continue
+                self._free(chord, clashes[chord])
+            name = f"{self.PREFIX}{i}.desktop"
+            write_atomic(
+                os.path.join(self.apps, name),
+                "[Desktop Entry]\nType=Application\n"
+                f"Name=kb-kill: {qt} (swallowed)\nExec={NOOP}\nNoDisplay=true\n"
+                "StartupNotify=false\nX-KDE-GlobalAccel-CommandShortcut=true\n",
+            )
+            self._kwrite(name, qt)
+            report.bound += 1
+        report.notes += self._reload()
+        return report
+
+    def remove(self, reload: bool = True) -> None:
+        for name in self._files():
+            self._kwrite(name, None)
+            try:
+                os.unlink(os.path.join(self.apps, name))
+            except OSError:
+                pass
+        if reload:
+            self._reload()
+
+    UNIT = "plasma-kglobalaccel.service"
+
+    @classmethod
+    def _reload(cls) -> list[str]:
+        """kglobalaccel reads kglobalshortcutsrc when it starts. Restart it
+        only where it runs as its own user unit (Plasma on X11); under Plasma
+        Wayland it lives inside KWin, and starting the unit there would bring
+        up a second one. Otherwise the change lands at the next login."""
+        _rc, state = systemctl_user("is-active", cls.UNIT)
+        if state.splitlines()[:1] == ["active"]:
+            rc, _out = systemctl_user("restart", cls.UNIT)
+            if rc == 0:
+                return []
+        return ["Log out and back in for KDE to pick the shortcuts up."]
+
+    def label(self, chord: Chord) -> str:
+        return self._qt(chord) or chord.keysym
+
+
+_KCONFIG_ESCAPES = MappingProxyType(
+    {"\\": "\\", "t": "\t", "n": "\n", "r": "\r", "s": " "}
+)
+
+
+def _kconfig_unescape(text: str) -> str:
+    """KConfig's value escaping undone: \\\\ \\t \\n \\r \\s and \\xHH."""
+    out, i = [], 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            if nxt in _KCONFIG_ESCAPES:
+                out.append(_KCONFIG_ESCAPES[nxt])
+                i += 2
+                continue
+            if nxt == "x" and re.fullmatch(r"[0-9A-Fa-f]{2}", text[i + 2 : i + 4]):
+                out.append(chr(int(text[i + 2 : i + 4], 16)))
+                i += 4
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def current_desktops() -> set[str]:
+    return {
+        d.strip().upper() for d in os.environ.get("XDG_CURRENT_DESKTOP", "").split(":")
+    }
+
+
+class DesktopPage(Adw.PreferencesPage):
+    """Desktop shortcuts that swallow kb-kill's hotkeys, and COSMIC's window rule."""
+
+    def __init__(self, win: "ConfigWindow") -> None:
+        super().__init__()
+        self._win = win
+        self._backends = [CosmicShortcuts(), GnomeShortcuts(), KdeShortcuts()]
+        # Per desktop: its Shortcuts dropdown, the hotkey rows in it, buttons.
+        self._status: dict[str, Adw.ExpanderRow] = {}
+        self._hotkey_rows: dict[str, list[Adw.ActionRow]] = {}
+        self._buttons: dict[str, tuple[Gtk.Button, Gtk.Button]] = {}
+
+        self._empty = Adw.PreferencesGroup(visible=False)
+        self._empty.add(
+            Adw.StatusPage(
+                icon_name="preferences-desktop-keyboard-shortcuts-symbolic",
+                title="No Hotkeys Yet",
+                description="Save a group with hotkeys; they show up here.",
+            )
+        )
+        self.add(self._empty)
+        self._combos = Adw.PreferencesGroup(
+            title="Keep Hotkeys Away From Apps",
+            description="A do-nothing desktop shortcut stops a hotkey reaching the "
+            "app in front; kb-kill still sees it.",
+        )
+        self.add(self._combos)
+
+        # Your desktop up front; the rest only on request (HIG: hide what does
+        # not apply). With no desktop recognised, all of them in one section.
+        here = current_desktops()
+        self._current = {
+            b.title for b in self._backends if b.title.split()[0].upper() in here
+        }
+        front = Adw.PreferencesGroup(
+            title="Current Desktop" if self._current else "Desktops"
+        )
+        others = Adw.PreferencesGroup(title="Other Desktops")
+        for backend in self._backends:
+            up_front = backend.title in self._current or not self._current
+            status = self._status_row(backend, f"{backend.title} Shortcuts")
+            status.set_expanded(backend.title in self._current)  # yours, open
+            (front if up_front else others).add(status)
+            if isinstance(backend, CosmicShortcuts):
+                self._float = Adw.SwitchRow(
+                    title="COSMIC Tiling Exception",
+                    subtitle="The settings window floats instead of tiling, "
+                    "from the next time it opens",
+                    sensitive=False,  # until refresh() finds COSMIC
+                )
+                self._float_handler = self._float.connect(
+                    "notify::active", self._on_float
+                )
+                if up_front:
+                    front.add(self._float)
+                else:
+                    status.add_row(self._float)  # folded away with COSMIC
+        self.add(front)
+        self._sections: list[Adw.PreferencesGroup] = [front]
+        if self._current and len(self._current) < len(self._backends):
+            self.add(others)
+            self._sections.append(others)
+
+    def _status_row(self, backend, title: str) -> Adw.ExpanderRow:
+        """The desktop's Shortcuts row; open it for each hotkey's state there."""
+        status = Adw.ExpanderRow(title=title)
+        apply = Gtk.Button(
+            label="Apply", valign=Gtk.Align.CENTER, css_classes=["suggested-action"]
+        )
+        remove = Gtk.Button(
+            label="Remove", valign=Gtk.Align.CENTER, css_classes=["flat"]
+        )
+        apply.set_tooltip_text("Bind each hotkey to a do-nothing shortcut")
+        remove.set_tooltip_text("Remove the shortcuts kb-kill added")
+        apply.connect("clicked", lambda _b: self._apply(backend))
+        remove.connect("clicked", lambda _b: self._remove(backend))
+        status.add_suffix(remove)
+        status.add_suffix(apply)
+        self._status[backend.title] = status
+        self._hotkey_rows[backend.title] = []
+        self._buttons[backend.title] = (apply, remove)
+        return status
+
+    def refresh(self) -> None:
+        wanted = wanted_chords(self._win.saved)
+        chords = [c for _s, c in wanted if isinstance(c, Chord)]
+        self._empty.set_visible(not wanted)
+        for section in (self._combos, *self._sections):
+            section.set_visible(bool(wanted))
+
+        for backend in self._backends:
+            title = backend.title
+            status, (apply, remove) = self._status[title], self._buttons[title]
+            for row in self._hotkey_rows[title]:
+                status.remove(row)
+            self._hotkey_rows[title] = []
+            why = backend.unavailable()
+            if isinstance(backend, CosmicShortcuts):
+                self._float.set_sensitive(why is None)  # never create COSMIC's files
+            apply.set_sensitive(why is None and bool(chords))
+            remove.set_visible(False)
+            if why:
+                status.set_subtitle(GLib.markup_escape_text(why))
+                status.set_enable_expansion(False)  # nothing to show there
+                continue
+            status.set_enable_expansion(True)
+            try:
+                bound = backend.bound(chords)
+                clashes = backend.conflicts(chords)
+                summary = (
+                    f"{len(bound & set(chords))} of {len(chords)} hotkeys swallowed"
+                )
+                remove.set_visible(backend.has_own())  # only once there is any
+            except (ValueError, OSError, GLib.Error) as e:
+                bound, clashes, summary = set(), {}, str(e)
+                apply.set_sensitive(False)
+            if clashes:
+                n = len(clashes)
+                summary += f"; {n} already in use" if n > 1 else "; 1 already in use"
+            status.set_subtitle(GLib.markup_escape_text(summary))
+            for spec, chord in wanted:
+                self._add_hotkey_row(status, title, spec, chord, bound, clashes)
+            if isinstance(backend, CosmicShortcuts):
+                self._float.handler_block(self._float_handler)
+                self._float.set_active(backend.floating())
+                self._float.handler_unblock(self._float_handler)
+        if self._win.dirty():
+            self._win.toast(
+                "The hotkeys listed are the saved ones; save to include your edits"
+            )
+
+    def _add_hotkey_row(
+        self,
+        status: Adw.ExpanderRow,
+        title: str,
+        spec: str,
+        chord: Chord | str,
+        bound,
+        clashes,
+    ) -> None:
+        """One hotkey's state on one desktop; `chord` is the reason, as a str,
+        when no desktop shortcut can express it (a mouse button, a bare key)."""
+        clash = clashes.get(chord) if isinstance(chord, Chord) else None
+        if not isinstance(chord, Chord):
+            state = f"Skipped: {chord}"
+        elif clash is not None:
+            state = f"Already in use: {clash.what}"
+        elif chord in bound:
+            state = "Swallowed"
+        else:
+            state = "Not swallowed yet"
+        row = Adw.ActionRow(
+            title=GLib.markup_escape_text(spec),
+            subtitle=GLib.markup_escape_text(state),
+        )
+        if clash is not None:
+            icon = Gtk.Image(
+                icon_name="dialog-warning-symbolic", css_classes=["warning"]
+            )
+            icon.set_tooltip_text("This combo is already a desktop shortcut")
+            row.add_prefix(icon)
+        status.add_row(row)
+        self._hotkey_rows[title].append(row)
+
+    def _apply(self, backend) -> None:
+        """Clashing hotkeys are the user's call: ask, each off by default."""
+        wanted = [
+            (spec, c)
+            for spec, c in wanted_chords(self._win.saved)
+            if isinstance(c, Chord)
+        ]
+        chords = [c for _s, c in wanted]
+        try:
+            clashes = backend.conflicts(chords)
+        except (ValueError, OSError, GLib.Error) as e:
+            self._win.alert("Shortcuts Not Applied", str(e))
+            return
+        if not clashes:
+            self._run_apply(backend, chords, set())
+            return
+
+        dialog = Adw.AlertDialog(
+            heading="Hotkeys Already in Use",
+            body=f"{backend.title} already uses these combos. Turn on the ones kb-kill "
+            "should take over; the rest are skipped and keep reaching apps.",
+        )
+        rows = Gtk.ListBox(
+            selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"]
+        )
+        choices: list[tuple[Adw.SwitchRow, Chord]] = []
+        for spec, chord in wanted:
+            if (clash := clashes.get(chord)) is None:
+                continue
+            row = Adw.SwitchRow(
+                title=GLib.markup_escape_text(spec),
+                subtitle=GLib.markup_escape_text(f"Now: {clash.what}. {clash.effect}"),
+            )
+            rows.append(row)
+            choices.append((row, chord))
+        dialog.set_extra_child(rows)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("apply", "Apply")
+        dialog.set_response_appearance("apply", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("apply")
+        dialog.set_close_response("cancel")
+
+        def answered(_d, response: str) -> None:
+            if response == "apply":
+                take = {chord for row, chord in choices if row.get_active()}
+                self._run_apply(backend, chords, take)
+
+        dialog.connect("response", answered)
+        dialog.present(self._win)
+
+    def _run_apply(self, backend, chords: list[Chord], take: set[Chord]) -> None:
+        try:
+            report = backend.apply(chords, take)
+        except (ValueError, OSError, GLib.Error) as e:
+            self._win.alert("Shortcuts Not Applied", str(e))
+            return
+        self.refresh()
+        text = f"{report.bound} of {len(chords)} hotkeys swallowed by {backend.title}."
+        if report.notes:
+            self._win.alert(
+                "Shortcuts Applied", text + "\n\n" + "\n".join(report.notes)
+            )
+        else:
+            self._win.toast(text)
+
+    def _remove(self, backend) -> None:
+        try:
+            backend.remove()
+        except (ValueError, OSError, GLib.Error) as e:
+            self._win.alert("Shortcuts Not Removed", str(e))
+            return
+        self.refresh()
+        self._win.toast(f"Removed kb-kill's {backend.title} shortcuts")
+
+    def _on_float(self, row, _pspec) -> None:
+        cosmic = self._backends[0]
+        try:
+            cosmic.set_floating(row.get_active())
+        except (ValueError, OSError) as e:
+            self._win.alert("Window Rule Not Changed", str(e))
+
+
+# --------------------------------------------------------------------------- #
+# Window
+# --------------------------------------------------------------------------- #
+class ConfigWindow(Adw.ApplicationWindow):
+    def __init__(self, app: Adw.Application) -> None:
+        super().__init__(
+            application=app,
+            title=APP_NAME,
+            default_width=920,
+            default_height=680,
+        )
+        self.path = user_config_path()
+        self.text = ""  # what the file held when last loaded or saved
+        self.saved = Model()
+        self.model = Model()
+        self.readable = True
+        self._status: dict[str, dict] = {}
+        self._banner_action = None
+        self._pages: dict[str, Adw.PreferencesPage] = {}
+        self._rows: dict[str, Adw.ActionRow] = {}
+        self._closing = False
+        self._undo: list[Edit] = []
+        self._redo: list[Edit] = []
+        self._preview_timer = 0
+        self._preview_gen = 0  # a preview reply for an older edit is dropped
+        self._saving = False  # a save's check is out
+
+        self._stack = Adw.ViewStack()
+        if self._stack.find_property("enable-transitions"):  # libadwaita >= 1.7
+            self._stack.set_property("enable-transitions", True)
+        self._stack.add_titled_with_icon(
+            self._build_groups_view(),
+            "groups",
+            "Groups",
+            "input-keyboard-symbolic",
+        )
+        self._tray = TrayPage(self)
+        self._stack.add_titled_with_icon(
+            self._tray, "tray", "Tray", "preferences-desktop-display-symbolic"
+        )
+        self._desktop = DesktopPage(self)
+        self._stack.add_titled_with_icon(
+            self._desktop,
+            "desktop",
+            "Desktop",
+            "preferences-desktop-keyboard-shortcuts-symbolic",
+        )
+        self._stack.connect("notify::visible-child-name", self._on_tab)
+
+        # Wide: tabs in the header. Narrow: the app name there, tabs at the bottom.
+        switcher = Adw.ViewSwitcher(
+            stack=self._stack, policy=Adw.ViewSwitcherPolicy.WIDE
+        )
+        app_title = Adw.WindowTitle(title=APP_NAME, visible=False)
+        titles = Gtk.Box()
+        titles.append(switcher)
+        titles.append(app_title)
+        header = Adw.HeaderBar(title_widget=titles)
+        switcher_bar = Adw.ViewSwitcherBar(stack=self._stack)
+        self._sidebar_button = Gtk.ToggleButton(
+            icon_name="sidebar-show-symbolic", tooltip_text="Show Groups", visible=False
+        )
+        self._sidebar_button.update_property(
+            [Gtk.AccessibleProperty.LABEL], ["Show Groups"]
+        )
+        self._split.bind_property(  # the split view's state wins at start
+            "show-sidebar",
+            self._sidebar_button,
+            "active",
+            GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE,
+        )
+        header.pack_start(self._sidebar_button)
+        files = Gio.Menu()
+        files.append(f"Open {os.path.basename(self.path)}…", "win.open-groups-text")
+        files.append(
+            f"Open {os.path.basename(tray_config_path())}…", "win.open-tray-text"
+        )
+        files.append("Reload From Disk", "win.reload")
+        about = Gio.Menu()
+        about.append("Keyboard Shortcuts", "win.show-help-overlay")
+        about.append("About kb-kill", "app.about")
+        menu = Gio.Menu()
+        menu.append_section(None, files)
+        menu.append_section(None, about)
+        header.pack_end(
+            Gtk.MenuButton(
+                icon_name="open-menu-symbolic",
+                menu_model=menu,
+                primary=True,
+                tooltip_text="Main Menu",
+            )
+        )
+        for name, handler in (
+            ("open-groups-text", self._open_groups_text),
+            ("open-tray-text", lambda *_: self._tray.open_text()),
+            ("reload", self._reload),
+            ("save", lambda *_: self.save()),
+            ("undo", lambda *_: self.undo()),
+            ("redo", lambda *_: self.redo()),
+        ):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", handler)
+            self.add_action(action)
+        for name, handler in (
+            ("rename-group", self._on_rename_action),
+            ("delete-group", self._on_delete_action),
+        ):  # target: the group's key
+            action = Gio.SimpleAction.new(name, GLib.VariantType.new("s"))
+            action.connect("activate", handler)
+            self.add_action(action)
+        self._save_action = self.lookup_action("save")
+        # Bubble phase: a focused text field takes Ctrl+Z for its own typing
+        # first; the group history gets it everywhere else.
+        history = Gtk.ShortcutController()
+        for key, action in (("undo", "win.undo"), ("redo", "win.redo")):
+            history.add_shortcut(
+                Gtk.Shortcut.new(key_trigger(key), Gtk.NamedAction.new(action))
+            )
+        self.add_controller(history)
+        self._sync_history()
+        self.set_help_overlay(shortcuts_window())
+
+        self._banner = Adw.Banner(use_markup=False)  # titles quote config text
+        self._banner.connect(
+            "button-clicked", lambda _b: self._banner_action and self._banner_action()
+        )
+        self._toasts = Adw.ToastOverlay(child=self._stack)
+        view = Adw.ToolbarView()
+        view.add_top_bar(header)
+        view.add_top_bar(self._banner)
+        view.set_content(self._toasts)
+        view.add_bottom_bar(switcher_bar)
+        self.set_content(view)
+
+        self.set_size_request(360, 294)  # the HIG's smallest phone-sized window
+        narrow = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 640sp"))
+        narrow.add_setter(self._split, "collapsed", True)
+        narrow.add_setter(switcher, "visible", False)
+        narrow.add_setter(app_title, "visible", True)
+        narrow.add_setter(switcher_bar, "reveal", True)
+        self.add_breakpoint(narrow)
+        self._split.connect("notify::collapsed", self._on_collapsed)
+
+        self.connect("close-request", self._on_close_request)
+        self._monitor = watch_file(self.path, self._on_disk_changed)
+        self.load()
+
+    # -- layout --------------------------------------------------------------- #
+    def _build_groups_view(self) -> Gtk.Widget:
+        self._list = Gtk.ListBox(css_classes=["navigation-sidebar"])
+        self._list.connect("row-selected", self._on_row_selected)
+        keys = Gtk.ShortcutController()
+        for key, handler in (
+            ("delete", self._delete_selected),
+            ("rename", self._rename_selected),
+            ("group-menu", self._menu_selected),
+        ):
+            keys.add_shortcut(
+                Gtk.Shortcut.new(
+                    key_trigger(key),
+                    Gtk.CallbackAction.new(lambda *_a, h=handler: h() or True),
+                )
+            )
+        self._list.add_controller(keys)
+        add = Gtk.Button(
+            child=Adw.ButtonContent(icon_name="list-add-symbolic", label="Add Group"),
+            css_classes=["flat"],
+            margin_start=6,
+            margin_end=6,
+            margin_bottom=6,
+        )
+        add.connect("clicked", lambda _b: self.add_group())
+        sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        sidebar.append(
+            Gtk.ScrolledWindow(
+                child=self._list, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER
+            )
+        )
+        sidebar.append(add)
+        self._content = Gtk.Stack(hexpand=True)
+        # An overlay sidebar, not a navigation split view: that one wants a
+        # header bar per pane, and this window already has one for the tabs.
+        self._split = Adw.OverlaySplitView(
+            sidebar=sidebar, content=self._content, max_sidebar_width=280, vexpand=True
+        )
+        # Save and Revert only while there is something to save or revert
+        # (the rest of the window applies as it changes).
+        revert = Gtk.Button(label="Revert")
+        revert.connect("clicked", lambda _b: self.revert())
+        save = Gtk.Button(label="Save", css_classes=["suggested-action"])
+        save.connect("clicked", lambda _b: self.save())
+        bar = Gtk.ActionBar()
+        bar.pack_start(Gtk.Label(label="Unsaved changes", css_classes=["dim-label"]))
+        bar.pack_end(save)
+        bar.pack_end(revert)
+        self._save_bar = Gtk.Revealer(
+            child=bar, transition_type=Gtk.RevealerTransitionType.SLIDE_UP
+        )
+        self._groups_view = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self._groups_view.append(self._split)
+        self._groups_view.append(self._save_bar)
+        return self._groups_view
+
+    def _rebuild(self, select: str | None = None) -> None:
+        """Rebuild sidebar and pages from the model (after load, add, delete)."""
+        selected = select or self._selected_key() or "top"
+        self._list.remove_all()
+        for page in self._pages.values():
+            self._content.remove(page)
+        self._pages, self._rows = {}, {}
+
+        self._add_entry("top", TopPage(self), "Defaults")
+        for g in self.model.groups:
+            self._add_entry(g.key, GroupPage(self, g), g.label.strip() or g.name)
+        self._update_status_rows()
+        row = self._rows.get(selected) or self._rows["top"]
+        self._list.select_row(row)
+
+    def _add_entry(self, key: str, page: Adw.PreferencesPage, title: str) -> None:
+        row = Adw.ActionRow(title=GLib.markup_escape_text(title))
+        if key != "top":  # Defaults cannot be renamed or deleted
+            click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+            click.connect("pressed", lambda _g, _n, x, y: self._row_menu(key, x, y))
+            press = Gtk.GestureLongPress(touch_only=True)
+            press.connect("pressed", lambda _g, x, y: self._row_menu(key, x, y))
+            row.add_controller(click)
+            row.add_controller(press)
+        self._rows[key] = row
+        self._pages[key] = page
+        self._list.append(row)
+        self._content.add_named(page, key)
+
+    def _selected_key(self) -> str | None:
+        row = self._list.get_selected_row() if hasattr(self, "_list") else None
+        return next((k for k, r in self._rows.items() if r is row), None)
+
+    def _on_collapsed(self, split: Adw.OverlaySplitView, _pspec) -> None:
+        """Narrow: the page, with the sidebar a button away. Wide: both."""
+        split.set_show_sidebar(not split.get_collapsed())
+        self._sync_header()
+
+    def _on_row_selected(self, _list, row) -> None:
+        key = next((k for k, r in self._rows.items() if r is row), None)
+        if key is None:
+            return
+        self._content.set_visible_child_name(key)
+        self._pages[key].refresh()
+        if self._split.get_collapsed():
+            self._split.set_show_sidebar(False)  # narrow: show the page picked
+
+    def retitle(self, group: Group) -> None:
+        if row := self._rows.get(group.key):
+            row.set_title(
+                GLib.markup_escape_text(group.label.strip() or group.name.strip())
+            )
+
+    # -- model ---------------------------------------------------------------- #
+    def dirty(self) -> bool:
+        return self.model.norm() != self.saved.norm()
+
+    def changed(self) -> None:
+        self._sync_header()
+        self._schedule_preview()
+
+    # -- matched-devices preview --------------------------------------------- #
+    def _schedule_preview(self) -> None:
+        if self._preview_timer:
+            GLib.source_remove(self._preview_timer)
+        self._preview_timer = GLib.timeout_add(PREVIEW_DELAY_MS, self._run_preview)
+
+    def _run_preview(self) -> bool:
+        """Ask the daemon what each group would grab, edits included: its own
+        matching (globs, remapper copies), so the preview cannot disagree."""
+        self._preview_timer = 0
+        if not self.readable or not self.model.groups:
+            return False
+        self._preview_gen += 1
+        gen = self._preview_gen
+        ask_daemon_async(
+            lambda result, error: self._show_preview(gen, result, error),
+            "config_check",
+            cmd="check_config",
+            toml=render(self.text, self.saved, self.model),
+        )
+        return False  # one-shot timer
+
+    def _show_preview(self, gen: int, result: dict | None, error: str | None) -> None:
+        if gen != self._preview_gen:
+            return  # an edit came after this request; its own reply follows
+        pages = [(g, self._pages.get(g.key)) for g in self.model.groups]
+        if result is None and "unknown command" in str(error):
+            note = "No preview: the kb-kill daemon is older than this window."
+        elif result is None:
+            note = f"No preview: {error}"
+        elif not result.get("ok"):
+            message = re.sub(r"^config:?\s*", "", str(result.get("error")))
+            note = f"No preview until the config is valid: {message}"
+        elif "matches" not in result:
+            note = "No preview: only the user at the seat can see devices."
+        else:
+            note = None
+        for group, page in pages:
+            if page is None:
+                continue
+            if note:
+                page.show_matches(None, note)
+                page.show_wakeable(None)
+            else:
+                name = group.name.strip()
+                page.show_matches(result["matches"].get(name, []), None)
+                page.show_wakeable(result.get("wakeable", {}).get(name))
+
+    def _sync_header(self) -> None:
+        on_groups = self._stack.get_visible_child_name() == "groups"
+        dirty = self.dirty()
+        self._sidebar_button.set_visible(on_groups and self._split.get_collapsed())
+        self._save_bar.set_reveal_child(dirty and self.readable)
+        self._save_action.set_enabled(dirty and self.readable)
+        self.set_title(f"• {APP_NAME}" if dirty else APP_NAME)
+
+    def name_for(self, label: str, group: Group | None) -> str:
+        taken = {g.name.strip() for g in self.model.groups if g is not group}
+        return name_from_label(label, taken)
+
+    def _group(self, key: str) -> Group | None:
+        return next((g for g in self.model.groups if g.key == key), None)
+
+    # Every change to the group list goes through here and the history.
+    def _insert(self, group: Group, index: int) -> None:
+        taken = {g.name.strip() for g in self.model.groups}
+        if group.name.strip() in taken:  # taken meanwhile (undo after a relabel)
+            group.name = self.name_for(group.label or group.name, group)
+        self.model.groups.insert(min(index, len(self.model.groups)), group)
+        self._rebuild(select=group.key)
+        self.changed()
+
+    def _drop(self, group: Group) -> None:
+        self.model.groups.remove(group)
+        self._rebuild(select="top")
+        self.changed()
+
+    def _set_label(self, group: Group, label: str, name: str) -> None:
+        group.label, group.name = label, name
+        self._rebuild(select=group.key)
+        self.changed()
+
+    def add_group(self) -> None:
+        shown = {g.label.strip() or g.name.strip() for g in self.model.groups}
+        label = next(
+            f"Group {i}" for i in itertools.count(1) if f"Group {i}" not in shown
+        )
+        group = Group(label=label, name=self.name_for(label, None))
+        index = len(self.model.groups)
+        self._insert(group, index)
+        self._push(
+            Edit(
+                f"Add {label}",
+                undo=lambda: self._drop(group),
+                redo=lambda: self._insert(group, index),
+            )
+        )
+
+    def delete_group(self, group: Group) -> None:
+        """Undo from the toast or Ctrl+Z instead of asking first (GNOME HIG)."""
+        index = self.model.groups.index(group)
+        self._drop(group)
+        name = group.label.strip() or group.name.strip()
+        edit = Edit(
+            f"Delete {name}",
+            undo=lambda: self._insert(group, index),
+            redo=lambda: self._drop(group),
+        )
+        self._push(edit)
+        toast = Adw.Toast(
+            title=GLib.markup_escape_text(f"Deleted {name}"), button_label="Undo"
+        )
+        toast.connect(
+            "button-clicked",
+            lambda _t: self._undo and self._undo[-1] is edit and self.undo(),
+        )
+        self._toasts.add_toast(toast)
+
+    def rename_group(self, group: Group, label: str) -> None:
+        """Rename sets the label; the name is made from it (one undo step)."""
+        label = label.strip()
+        old = (group.label, group.name)
+        if label == (group.label.strip() or group.name):
+            return
+        new = (label, self.name_for(label, group))
+        self._set_label(group, *new)
+        self._push(
+            Edit(
+                f"Rename {old[0] or old[1]}",
+                undo=lambda: self._set_label(group, *old),
+                redo=lambda: self._set_label(group, *new),
+            )
+        )
+
+    # -- history -------------------------------------------------------------- #
+    def _push(self, edit: Edit) -> None:
+        self._undo.append(edit)
+        self._redo.clear()
+        self._sync_history()
+
+    def undo(self) -> None:
+        if self._undo:
+            edit = self._undo.pop()
+            edit.undo()
+            self._redo.append(edit)
+            self._sync_history()
+
+    def redo(self) -> None:
+        if self._redo:
+            edit = self._redo.pop()
+            edit.redo()
+            self._undo.append(edit)
+            self._sync_history()
+
+    def _clear_history(self) -> None:
+        """The model object is replaced (load, revert): old edits point nowhere."""
+        self._undo.clear()
+        self._redo.clear()
+        self._sync_history()
+
+    def _sync_history(self) -> None:
+        self.lookup_action("undo").set_enabled(bool(self._undo))
+        self.lookup_action("redo").set_enabled(bool(self._redo))
+
+    # -- sidebar actions ------------------------------------------------------ #
+    def _on_rename_action(self, _action, key: GLib.Variant) -> None:
+        self._rename_popover(key.get_string())
+
+    def _on_delete_action(self, _action, key: GLib.Variant) -> None:
+        if group := self._group(key.get_string()):
+            self.delete_group(group)
+
+    def _selected_group(self) -> Group | None:
+        key = self._selected_key()
+        return self._group(key) if key and key != "top" else None
+
+    def _delete_selected(self) -> None:
+        if group := self._selected_group():
+            self.delete_group(group)
+
+    def _rename_selected(self) -> None:
+        if group := self._selected_group():
+            self._rename_popover(group.key)
+
+    def _menu_selected(self) -> None:
+        if group := self._selected_group():
+            self._row_menu(group.key)
+
+    def _row_menu(
+        self, key: str, x: float | None = None, y: float | None = None
+    ) -> None:
+        row = self._rows.get(key)
+        if row is None:
+            return
+        self._list.select_row(row)
+        menu = Gio.Menu()
+        for label, action in (
+            ("Rename…", "win.rename-group"),
+            ("Delete", "win.delete-group"),
+        ):
+            item = Gio.MenuItem.new(label, None)
+            item.set_action_and_target_value(action, GLib.Variant("s", key))
+            menu.append_item(item)
+        popover = Gtk.PopoverMenu.new_from_model(menu)
+        popover.set_parent(row)
+        popover.set_has_arrow(False)
+        if x is not None and y is not None:
+            rect = Gdk.Rectangle()
+            rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+            popover.set_pointing_to(rect)
+        popover.connect("closed", lambda p: GLib.idle_add(p.unparent))
+        popover.popup()
+
+    def _rename_popover(self, key: str) -> None:
+        """Rename in a popover on the row, as GNOME Files does."""
+        group, row = self._group(key), self._rows.get(key)
+        if group is None or row is None:
+            return
+        self._list.select_row(row)
+        popover = Gtk.Popover(position=Gtk.PositionType.RIGHT)
+        popover.set_parent(row)
+        popover.connect("closed", lambda p: GLib.idle_add(p.unparent))
+        entry = Gtk.Entry(text=group.label or group.name, hexpand=True, width_chars=20)
+        button = Gtk.Button(label="Rename", css_classes=["suggested-action"])
+        hint = Gtk.Label(
+            label="A label is 1 to 64 printable characters.",
+            wrap=True,
+            max_width_chars=32,
+            xalign=0,
+            visible=False,
+            css_classes=["caption", "error"],
+        )
+
+        def check(*_args) -> None:
+            text = entry.get_text().strip()
+            ok = bool(text) and label_ok(text)
+            button.set_sensitive(ok)
+            _entry_error(entry, not ok)
+            hint.set_visible(not ok)
+
+        def apply(*_args) -> None:
+            if not button.get_sensitive():
+                return
+            label = entry.get_text()
+            popover.popdown()
+            # After the popover has let go of the row the rebuild replaces.
+            GLib.idle_add(lambda: self.rename_group(group, label) and False)
+
+        entry.connect("changed", check)
+        entry.connect("activate", apply)
+        button.connect("clicked", apply)
+        line = Gtk.Box(spacing=6)
+        line.append(entry)
+        line.append(button)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{side}")(6)
+        box.append(Gtk.Label(label="Group Label", xalign=0, css_classes=["heading"]))
+        box.append(line)
+        box.append(hint)
+        popover.set_child(box)
+        popover.popup()
+        entry.grab_focus()
+        entry.select_region(0, -1)
+
+    # -- load / save ---------------------------------------------------------- #
+    def _read_text(self) -> str:
+        """The user's file, or the shipped default it would be seeded from."""
+        for path in (self.path, seed_path()):
+            if path and os.path.isfile(path):
+                try:
+                    with open(path) as fh:
+                        return fh.read()
+                except OSError as e:
+                    self.toast(f"Cannot read {path}: {e}")
+        return ""
+
+    def load(self) -> None:
+        self.text = self._read_text()
+        try:
+            self.saved = model_from(self.text)
+            self.readable = True
+            self._show_banner(None)
+        except (tomllib.TOMLDecodeError, TopLevelGroupError) as e:
+            self.saved = Model()
+            self.readable = False
+            problem = (
+                str(e)
+                if isinstance(e, TopLevelGroupError)
+                else f"kb-kill.toml is not valid TOML ({e})"
+            )
+            self._show_banner(
+                f"{problem}. Fix it as text.", "Open as Text", self._open_groups_text
+            )
+        self.model = copy.deepcopy(self.saved)
+        self._clear_history()
+        self._groups_view.set_sensitive(self.readable)
+        self._rebuild()
+        self.changed()
+        self.refresh_status()
+
+    def revert(self) -> None:
+        self.model = copy.deepcopy(self.saved)
+        self._clear_history()
+        self._rebuild()
+        self.changed()
+
+    def save(self, then=None, overwrite: bool = False) -> None:
+        if not self.readable:
+            return
+        names = [g.name.strip() for g in self.model.groups]
+        if dup := next((n for n in names if names.count(n) > 1), None):
+            self.alert(
+                "Not Saved",
+                f"Two groups are named {dup}, and one would replace the other. "
+                "Change one of their labels first.",
+            )
+            return
+        if not overwrite and self._read_text() != self.text:
+            self._confirm_overwrite(then)
+            return
+        if self._saving:
+            return  # a check is already out; its answer decides
+        text = render(self.text, self.saved, self.model)
+        snapshot = copy.deepcopy(self.model)  # edits made during the check stay unsaved
+        self._saving = True
+        ask_daemon_async(
+            lambda result, error: self._checked(
+                text, snapshot, result, error, then, overwrite
+            ),
+            "config_check",
+            cmd="check_config",
+            toml=text,
+        )
+
+    def _checked(self, text, snapshot, result, error, then, overwrite) -> None:
+        self._saving = False
+        if result is None:
+            if "unknown command" in str(error):
+                error = "it is older than this window"
+            self._confirm(
+                "Save Without Checking?",
+                f"The daemon could not check this config: {error}. It is valid TOML, "
+                "but kb-kill may still reject it.",
+                "Save Anyway",
+                lambda: self._commit(text, snapshot, [], then, overwrite),
+            )
+            return
+        if not result.get("ok"):
+            message = re.sub(r"^config:?\s*", "", str(result.get("error")))
+            self.alert("Not Saved", f"kb-kill would reject this config:\n\n{message}")
+            return
+        self._commit(text, snapshot, result.get("warnings") or [], then, overwrite)
+
+    def _confirm_overwrite(self, then) -> None:
+        """The file changed under unsaved edits: never pick a side silently."""
+        dialog = Adw.AlertDialog(
+            heading="Config Changed on Disk",
+            body="It was edited outside this window after you opened it. "
+            "Overwrite it with your edits, or reload it and drop them?",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("reload", "Reload")
+        dialog.add_response("overwrite", "Overwrite")
+        dialog.set_response_appearance("overwrite", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_close_response("cancel")
+
+        def answered(_d, response: str) -> None:
+            if response == "reload":
+                self.load()
+            elif response == "overwrite":
+                self.save(then, overwrite=True)
+
+        dialog.connect("response", answered)
+        dialog.present(self)
+
+    def _commit(
+        self, text: str, snapshot: Model, warnings: list[str], then, overwrite=False
+    ) -> None:
+        """Write `text`, rendered from `snapshot`: that is what is now saved."""
+        try:
+            tomllib.loads(text)
+        except tomllib.TOMLDecodeError as e:  # never write what cannot be read
+            self.alert("Not Saved", f"The edited config is not valid TOML: {e}")
+            return
+        if not overwrite and self._read_text() != self.text:
+            self._confirm_overwrite(then)  # changed while the check ran
+            return
+        try:
+            write_atomic(self.path, text)
+        except OSError as e:
+            self.alert("Not Saved", f"Cannot write {self.path}: {e}")
+            return
+        self.text = text
+        for g in snapshot.groups:
+            g.orig = g.name = g.name.strip()
+        saved_as = {g.key: g.name for g in snapshot.groups}
+        for g in self.model.groups:  # the live copy, possibly edited since
+            if g.key in saved_as:
+                g.orig = saved_as[g.key]
+        self.saved = snapshot
+        self.changed()
+        if warnings:
+            more = f" (+{len(warnings) - 1} more)" if len(warnings) > 1 else ""
+            self._show_banner(f"Saved with a warning: {warnings[0]}{more}")
+        else:
+            self._show_banner(None)
+            self.toast("Saved; kb-kill applies it in a moment")
+        GLib.timeout_add(STATUS_DELAY_MS, lambda: self.refresh_status() and False)
+        if then:
+            then()
+
+    def refresh_status(self) -> bool:
+        ask_daemon_async(self._show_status, "state", cmd="status")
+        return False
+
+    def _show_status(self, state: dict | None, error: str | None) -> None:
+        self._status = {g["name"]: g for g in state.get("groups", [])} if state else {}
+        if error and self.readable and not self._banner.get_revealed():
+            self._show_banner(f"No live status: {error}", "Retry", self.refresh_status)
+        self._update_status_rows()
+
+    def _update_status_rows(self) -> None:
+        live = self._status
+
+        def line(name: str, saved: bool) -> str:
+            if not saved:
+                return "Not saved yet"
+            g = live.get(name)
+            if g is None:
+                return ""
+            killed = "killed" if g.get("killed") else "awake"
+            n = g.get("targets", 0)
+            return f"{killed} · {n} device{'s' if n != 1 else ''}"
+
+        if row := self._rows.get("top"):
+            row.set_subtitle("Shared hotkeys")
+        for g in self.model.groups:
+            if row := self._rows.get(g.key):
+                row.set_subtitle(line(g.orig or "", g.orig is not None))
+
+    def device_names(self, cls: str | None, done) -> None:
+        """done(names, error): (name, subtitle) per distinct device name of a
+        class, for the picker, once the daemon has answered."""
+        ask_daemon_async(
+            lambda reply, error: done(*self._device_names(reply, error, cls)),
+            "devices",
+            cmd="devices",
+            all=True,
+        )
+
+    @staticmethod
+    def _device_names(
+        reply: dict | None, error: str | None, cls: str | None
+    ) -> tuple[list[tuple[str, str]], str | None]:
+        if reply is None:
+            return [], f"No device list: {error}"
+        seen: dict[str, str] = {}
+        for d in reply.get("devices", []):
+            # kb-kill only watches keyboards and pointers: a headphone jack or
+            # a video bus could be matched but never disabled, so not offered.
+            if d.get("class") not in ((cls,) if cls else ("kbd", "ptr")):
+                continue
+            name = d.get("name") or ""
+            if name and name not in seen:
+                kind = "virtual" if d.get("virtual") else "physical"
+                seen[name] = f"{kind} · {d.get('path', '')}"
+        return sorted(seen.items(), key=lambda kv: kv[0].lower()), None
+
+    # -- file on disk --------------------------------------------------------- #
+    def _on_disk_changed(self) -> None:
+        if self._read_text() == self.text:
+            return  # our own save, or a touch
+        if self.dirty():
+            self._show_banner("kb-kill.toml changed on disk.", "Reload", self.load)
+        else:
+            self.load()
+
+    def _on_tab(self, *_args) -> None:
+        self._sync_header()
+        if self._stack.get_visible_child_name() == "desktop":
+            self._desktop.refresh()
+
+    def _on_groups_tab(self) -> bool:
+        return self._stack.get_visible_child_name() == "groups"
+
+    def _open_groups_text(self, *_args) -> None:
+        if not os.path.exists(self.path) and not seed_user_config(self.path):
+            return
+        launch_editor(self.path)
+
+    def _reload(self, *_args) -> None:
+        if self._on_groups_tab():
+            self.load()
+        else:
+            self._tray.load()
+
+    # -- feedback ------------------------------------------------------------- #
+    def toast(self, text: str) -> None:
+        self._toasts.add_toast(Adw.Toast(title=GLib.markup_escape_text(text)))
+
+    def _show_banner(
+        self, text: str | None, button: str | None = None, action=None
+    ) -> None:
+        self._banner_action = action
+        self._banner.set_title(text or "")
+        self._banner.set_button_label(button)
+        self._banner.set_revealed(bool(text))
+
+    def alert(self, heading: str, body: str) -> None:
+        dialog = Adw.AlertDialog(heading=heading, body=body)
+        dialog.add_response("close", "Close")
+        dialog.present(self)
+
+    def _confirm(self, heading: str, body: str, yes: str, then) -> None:
+        dialog = Adw.AlertDialog(heading=heading, body=body)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("yes", yes)
+        dialog.set_response_appearance("yes", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_close_response("cancel")
+        dialog.connect("response", lambda _d, r: r == "yes" and then())
+        dialog.present(self)
+
+    def _on_close_request(self, _win) -> bool:
+        self._tray.flush()  # a tray edit still waiting on its timer
+        if self._closing or not self.dirty():
+            return False
+        dialog = Adw.AlertDialog(
+            heading="Save Changes?", body="Your group and hotkey edits are not saved."
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("discard", "Discard")
+        dialog.add_response("save", "Save")
+        dialog.set_response_appearance("discard", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("save")
+        dialog.set_close_response("cancel")
+
+        def answered(_d, response: str) -> None:
+            if response == "discard":
+                self._close_now()
+            elif response == "save":
+                self.save(then=self._close_now)
+
+        dialog.connect("response", answered)
+        dialog.present(self)
+        return True
+
+    def _close_now(self) -> None:
+        self._closing = True
+        self.close()
+
+
+# Every keyboard shortcut, once: (help-window group, title, key). The bindings
+# and the Keyboard Shortcuts window are both made from this.
+KEYS = MappingProxyType(
+    {
+        "save": ("General", "Save Groups", "<Primary>s"),
+        "help": ("General", "Show Keyboard Shortcuts", "<Primary>question"),
+        "menu": ("General", "Main Menu", "F10"),  # GTK's, for the primary menu
+        "close": ("General", "Close Window", "<Primary>w"),
+        "quit": ("General", "Quit", "<Primary>q"),
+        "undo": ("Groups", "Undo", "<Primary>z"),
+        "redo": ("Groups", "Redo", "<Primary><Shift>z"),
+        "rename": ("Groups", "Rename Group", "F2"),
+        "delete": ("Groups", "Delete Group", "Delete"),
+        "group-menu": ("Groups", "Group Menu", "<Shift>F10"),
+    }
+)
+KEY_ALIASES = MappingProxyType({"delete": "KP_Delete", "group-menu": "Menu"})
+
+
+def key_trigger(name: str) -> "Gtk.ShortcutTrigger":
+    """KEYS[name], plus its unlisted alias (keypad Delete, the Menu key)."""
+    keys = [KEYS[name][2], *([KEY_ALIASES[name]] if name in KEY_ALIASES else [])]
+    return Gtk.ShortcutTrigger.parse_string("|".join(keys))
+
+
+def shortcuts_window() -> Gtk.ShortcutsWindow:
+    groups: dict[str, list[str]] = {}
+    for section, title, key in KEYS.values():
+        groups.setdefault(section, []).append(
+            "<child><object class='GtkShortcutsShortcut'>"
+            f"<property name='title'>{xml_escape(title)}</property>"
+            f"<property name='accelerator'>{xml_escape(key)}</property>"
+            "</object></child>"
+        )
+    body = "".join(
+        "<child><object class='GtkShortcutsGroup'>"
+        f"<property name='title'>{xml_escape(section)}</property>{''.join(rows)}"
+        "</object></child>"
+        for section, rows in groups.items()
+    )
+    ui = (
+        "<interface><object class='GtkShortcutsWindow' id='shortcuts'>"
+        "<property name='modal'>1</property>"
+        "<child><object class='GtkShortcutsSection'>"
+        f"<property name='section-name'>shortcuts</property>{body}"
+        "</object></child></object></interface>"
+    )
+    return Gtk.Builder.new_from_string(ui, -1).get_object("shortcuts")
+
+
+class ConfigApp(Adw.Application):
+    """Single instance: launching it again raises the open window."""
+
+    ACCELS = (
+        ("win.save", "save"),
+        ("win.show-help-overlay", "help"),
+        ("window.close", "close"),
+        ("app.quit", "quit"),
+    )
+
+    def __init__(self) -> None:
+        super().__init__(application_id=APP_ID)
+        self._win: ConfigWindow | None = None
+
+    def do_startup(self) -> None:
+        Adw.Application.do_startup(self)
+        for name, handler in (("about", self._on_about), ("quit", self._on_quit)):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", handler)
+            self.add_action(action)
+        for action, key in self.ACCELS:
+            self.set_accels_for_action(action, [KEYS[key][2]])
+
+    def do_activate(self) -> None:
+        if self._win is None:
+            self._win = ConfigWindow(self)
+            GLib.idle_add(self._unfocus)
+        self._win.present()
+
+    def _unfocus(self) -> bool:
+        """GTK focuses the first entry on map, which selects all its text.
+        Start with nothing focused or selected until a click or Tab."""
+        focus = self._win.get_focus() if self._win else None
+        if isinstance(focus, Gtk.Editable):
+            focus.select_region(0, 0)
+        if self._win:
+            self._win.set_focus(None)
+        return False  # one-shot idle
+
+    def _on_about(self, *_args) -> None:
+        Adw.AboutDialog(
+            application_name="kb-kill",
+            application_icon="kb-kill-awake",
+            developer_name="Steven Eisinger",
+            version=VERSION,
+            website="https://github.com/Shtaiven/kb-kill",
+            issue_url="https://github.com/Shtaiven/kb-kill/issues",
+            license_type=Gtk.License.MIT_X11,
+            copyright="© Steven Eisinger",
+        ).present(self._win)
+
+    def _on_quit(self, *_args) -> None:
+        """Through the window, so unsaved edits still get their prompt."""
+        if self._win is not None:
+            self._win.close()
+
+
+def main() -> int:
+    # kb-kill-config.desktop names APP_ID as its StartupWMClass: Wayland shells
+    # match it to the app id (the GApplication's), X11 ones to WM_CLASS (prgname).
+    GLib.set_prgname(APP_ID)
+    return ConfigApp().run(sys.argv[:1])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

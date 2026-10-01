@@ -10,6 +10,7 @@ and applies it only while this user controls the seat. Stdlib only.
 import json
 import os
 import socket
+import stat
 import sys
 import time
 from pathlib import Path
@@ -18,7 +19,7 @@ POLL_SECONDS = 1.0
 RECONNECT_SECONDS = 2.0
 
 # Rewritten by packaging/bump-version.sh from the repo-root VERSION file.
-VERSION = "0.5.1"
+VERSION = "0.6.0"
 
 
 def log(msg: str) -> None:
@@ -39,11 +40,24 @@ def config_path() -> Path | None:
 
 
 def socket_path() -> str:
+    """The daemon's socket. /run/kb-kill (made by systemd) and
+    $XDG_RUNTIME_DIR (private to this user) are used as found. The /tmp
+    fallback of a dev daemon only when this user owns it: anyone can create a
+    file there, and would then read what is sent and answer as the daemon."""
     candidates = ["/run/kb-kill/control.sock"]
     if base := os.environ.get("XDG_RUNTIME_DIR"):
         candidates.append(os.path.join(base, "kb-kill.sock"))
-    candidates.append(f"/tmp/kb-kill-{os.getuid()}.sock")
-    return next((c for c in candidates if os.path.exists(c)), candidates[0])
+    found = next((c for c in candidates if os.path.exists(c)), None)
+    if found:
+        return found
+    tmp = f"/tmp/kb-kill-{os.getuid()}.sock"
+    try:
+        st = os.lstat(tmp)
+        if stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid():
+            return tmp
+    except OSError:
+        pass
+    return candidates[0]
 
 
 def config_mtime() -> float | None:
@@ -68,6 +82,21 @@ def push(sock: socket.socket) -> None:
     log(f"pushed {p}")
 
 
+def report_errors(buf: bytes) -> bytes:
+    """Log the daemon's error replies (a rejected config) to this user's own
+    journal; the daemon's journal is not theirs to read. State lines are
+    ignored. Returns the unfinished line."""
+    *lines, rest = buf.split(b"\n")
+    for line in lines:
+        try:
+            msg = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(msg, dict) and msg.get("type") == "error":
+            log(f"daemon: {msg.get('error')}")
+    return rest[-65536:]  # a line longer than the daemon ever sends: drop it
+
+
 def serve_once() -> None:
     """One connection: push, then re-push on each edit until the socket drops."""
     path = socket_path()
@@ -82,11 +111,14 @@ def serve_once() -> None:
         push(sock)
         mtime = config_mtime()
         sock.settimeout(POLL_SECONDS)
+        buf = b""
         while True:
             try:
-                if not sock.recv(65536):  # daemon replies are drained and ignored
+                chunk = sock.recv(65536)
+                if not chunk:
                     log("daemon closed the connection")
                     return
+                buf = report_errors(buf + chunk)
             except TimeoutError:
                 pass
             if (now := config_mtime()) != mtime:
