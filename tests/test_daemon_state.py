@@ -1,7 +1,7 @@
 """When a group's killed/awake state resets, and when it is kept.
 
 State resets only at a login, on a save, or by a hotkey/control call; sleep,
-lid close, lock and switching back keep it, and a kill never passes from one
+lid close, lock and switching back keep it (unless a group sets wake_on_lock), and a kill never passes from one
 user to another. Drives the real daemon logic with logind, evdev devices and
 the control socket faked out. Run: python3 -m unittest discover tests
 """
@@ -405,6 +405,61 @@ class Explicit(DaemonTest):
         self.command(ALICE, "wake", "a")
         self.assertState(a=False, b=False)
         self.assertGrabbed()
+
+
+# Alice's config with wake_on_lock on group a only.
+LOCK_CONFIG = CONFIG.replace(
+    'kill_combo = "ctrl+alt+k"\n', 'kill_combo = "ctrl+alt+k"\nwake_on_lock = true\n'
+)
+
+
+class WakeOnLock(DaemonTest):
+    def locked(self, uid: int) -> None:
+        """kb-kill-push saw `uid`'s screen lock."""
+        self.k._apply_command({"cmd": "locked"}, Conn(), uid)  # type: ignore[arg-type]
+
+    def test_lock_wakes_only_wake_on_lock_groups(self) -> None:
+        self.login_alice()
+        self.push(ALICE, LOCK_CONFIG)
+        self.press(LAPTOP, KILL_A)
+        self.assertState(a=True, b=True)
+        self.locked(ALICE)
+        self.assertState(a=False, b=True)
+        self.assertGrabbed(USB)
+        self.assertIn("[a] awake (screen locked)", self.states)
+
+    def test_lock_without_wake_on_lock_keeps_state(self) -> None:
+        self.login_alice()
+        self.press(LAPTOP, KILL_A)
+        self.locked(ALICE)
+        self.assertState(a=True, b=True)
+        self.assertGrabbed(LAPTOP, USB)
+
+    def test_lock_while_dormant_wakes_on_return(self) -> None:
+        """A switch to another user locks the session left behind."""
+        self.login_alice()
+        self.push(ALICE, LOCK_CONFIG)
+        self.press(LAPTOP, KILL_A)
+        self.activate("4", BOB)
+        self.locked(ALICE)
+        self.activate("2", ALICE, new=False)
+        self.assertState(a=False, b=True)
+        self.assertGrabbed(USB)
+
+    def test_another_users_lock_leaves_the_live_user_alone(self) -> None:
+        self.login_alice()
+        self.push(ALICE, LOCK_CONFIG)
+        self.press(LAPTOP, KILL_A)
+        self.push(BOB, BOB_CONFIG)
+        self.locked(BOB)
+        self.locked(GREETER)  # no config at all
+        self.assertState(a=True, b=True)
+
+    def test_wake_on_lock_must_be_a_bool(self) -> None:
+        with self.assertRaises(d.ConfigError):
+            d.load_config_text(
+                CONFIG.replace("start_killed = true", 'wake_on_lock = "yes"'), "t"
+            )
 
 
 class PushRestart(DaemonTest):

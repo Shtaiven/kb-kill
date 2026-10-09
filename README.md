@@ -110,6 +110,7 @@ installing this on your system; never run scripts you don't trust.
   Its on-screen display comes from the shell itself on GNOME and KDE; on COSMIC,
   sway and other wlroots compositors it needs `gtk-layer-shell` (GTK 3), and
   without it nothing pops.
+- `wake_on_lock` needs `gdbus` (GLib; on nearly every desktop already).
 - The settings window `kb-kill-config` (optional) needs GTK 4, libadwaita ≥ 1.5
   and `tomlkit`. Without them it opens `kb-kill.toml` in a text editor instead.
   The `.deb`/`.rpm` pull all of these in as weak dependencies; the commands
@@ -240,7 +241,14 @@ together. The old name `virtual_keyboard` is accepted as a deprecated alias.
   after, and an awake one stays awake. logind may report the seat idle for a
   moment across these; the daemon lets go of the grabs meanwhile and takes them
   back when you return. Only a save, a login, a hotkey or a tray/control call
-  changes a group's state.
+  changes a group's state, and `wake_on_lock`.
+- `wake_on_lock = true` (per group, not inherited) wakes the group when your
+  screen locks or the computer goes to sleep, so a killed keyboard can type
+  your password on the lock screen. `kb-kill-push` watches logind for this
+  (the session's `Lock` signal, its `LockedHint`, and `PrepareForSleep`, since
+  desktops lock on suspend and COSMIC reports its lock only as the `Lock`
+  signal), using `gdbus` from GLib. When you switch to another user, a desktop
+  that locks the session you leave wakes the group too.
 - **Saving is a restart:** every change to the file (kb-kill-push re-sends it)
   starts every group awake again, except the `start_killed` ones, which start
   killed. A daemon or `kb-kill-push` restart mid-session starts everything
@@ -440,7 +448,8 @@ defaults above.
 
 The socket is a small newline-delimited JSON protocol if you want to script it:
 `{"cmd":"kill|wake|toggle","group":"<name>"}`, `{"cmd":"status"}`,
-`{"cmd":"devices","all":true}`; the daemon replies and broadcasts
+`{"cmd":"devices","all":true}`, `{"cmd":"locked"}` (from any user with a
+config: wakes that user's `wake_on_lock` groups); the daemon replies and broadcasts
 `{"type":"state","groups":[{name,label,killed,targets,kill,wake,kill_codes,wake_codes}]}`
 to the active user's clients on every change. Config is delivered the same way
 (`{"cmd":"set_config","toml":"…"}`, what `kb-kill-push` sends), and

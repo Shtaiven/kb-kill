@@ -67,11 +67,14 @@ rebuild the package or re-run `./install.sh`.
 - **Grab deferral.** `_reconcile_grabs` never grabs a device with keys held.
 - **A grab never outlives its config; state survives sleep, lock and switches.**
   `_install_groups` ungrabs first and takes killed state only from `preserve`.
-  State is reset only by a login, a save, or a hotkey/control call. A restart
+  State is reset only by a login, a save, a hotkey/control call, or a lock
+  under `wake_on_lock`. A restart
   (`_start`) begins awake apart from the config's own `start_killed` groups: at
   login (`_track_sessions` arms a session the first time it is active,
   including a second session of the same uid) and on every re-push (saving is
-  a restart; a save while dormant is applied on return, `_saved`). Anything
+  a restart; a save while dormant is applied on return, `_saved`). A uid's
+  `{"cmd":"locked"}` (`kb-kill-push` watching logind via `gdbus monitor`)
+  wakes only that uid's `wake_on_lock` groups, live or dormant. Anything
   else that makes a uid live again (switching back, the seat going idle across
   sleep/lid/lock) goes through `_resume`, which reinstalls the groups with the
   `killed` they kept on the dormant Config. A kill is never carried over from

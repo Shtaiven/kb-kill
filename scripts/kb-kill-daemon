@@ -316,6 +316,7 @@ class Group:
         wake_raw: str,
         virtual: bool | None,
         start_killed: bool = False,
+        wake_on_lock: bool = False,
     ) -> None:
         self.name = name
         self.label = label
@@ -328,6 +329,7 @@ class Group:
         self.wake_combo = _parse_combo(wake_raw)
         self.virtual = virtual  # None = "auto" (pair with a fronting remapper copy)
         self.start_killed = start_killed  # killed when its user becomes live
+        self.wake_on_lock = wake_on_lock  # woken when its user's screen locks
         # runtime
         self.targets: dict[str, InputDevice] = {}
         self.killed = False
@@ -382,6 +384,7 @@ _GROUP_KEYS = {
     "virtual",
     "virtual_keyboard",
     "start_killed",
+    "wake_on_lock",
 }
 _TOP_KEYS = {"kill_combo", "wake_combo"}
 _GLOB_META_RE = re.compile(r"[*?]|\[[!^]?\]?[^]]*\]")
@@ -500,9 +503,11 @@ def _build_group(
                 f"{where}: invalid 'label' {_safe(label)!r}: up to {LABEL_MAX_LEN} printable characters"
             )
 
-    start_killed = table.get("start_killed", False)
-    if not isinstance(start_killed, bool):
-        raise ConfigError(f"{where}: 'start_killed' must be true or false")
+    flags = {}
+    for key in ("start_killed", "wake_on_lock"):
+        flags[key] = table.get(key, False)
+        if not isinstance(flags[key], bool):
+            raise ConfigError(f"{where}: '{key}' must be true or false")
 
     kill_raw = table.get("kill_combo", defaults["kill_combo"])
     wake_raw = table.get("wake_combo", defaults["wake_combo"])
@@ -523,7 +528,7 @@ def _build_group(
             kill_raw,
             wake_raw,
             virtual,
-            start_killed,
+            **flags,
         )
     except ConfigError as e:
         raise ConfigError(f"{where}: {e}")
@@ -1046,6 +1051,27 @@ class KbKill:
         else:
             self._reevaluate_live()
 
+    def _on_locked(self, uid: int) -> None:
+        """`uid`'s screen locked (kb-kill-push watches logind): wake its
+        killed wake_on_lock groups, so its lock screen can be typed on. A
+        dormant user's groups are woken on its Config, for when it returns."""
+        cfg = self.pushed.get(uid)
+        if cfg is None:
+            return
+        live = uid == self.live_uid
+        woke = False
+        for g in cfg.groups:
+            if not (g.wake_on_lock and g.killed):
+                continue
+            woke = True
+            if live:
+                self._set_killed(g, False, "lock")
+            else:
+                g.killed = False
+                log_state(f"[{g.name}] awake (screen locked, uid {uid})")
+        if woke and live:
+            self._reconcile_grabs()
+
     def _check_config(self, text: str, uid: int | None = None) -> dict:
         """Parse a candidate config for a settings editor. Nothing reaches the
         journal: warnings and errors go back to the caller only. The live user
@@ -1074,6 +1100,7 @@ class KbKill:
                 "wake": g.wake_raw,
                 "virtual": g.virtual_label,
                 "start_killed": g.start_killed,
+                "wake_on_lock": g.wake_on_lock,
             }
             for g in cfg.groups
         ]
@@ -1215,7 +1242,7 @@ class KbKill:
 
     def _set_killed(self, group: Group, killed: bool, how: str) -> None:
         group.killed = killed
-        via = " (via control)" if how == "control" else ""
+        via = {"control": " (via control)", "lock": " (screen locked)"}.get(how, "")
         if killed:
             if not group.targets:
                 self._once(
@@ -1479,6 +1506,9 @@ class KbKill:
                 self._send(
                     conn, {"type": "error", "error": "check_config needs 'toml'"}
                 )
+            return
+        if cmd == "locked":  # any uid; wakes only that uid's own groups
+            self._on_locked(uid)
             return
         if uid not in (0, self.live_uid):
             CTRL_LOG.emit(
