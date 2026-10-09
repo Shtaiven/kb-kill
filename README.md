@@ -287,10 +287,15 @@ together. The old name `virtual_keyboard` is accepted as a deprecated alias.
   awake (the daemon counts a session as a fresh login only if logind created it
   in the last two minutes).
 
-- A group is never started killed when no device the daemon reads can type its
-  wake hotkey: that would disable input at every login with no way back. The
-  journal says so, and the settings window warns on the group's **Start
-  killed** switch.
+- A group is never killed when no device the daemon reads can type its wake
+  hotkey, neither at login (`start_killed`) nor by its kill hotkey or the tray:
+  there would be no way back short of logging out. The journal says so
+  (`not killed: no device can type its wake hotkey`), and the settings window
+  warns on the group's **Start killed** switch. The daemon reads every keyboard,
+  pointers when a group targets them, and any other device that has a key or
+  button some hotkey names: a mouse button in a keyboard group's wake hotkey,
+  or a media key on a keyboard's separate "Consumer Control" device. A device
+  read only for a hotkey key is never a target; it only types the hotkey.
 
 - Limits: at most 64 groups, and 16 keys per hotkey.
 
@@ -530,7 +535,8 @@ keycodes arrive.
 
 ## Security model
 
-kb-kill reads all keyboard input (and mouse buttons, for pointer groups), so it
+kb-kill reads all keyboard input (and mouse buttons, for pointer groups, and
+key events of any other device that has a key a hotkey names), so it
 is keylogger-*capable*. The design minimizes and contains that:
 
 - **No keystroke content is ever stored or transmitted.** The daemon keeps only

@@ -65,6 +65,13 @@ rebuild the package or re-run `./install.sh`.
   `_sync_latches` is the single place latches are written. `_release_stale_keys`
   only ever drops keys (re-arms, never fires).
 - **Grab deferral.** `_reconcile_grabs` never grabs a device with keys held.
+- **No kill without a way back.** `_set_killed` refuses a kill (hotkey or
+  control) and `_start` a `start_killed` when `_can_wake` finds no read device
+  that has every wake key. `watched()` decides what is read (keyboards,
+  pointers when targeted, any device with a hotkey key) for both the daemon
+  and the `check_config` preview, so the check and reality agree; a device read
+  only for a hotkey key is never a target (`_dev_matches`). `_resume` keeps a
+  kill whose wake device vanished across sleep, on purpose.
 - **A grab never outlives its config; state survives sleep, lock and switches.**
   `_install_groups` ungrabs first and takes killed state only from `preserve`.
   State is reset only by a login, a save, a hotkey/control call, or a lock

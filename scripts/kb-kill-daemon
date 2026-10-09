@@ -634,6 +634,28 @@ def is_virtual(dev: InputDevice) -> bool:
     )
 
 
+def hotkey_keys(groups: list[Group]) -> set[int]:
+    """Every key and button some group's kill or wake hotkey names."""
+    keys: set[int] = set()
+    for g in groups:
+        for token in (*g.kill_combo, *g.wake_combo):
+            keys |= token
+    return keys
+
+
+def watched(dev: InputDevice, groups: list[Group], keys: set[int]) -> bool:
+    """What the daemon reads for `groups`: keyboards; pointers when a group
+    targets them; and any other device with a key in `keys` (hotkey_keys),
+    so a hotkey's mouse button or a media key on a keyboard's separate
+    "Consumer Control" node can be typed. The lockout check (_can_wake)
+    counts exactly these devices."""
+    if is_keyboard(dev):
+        return True
+    if is_pointer(dev) and any(g.pointers or g.devices for g in groups):
+        return True
+    return not keys.isdisjoint(dev.capabilities().get(ecodes.EV_KEY, []))
+
+
 def device_class(dev: InputDevice) -> str:
     return "kbd" if is_keyboard(dev) else "ptr" if is_pointer(dev) else "other"
 
@@ -762,7 +784,8 @@ class KbKill:
         return (
             (hit(group.keyboards) and is_keyboard(dev))
             or (hit(group.pointers) and is_pointer(dev))
-            or hit(group.devices)
+            # A device read only for a hotkey key is never a target.
+            or (hit(group.devices) and (is_keyboard(dev) or is_pointer(dev)))
         )
 
     def _update_fronting(self) -> None:
@@ -813,8 +836,7 @@ class KbKill:
 
     # -- device lifecycle ----------------------------------------------------- #
     def _wanted(self, dev: InputDevice) -> bool:
-        want_pointers = any(g.pointers or g.devices for g in self.groups)
-        return is_keyboard(dev) or (want_pointers and is_pointer(dev))
+        return watched(dev, self.groups, hotkey_keys(self.groups))
 
     def _add_device(self, path: str) -> None:
         try:
@@ -1105,15 +1127,8 @@ class KbKill:
             g.lock_woken = False
             if g.killed:
                 continue
-            if not self._can_wake(g):
-                self._once(
-                    f"lockout:{g.name}",
-                    f"[{g.name}] not killed again on unlock: no device can type its wake hotkey",
-                    PRI_WARN,
-                )
-                continue
-            killed = True
-            self._set_killed(g, True, "unlock")
+            # Refused, and logged, when nothing can type its wake hotkey.
+            killed |= self._set_killed(g, True, "unlock")
         if killed:
             self._reconcile_grabs()
 
@@ -1153,27 +1168,22 @@ class KbKill:
     def _preview(self, cfg: Config) -> dict:
         """`matches`: per group of `cfg`, the devices it would grab.
         `wakeable`: per group, whether some device can type its wake hotkey
-        (else start_killed is refused). Pointers the live config does not
-        watch are opened just for this, then closed."""
-        want_pointers = any(g.pointers or g.devices for g in cfg.groups)
+        (else it can be neither started killed nor killed). Devices `cfg`
+        would read that the live config does not are opened just for this,
+        then closed."""
+        keys = hotkey_keys(cfg.groups)
         devices = {
-            p: d
-            for p, d in self.devices.items()
-            if is_keyboard(d) or (want_pointers and is_pointer(d))
+            p: d for p, d in self.devices.items() if watched(d, cfg.groups, keys)
         }
         opened: list[InputDevice] = []
         try:
-            # Every keyboard is watched already; only pointers can be missing.
-            unwatched = (
-                set(list_devices()) - self.devices.keys() if want_pointers else ()
-            )
-            for path in sorted(unwatched):
+            for path in sorted(set(list_devices()) - self.devices.keys()):
                 try:
                     dev = InputDevice(path)
                 except (OSError, SystemError):  # SystemError: unplugged mid-open
                     continue
                 opened.append(dev)
-                if is_pointer(dev) or is_keyboard(dev):
+                if watched(dev, cfg.groups, keys):
                     devices[path] = dev
             fronting = fronting_map(devices)
             copy_of = {copy: devices[hw].name for hw, (copy, _d) in fronting.items()}
@@ -1285,14 +1295,22 @@ class KbKill:
             caps |= set(d.capabilities().get(ecodes.EV_KEY, []))
         return all(token & caps for token in group.wake_combo)
 
-    def _set_killed(self, group: Group, killed: bool, how: str) -> None:
-        group.killed = killed
-        group.lock_woken = False  # any change supersedes the lock's; _on_locked re-marks
+    def _set_killed(self, group: Group, killed: bool, how: str) -> bool:
+        """False when a kill is refused: no device can type the group's wake
+        hotkey, so nothing but a reboot or logout would wake it."""
         via = {
             "control": " (via control)",
             "lock": " (screen locked)",
             "unlock": " (screen unlocked)",
         }.get(how, "")
+        if killed and not self._can_wake(group):
+            log_state(
+                f"[{group.name}] not killed: no device can type its wake hotkey{via}",
+                PRI_WARN,
+            )
+            return False
+        group.killed = killed
+        group.lock_woken = False  # any change supersedes the lock's; _on_locked re-marks
         if killed:
             if not group.targets:
                 self._once(
@@ -1310,6 +1328,7 @@ class KbKill:
         else:
             log_state(f"[{group.name}] awake{via}")
         self._maybe_broadcast()
+        return True
 
     # -- events --------------------------------------------------------------- #
     def _process(self, path: str, event) -> None:
@@ -1590,7 +1609,15 @@ class KbKill:
                 return
             want = {"kill": True, "wake": False, "toggle": not group.killed}[cmd]
             if want != group.killed:
-                self._set_killed(group, want, "control")
+                if not self._set_killed(group, want, "control"):
+                    self._send(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": "not killed: no device can type its wake hotkey",
+                        },
+                    )
+                    return
                 self._reconcile_grabs()
         else:
             self._send(conn, {"type": "error", "error": f"unknown command {cmd!r}"})

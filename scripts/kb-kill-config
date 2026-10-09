@@ -1034,14 +1034,14 @@ class GroupPage(Adw.PreferencesPage):
 
     def show_wakeable(self, wakeable: bool | None) -> None:
         """Say on the Start killed switch when the wake hotkey cannot be typed:
-        the daemon would then refuse to start the group killed."""
+        the daemon would then refuse to kill the group, at login or by hotkey."""
         row = self._start_row
         if row is None:
             return
         if wakeable is False:
             row.set_subtitle(
-                "No device can type this group's wake hotkey, so it will not "
-                "start killed"
+                "No device can type this group's wake hotkey, so it cannot be "
+                "killed"
             )
             row.add_css_class("warning")
         else:

@@ -1,10 +1,11 @@
 """When a group's killed/awake state resets, and when it is kept.
 
-State resets only at a login, on a save, or by a hotkey/control call; sleep,
-lid close, lock and switching back keep it (unless a group sets wake_on_lock:
-then the lock wakes it and the unlock kills it again), and a kill never
-passes from one user to another. Drives the real daemon logic with logind, evdev devices and
-the control socket faked out. Run: python3 -m unittest discover tests
+State resets only at a login, on a save, or by a hotkey/control call (and a
+kill is refused when nothing can type the wake hotkey); sleep, lid close,
+lock and switching back keep it (unless a group sets wake_on_lock: then the
+lock wakes it and the unlock kills it again), and a kill never passes from
+one user to another. Drives the real daemon logic with logind, evdev devices
+and the control socket faked out. Run: python3 -m unittest discover tests
 """
 
 import importlib.machinery
@@ -70,9 +71,10 @@ keyboards = "Laptop Keyboard"
 class FakeDev:
     """An evdev InputDevice as far as the daemon uses one."""
 
-    def __init__(self, name: str, keys: list[int] = KEYS) -> None:
+    def __init__(self, name: str, keys: list[int] = KEYS, rel: bool = False) -> None:
         self.name, self.phys = name, f"phys/{name}"
         self._keys = list(keys)
+        self._rel = rel  # relative motion: a mouse
         self._r, self._w = os.pipe()  # a real fd, so the selector accepts it
         self.fd = self._r
         self.held: set[int] = set()
@@ -82,7 +84,10 @@ class FakeDev:
         return self._r
 
     def capabilities(self) -> dict[int, list[int]]:
-        return {ecodes.EV_KEY: self._keys}
+        caps = {ecodes.EV_KEY: self._keys}
+        if self._rel:
+            caps[ecodes.EV_REL] = [ecodes.REL_X, ecodes.REL_Y]
+        return caps
 
     def active_keys(self) -> list[int]:
         return sorted(self.held)
@@ -155,8 +160,10 @@ class DaemonTest(unittest.TestCase):
             dev.dispose()
 
     # -- the world ------------------------------------------------------------ #
-    def plug(self, path: str, name: str, keys: list[int] = KEYS) -> FakeDev:
-        dev = FakeDev(name, keys)
+    def plug(
+        self, path: str, name: str, keys: list[int] = KEYS, rel: bool = False
+    ) -> FakeDev:
+        dev = FakeDev(name, keys, rel)
         self.made.append(dev)
         self.world[path] = dev
         return dev
@@ -202,6 +209,13 @@ class DaemonTest(unittest.TestCase):
     def unlocked(self, uid: int) -> None:
         """kb-kill-push saw `uid`'s screen unlock."""
         self.k._apply_command({"cmd": "unlocked"}, Conn(), uid)  # type: ignore[arg-type]
+
+    def key(self, path: str, code: int, value: int) -> None:
+        """One key event on one device (1 down, 0 up)."""
+        (self.world[path].held.add if value else self.world[path].held.discard)(code)
+        self.k._process(
+            path, types.SimpleNamespace(type=ecodes.EV_KEY, code=code, value=value)
+        )
 
     def press(self, path: str, keys: tuple[int, ...]) -> None:
         """Hold `keys` in order on one device, then let go in reverse."""
@@ -595,8 +609,8 @@ class WakeOnLock(DaemonTest):
         self.activate("2", ALICE, new=False)
         self.assertState(a=False, b=True)  # b's kill is kept, not new: unchecked
         self.assertIn(
-            "[a] not killed again on unlock: no device can type its wake hotkey",
-            self.ctrl,
+            "[a] not killed: no device can type its wake hotkey (screen unlocked)",
+            self.states,
         )
 
     def test_lock_across_a_switch_then_unlock(self) -> None:
@@ -626,6 +640,103 @@ class WakeOnLock(DaemonTest):
             d.load_config_text(
                 CONFIG.replace("start_killed = true", 'wake_on_lock = "yes"'), "t"
             )
+
+
+MOUSE, MEDIA, VIDEO = "/dev/input/event9", "/dev/input/event6", "/dev/input/event7"
+
+# A keyboard group woken with a mouse button: no group targets pointers.
+MOUSE_WAKE = """\
+[groups.a]
+keyboards = "Laptop Keyboard"
+kill_combo = "ctrl+alt+k"
+wake_combo = "ctrl+alt+mouseleft"
+"""
+
+# Woken with a key only a keyboard's separate media node has.
+MEDIA_WAKE = """\
+[groups.a]
+devices = "*"
+kill_combo = "ctrl+alt+k"
+wake_combo = "ctrl+mute"
+"""
+
+
+class NoKillWithoutWay(DaemonTest):
+    """A kill needs a device the daemon reads that has every wake key."""
+
+    def test_mouse_button_in_a_keyboard_groups_wake_hotkey(self) -> None:
+        self.plug(MOUSE, "Some Mouse", [ecodes.BTN_LEFT, ecodes.BTN_RIGHT], rel=True)
+        self.boot()
+        self.activate("2", ALICE)
+        self.push(ALICE, MOUSE_WAKE)
+        self.assertIn(MOUSE, self.k.devices)
+        self.press(LAPTOP, KILL_A)
+        self.assertState(a=True)
+        self.assertGrabbed(LAPTOP)  # read for its button, never a target
+        self.key(LAPTOP, ecodes.KEY_LEFTCTRL, 1)
+        self.key(LAPTOP, ecodes.KEY_LEFTALT, 1)
+        self.key(MOUSE, ecodes.BTN_LEFT, 1)
+        self.assertState(a=False)
+
+    def test_wake_key_on_a_separate_media_node(self) -> None:
+        self.plug(MEDIA, "USB Keyboard Consumer Control", [ecodes.KEY_MUTE])
+        self.boot()
+        self.activate("2", ALICE)
+        self.push(ALICE, MEDIA_WAKE)
+        self.assertIn(MEDIA, self.k.devices)
+        self.press(LAPTOP, KILL_A)
+        self.assertState(a=True)
+        self.assertGrabbed(LAPTOP, USB)  # devices = "*" still skips the media node
+        self.key(LAPTOP, ecodes.KEY_LEFTCTRL, 1)
+        self.key(MEDIA, ecodes.KEY_MUTE, 1)
+        self.assertState(a=False)
+
+    def test_device_without_a_hotkey_key_is_not_read(self) -> None:
+        self.plug(VIDEO, "Video Bus", [ecodes.KEY_BRIGHTNESSUP])
+        self.login_alice()
+        self.assertNotIn(VIDEO, self.k.devices)
+
+    def test_hotkey_kill_refused_when_the_wake_hotkey_cannot_be_typed(self) -> None:
+        self.boot()
+        self.activate("2", ALICE)
+        self.push(ALICE, MOUSE_WAKE)  # no mouse plugged in
+        self.press(LAPTOP, KILL_A)
+        self.assertState(a=False)
+        self.assertGrabbed()
+        self.assertIn("[a] not killed: no device can type its wake hotkey", self.states)
+
+    def test_unlock_refuses_to_kill_again_once_the_wake_device_is_gone(self) -> None:
+        self.plug(MOUSE, "Some Mouse", [ecodes.BTN_LEFT, ecodes.BTN_RIGHT], rel=True)
+        self.boot()
+        self.activate("2", ALICE)
+        self.push(ALICE, MOUSE_WAKE + "wake_on_lock = true\n")
+        self.press(LAPTOP, KILL_A)
+        self.k._apply_command({"cmd": "locked"}, Conn(), ALICE)  # type: ignore[arg-type]
+        self.unplug(MOUSE)
+        self.k.rescan()
+        self.k._apply_command({"cmd": "unlocked"}, Conn(), ALICE)  # type: ignore[arg-type]
+        self.assertState(a=False)
+        self.assertGrabbed()
+        self.assertIn(
+            "[a] not killed: no device can type its wake hotkey (screen unlocked)",
+            self.states,
+        )
+
+    def test_control_kill_refused_when_the_wake_hotkey_cannot_be_typed(self) -> None:
+        self.boot()
+        self.activate("2", ALICE)
+        self.push(ALICE, MOUSE_WAKE)
+        self.command(ALICE, "kill", "a")
+        self.command(ALICE, "toggle", "a")
+        self.assertState(a=False)
+        self.assertGrabbed()
+
+    def test_preview_agrees_with_the_live_check(self) -> None:
+        self.login_alice()
+        cfg = d.load_config_text(MOUSE_WAKE, "t")
+        self.assertEqual(self.k._preview(cfg)["wakeable"], {"a": False})
+        self.plug(MOUSE, "Some Mouse", [ecodes.BTN_LEFT], rel=True)
+        self.assertEqual(self.k._preview(cfg)["wakeable"], {"a": True})
 
 
 class PushRestart(DaemonTest):
