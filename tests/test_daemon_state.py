@@ -195,6 +195,14 @@ class DaemonTest(unittest.TestCase):
     def command(self, uid: int, cmd: str, group: str) -> None:
         self.k._apply_command({"cmd": cmd, "group": group}, Conn(), uid)  # type: ignore[arg-type]
 
+    def locked(self, uid: int) -> None:
+        """kb-kill-push saw `uid`'s screen lock."""
+        self.k._apply_command({"cmd": "locked"}, Conn(), uid)  # type: ignore[arg-type]
+
+    def unlocked(self, uid: int) -> None:
+        """kb-kill-push saw `uid`'s screen unlock."""
+        self.k._apply_command({"cmd": "unlocked"}, Conn(), uid)  # type: ignore[arg-type]
+
     def press(self, path: str, keys: tuple[int, ...]) -> None:
         """Hold `keys` in order on one device, then let go in reverse."""
         dev = self.world[path]
@@ -416,14 +424,6 @@ LOCK_CONFIG = CONFIG.replace(
 
 
 class WakeOnLock(DaemonTest):
-    def locked(self, uid: int) -> None:
-        """kb-kill-push saw `uid`'s screen lock."""
-        self.k._apply_command({"cmd": "locked"}, Conn(), uid)  # type: ignore[arg-type]
-
-    def unlocked(self, uid: int) -> None:
-        """kb-kill-push saw `uid`'s screen unlock."""
-        self.k._apply_command({"cmd": "unlocked"}, Conn(), uid)  # type: ignore[arg-type]
-
     def test_lock_wakes_only_wake_on_lock_groups(self) -> None:
         self.login_alice()
         self.push(ALICE, LOCK_CONFIG)

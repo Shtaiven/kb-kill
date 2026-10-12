@@ -213,7 +213,7 @@ class LockWatch:
         # "(objectpath '/org/freedesktop/login1/session/_32',)"
         _, quote, rest = out.partition("'")
         session = rest.partition("'")[0] if quote else ""
-        if session == self.session and self.gdbus and self.proc is not None:
+        if session == self.session and self.proc is not None:
             return
         if self.proc is not None:  # not the first lookup
             log(f"display session now {session or 'none'}")
@@ -270,33 +270,29 @@ class LockWatch:
             return None
         if not path.startswith(LOGIN1 + "/session/"):
             return None
-        if path != self.session:
-            now = time.monotonic()
-            if not _is_lock_signal(signal) or now - self.looked_at < 1.0:
-                return None  # another user's session; at most one look a second
-            self.looked_at = now
-            self._find_session()  # ours, now? (logind says nothing per user)
-            if path != self.session:
-                return None
-        if signal.startswith("org.freedesktop.login1.Session.Lock "):
+        cmd = _lock_cmd(signal)
+        if cmd is None or path == self.session:
+            return cmd
+        now = time.monotonic()
+        if now - self.looked_at < 1.0:
+            return None  # another user's session; at most one look a second
+        self.looked_at = now
+        self._find_session()  # ours, now? (logind says nothing per user)
+        return cmd if path == self.session else None
+
+
+def _lock_cmd(signal: str) -> str | None:
+    """A session's signal as the daemon command it means, if any."""
+    if signal.startswith("org.freedesktop.login1.Session.Lock "):
+        return "locked"
+    if signal.startswith("org.freedesktop.login1.Session.Unlock "):
+        return "unlocked"
+    if signal.startswith("org.freedesktop.DBus.Properties.PropertiesChanged "):
+        if "'LockedHint': <true>" in signal:
             return "locked"
-        if signal.startswith("org.freedesktop.login1.Session.Unlock "):
+        if "'LockedHint': <false>" in signal:
             return "unlocked"
-        if signal.startswith("org.freedesktop.DBus.Properties.PropertiesChanged "):
-            if "'LockedHint': <true>" in signal:
-                return "locked"
-            if "'LockedHint': <false>" in signal:
-                return "unlocked"
-        return None
-
-
-def _is_lock_signal(signal: str) -> bool:
-    return signal.startswith(
-        (
-            "org.freedesktop.login1.Session.Lock ",
-            "org.freedesktop.login1.Session.Unlock ",
-        )
-    ) or ("'LockedHint'" in signal)
+    return None
 
 
 def report_errors(buf: bytes) -> bytes:

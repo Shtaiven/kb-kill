@@ -1287,7 +1287,7 @@ class KbKill:
 
     def _set_killed(self, group: Group, killed: bool, how: str) -> None:
         group.killed = killed
-        group.lock_woken = how == "lock"  # any other change supersedes the lock's
+        group.lock_woken = False  # any change supersedes the lock's; _on_locked re-marks
         via = {
             "control": " (via control)",
             "lock": " (screen locked)",
