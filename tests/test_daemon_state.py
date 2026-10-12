@@ -143,7 +143,11 @@ class DaemonTest(unittest.TestCase):
                 "_stale",
                 staticmethod(lambda path, dev: self.world.get(path) is not dev),
             ),
-            mock.patch.object(d.KbKill, "_send", lambda self_, conn, obj: None),
+            mock.patch.object(
+                d.KbKill,
+                "_send",
+                lambda self_, conn, obj: self.sent.append((conn, obj)),
+            ),
         ]
         for p in patches:
             p.start()
@@ -151,6 +155,7 @@ class DaemonTest(unittest.TestCase):
         self.plug(LAPTOP, "Laptop Keyboard")
         self.plug(USB, "USB Keyboard")
         self.conns: dict[int, Conn] = {}
+        self.sent: list[tuple[Conn, dict]] = []  # what the daemon wrote, to whom
         self.k = d.KbKill()
         self.addCleanup(self._teardown)
 
@@ -730,6 +735,31 @@ class NoKillWithoutWay(DaemonTest):
         self.command(ALICE, "toggle", "a")
         self.assertState(a=False)
         self.assertGrabbed()
+
+    def test_refused_kill_tells_the_live_users_clients(self) -> None:
+        """No state changes, so no state message: the tray needs its own
+        word to show the warning OSD."""
+        self.boot()
+        self.activate("2", ALICE)
+        self.push(ALICE, MOUSE_WAKE)
+        self.push(BOB, BOB_CONFIG)
+        self.sent.clear()
+        self.press(LAPTOP, KILL_A)
+        refused = [(c, m) for c, m in self.sent if m["type"] == "refused"]
+        self.assertEqual(
+            refused,
+            [
+                (
+                    self.conns[ALICE],
+                    {
+                        "type": "refused",
+                        "group": "a",
+                        "label": "a",
+                        "reason": "no device can type its wake hotkey",
+                    },
+                )
+            ],
+        )
 
     def test_preview_agrees_with_the_live_check(self) -> None:
         self.login_alice()

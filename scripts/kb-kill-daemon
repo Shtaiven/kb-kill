@@ -1308,6 +1308,14 @@ class KbKill:
                 f"[{group.name}] not killed: no device can type its wake hotkey{via}",
                 PRI_WARN,
             )
+            self._tell_live(
+                {
+                    "type": "refused",
+                    "group": group.name,
+                    "label": group.label or group.name,
+                    "reason": "no device can type its wake hotkey",
+                }
+            )
             return False
         group.killed = killed
         group.lock_woken = False  # any change supersedes the lock's; _on_locked re-marks
@@ -1629,10 +1637,14 @@ class KbKill:
         if sig == self._last_sig:
             return
         self._last_sig = sig
-        state = self._state_dict()
+        self._tell_live(self._state_dict())
+
+    def _tell_live(self, msg: dict) -> None:
+        """Send `msg` to the live user's (and root's) clients only: group
+        names and labels are theirs to see."""
         for conn, info in list(self.clients.items()):
             if info["uid"] in (0, self.live_uid):
-                self._send(conn, state)
+                self._send(conn, msg)
 
     # -- main loop ------------------------------------------------------------ #
     def _watch(self, path: str, mask: int, tag: object) -> None:

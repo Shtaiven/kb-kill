@@ -159,6 +159,10 @@ class Monitor:
                     elif old["killed"] != g["killed"]:
                         print(f">>> daemon: [{g['name']}] -> {state_word(g['killed'])}")
                     self.groups[g["name"]] = g
+            elif kind == "refused":
+                print(
+                    f">>> daemon: [{msg.get('group')}] not killed: {msg.get('reason')}"
+                )
             elif kind == "debug":
                 print(f">>> daemon debug: {msg.get('msg')}")
             elif kind == "error":

@@ -290,8 +290,9 @@ together. The old name `virtual_keyboard` is accepted as a deprecated alias.
 - A group is never killed when no device the daemon reads can type its wake
   hotkey, neither at login (`start_killed`) nor by its kill hotkey or the tray:
   there would be no way back short of logging out. The journal says so
-  (`not killed: no device can type its wake hotkey`), and the settings window
-  warns on the group's **Start killed** switch. The daemon reads every keyboard,
+  (`not killed: no device can type its wake hotkey`), the tray shows it as a
+  warning on-screen display, and the settings window warns on the group's
+  **Start killed** switch. The daemon reads every keyboard,
   pointers when a group targets them, and any other device that has a key or
   button some hotkey names: a mouse button in a keyboard group's wake hotkey,
   or a media key on a keyboard's separate "Consumer Control" device. A device
@@ -495,7 +496,8 @@ The socket is a small newline-delimited JSON protocol if you want to script it:
 (from any user with a config: wake that user's `wake_on_lock` groups, then
 kill again what the lock woke); the daemon replies and broadcasts
 `{"type":"state","groups":[{name,label,killed,targets,kill,wake,kill_codes,wake_codes}]}`
-to the active user's clients on every change. Config is delivered the same way
+to the active user's clients on every change, and
+`{"type":"refused","group","label","reason"}` when it refuses a kill. Config is delivered the same way
 (`{"cmd":"set_config","toml":"…"}`, what `kb-kill-push` sends), and
 `{"cmd":"check_config","toml":"…"}` parses a candidate without applying it,
 replying `{"type":"config_check","ok":…,"error":…,"warnings":[…],"groups":[…]}`
