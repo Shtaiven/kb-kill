@@ -514,14 +514,10 @@ class Tray:
     def _flush_osd(self) -> bool:
         self._osd_timer = 0
         pending, self._pending = self._pending, {}
-        order = [g["name"] for g in self.groups]
+        # In the groups' order; one gone since it was queued goes last.
         self.osd.show(
-            [
-                pending[name]
-                for name in sorted(
-                    pending, key=lambda n: order.index(n) if n in order else len(order)
-                )
-            ]
+            [pending.pop(g["name"]) for g in self.groups if g["name"] in pending]
+            + list(pending.values())
         )
         return False  # one-shot timer
 

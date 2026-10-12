@@ -539,19 +539,11 @@ class WakeOnLock(DaemonTest):
         self.push(ALICE, LOCK_CONFIG)
         self.press(LAPTOP, KILL_A)
         self.locked(ALICE)
-        dev = self.world[LAPTOP]
-        enter = ecodes.KEY_ENTER
-        dev.held.add(enter)
-        self.k._process(
-            LAPTOP, types.SimpleNamespace(type=ecodes.EV_KEY, code=enter, value=1)
-        )
+        self.key(LAPTOP, ecodes.KEY_ENTER, 1)
         self.unlocked(ALICE)
         self.assertState(a=True, b=True)
         self.assertGrabbed(USB)
-        dev.held.discard(enter)
-        self.k._process(
-            LAPTOP, types.SimpleNamespace(type=ecodes.EV_KEY, code=enter, value=0)
-        )
+        self.key(LAPTOP, ecodes.KEY_ENTER, 0)
         self.assertGrabbed(LAPTOP, USB)
 
     def test_unlock_while_dormant_kills_on_return(self) -> None:
@@ -716,10 +708,10 @@ class NoKillWithoutWay(DaemonTest):
         self.activate("2", ALICE)
         self.push(ALICE, MOUSE_WAKE + "wake_on_lock = true\n")
         self.press(LAPTOP, KILL_A)
-        self.k._apply_command({"cmd": "locked"}, Conn(), ALICE)  # type: ignore[arg-type]
+        self.locked(ALICE)
         self.unplug(MOUSE)
         self.k.rescan()
-        self.k._apply_command({"cmd": "unlocked"}, Conn(), ALICE)  # type: ignore[arg-type]
+        self.unlocked(ALICE)
         self.assertState(a=False)
         self.assertGrabbed()
         self.assertIn(

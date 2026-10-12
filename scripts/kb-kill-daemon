@@ -92,6 +92,8 @@ MAX_LINE = 65536  # bytes buffered per client before a newline
 HANDSHAKE_SECONDS = 10  # drop a connection that never sends a command
 GROUP_NAME_RE = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9 ._-]{0,31}\Z")
 LABEL_MAX_LEN = 64
+# Why a kill is refused: journal, the tray's warning and a control error.
+UNWAKEABLE = "no device can type its wake hotkey"
 SEATS_DIR = "/run/systemd/seats"
 SESSIONS_DIR = "/run/systemd/sessions"
 # A session this young when the daemon first sees it counts as a fresh login
@@ -1273,10 +1275,7 @@ class KbKill:
         self._sync_latches(held)
 
     def _can_self_wake(self, group: Group) -> bool:
-        caps: set[int] = set()
-        for d in group.targets.values():
-            caps |= set(d.capabilities().get(ecodes.EV_KEY, []))
-        return all(token & caps for token in group.wake_combo)
+        return self._can_wake(group, group.targets)
 
     def _set_killed(self, group: Group, killed: bool, how: str) -> bool:
         """False when a kill is refused: no device can type the group's wake
@@ -1289,7 +1288,7 @@ class KbKill:
         }.get(how, "")
         if killed and not self._can_wake(group):
             log_state(
-                f"[{group.name}] not killed: no device can type its wake hotkey{via}",
+                f"[{group.name}] not killed: {UNWAKEABLE}{via}",
                 PRI_WARN,
             )
             self._tell_live(
@@ -1297,7 +1296,7 @@ class KbKill:
                     "type": "refused",
                     "group": group.name,
                     "label": group.label or group.name,
-                    "reason": "no device can type its wake hotkey",
+                    "reason": UNWAKEABLE,
                 }
             )
             return False
@@ -1606,7 +1605,7 @@ class KbKill:
                         conn,
                         {
                             "type": "error",
-                            "error": "not killed: no device can type its wake hotkey",
+                            "error": f"not killed: {UNWAKEABLE}",
                         },
                     )
                     return
