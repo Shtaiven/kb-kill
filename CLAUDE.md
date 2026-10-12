@@ -68,13 +68,16 @@ rebuild the package or re-run `./install.sh`.
 - **A grab never outlives its config; state survives sleep, lock and switches.**
   `_install_groups` ungrabs first and takes killed state only from `preserve`.
   State is reset only by a login, a save, a hotkey/control call, or a lock
-  under `wake_on_lock`. A restart
+  (and its unlock) under `wake_on_lock`. A restart
   (`_start`) begins awake apart from the config's own `start_killed` groups: at
   login (`_track_sessions` arms a session the first time it is active,
   including a second session of the same uid) and on every re-push (saving is
   a restart; a save while dormant is applied on return, `_saved`). A uid's
-  `{"cmd":"locked"}` (`kb-kill-push` watching logind via `gdbus monitor`)
-  wakes only that uid's `wake_on_lock` groups, live or dormant. Anything
+  `{"cmd":"locked"}` (`kb-kill-push` watching logind via `gdbus monitor`,
+  and COSMIC's `cosmic-greeter-<sid>.lock`) wakes only that uid's
+  `wake_on_lock` groups, live or dormant, and marks them `lock_woken`;
+  `{"cmd":"unlocked"}` kills those again. Any other `_set_killed` or a
+  `_start` clears the mark, so a choice made while locked stands. Anything
   else that makes a uid live again (switching back, the seat going idle across
   sleep/lid/lock) goes through `_resume`, which reinstalls the groups with the
   `killed` they kept on the dormant Config. A kill is never carried over from

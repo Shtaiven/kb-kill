@@ -7,11 +7,14 @@ socket drops. The daemon binds the config to this process's uid (SO_PEERCRED)
 and applies it only while this user controls the seat. Stdlib only.
 
 When a group sets wake_on_lock, it also tells the daemon when this user's
-screen locks. Lockers report that to logind in different ways (COSMIC only
-answers logind's Lock signal and sets no LockedHint), so any of these counts:
-the session's Lock signal, its LockedHint turning true, and PrepareForSleep
-(desktops lock on suspend). It listens with `gdbus monitor` (GLib), the
-daemon's sandbox has no D-Bus.
+screen locks and unlocks. Lockers report that to logind in different ways, so
+any of these counts as a lock: the session's Lock signal, its LockedHint
+turning true, and PrepareForSleep (desktops lock on suspend); and as an
+unlock: the session's Unlock signal and LockedHint turning false. COSMIC sets
+no LockedHint and tells logind nothing on unlock; its locker keeps
+$XDG_RUNTIME_DIR/cosmic-greeter-<session id>.lock while the screen is locked,
+so that file appearing and vanishing counts too. It listens with
+`gdbus monitor` (GLib), the daemon's sandbox has no D-Bus.
 """
 
 import json
@@ -109,12 +112,33 @@ def wants_lock_watch(text: str) -> bool:
     )
 
 
+def _session_id(path: str) -> str:
+    """logind's session id from its object path: '.../session/_32' -> '2'
+    (sd-bus escapes each byte outside [A-Za-z0-9] as _XX)."""
+    name = path.rpartition("/")[2]
+    out, i = bytearray(), 0
+    while i < len(name):
+        if name[i] == "_" and i + 3 <= len(name):
+            try:
+                out.append(int(name[i + 1 : i + 3], 16))
+                i += 3
+                continue
+            except ValueError:
+                pass
+        out += name[i].encode()
+        i += 1
+    return out.decode(errors="replace")
+
+
 class LockWatch:
-    """This user's screen locking, from logind's signals via `gdbus monitor`."""
+    """This user's screen locking and unlocking, from logind's signals via
+    `gdbus monitor` and from COSMIC's lockfile."""
 
     def __init__(self) -> None:
         self.proc: subprocess.Popen | None = None
         self.session = ""  # our display session's object path
+        self.lockfile: Path | None = None  # COSMIC's, while the screen is locked
+        self.lockfile_seen = False
         self.buf = b""
         self.retry_at = 0.0
         self._said_missing = False
@@ -165,6 +189,15 @@ class LockWatch:
         # "(objectpath '/org/freedesktop/login1/session/_32',)"
         _, quote, rest = out.partition("'")
         self.session = rest.partition("'")[0] if quote else ""
+        runtime = os.environ.get("XDG_RUNTIME_DIR")
+        sid = _session_id(self.session) if self.session else ""
+        self.lockfile = (
+            Path(runtime) / f"cosmic-greeter-{sid}.lock"
+            if runtime and sid and "/" not in sid
+            else None
+        )
+        # Already locked when we start: that lock was not seen, only its end is.
+        self.lockfile_seen = self.lockfile is not None and self.lockfile.exists()
         try:
             self.proc = subprocess.Popen(
                 [gdbus, "monitor", "--system", "--dest", "org.freedesktop.login1"],
@@ -185,30 +218,50 @@ class LockWatch:
             self.proc.wait()
             self.proc = None
 
-    def read(self) -> bool:
-        """Drain gdbus; True when it reported a lock."""
+    def read(self) -> list[str]:
+        """Drain gdbus; the commands ("locked"/"unlocked") it reported, in order."""
         assert self.proc is not None and self.proc.stdout is not None
         chunk = os.read(self.fileno(), 65536)
         if not chunk:
             self.stop()
             self.retry_at = time.monotonic() + LOCK_RETRY_SECONDS
-            return False
+            return []
         *lines, self.buf = (self.buf + chunk).split(b"\n")
         self.buf = self.buf[-65536:]
-        return any(self._is_lock(line.decode(errors="replace")) for line in lines)
+        events = (self._event(line.decode(errors="replace")) for line in lines)
+        return [e for e in events if e]
 
-    def _is_lock(self, line: str) -> bool:
+    def poll(self) -> list[str]:
+        """COSMIC's lockfile appearing ("locked") or vanishing ("unlocked")."""
+        if self.proc is None or self.lockfile is None:
+            return []
+        now = self.lockfile.exists()
+        if now == self.lockfile_seen:
+            return []
+        self.lockfile_seen = now
+        return ["locked" if now else "unlocked"]
+
+    def _event(self, line: str) -> str | None:
         path, _, signal = line.partition(": ")
         if path == LOGIN1:
-            return signal.startswith(
+            # Waking from sleep is not an unlock: the lock screen is still up.
+            if signal.startswith(
                 "org.freedesktop.login1.Manager.PrepareForSleep (true"
-            )
+            ):
+                return "locked"
+            return None
         if not self.session or path != self.session:
-            return False
-        return signal.startswith("org.freedesktop.login1.Session.Lock ") or (
-            signal.startswith("org.freedesktop.DBus.Properties.PropertiesChanged ")
-            and "'LockedHint': <true>" in signal
-        )
+            return None
+        if signal.startswith("org.freedesktop.login1.Session.Lock "):
+            return "locked"
+        if signal.startswith("org.freedesktop.login1.Session.Unlock "):
+            return "unlocked"
+        if signal.startswith("org.freedesktop.DBus.Properties.PropertiesChanged "):
+            if "'LockedHint': <true>" in signal:
+                return "locked"
+            if "'LockedHint': <false>" in signal:
+                return "unlocked"
+        return None
 
 
 def report_errors(buf: bytes) -> bytes:
@@ -250,8 +303,9 @@ def serve_once(lock: LockWatch) -> None:
                     log("daemon closed the connection")
                     return
                 buf = report_errors(buf + chunk)
-            if lock in ready and lock.read():
-                send(sock, {"cmd": "locked"})
+            events = lock.read() if lock in ready else []
+            for cmd in events + lock.poll():
+                send(sock, {"cmd": cmd})
             if (now := config_mtime()) != mtime:
                 mtime = now
                 watch = push(sock)

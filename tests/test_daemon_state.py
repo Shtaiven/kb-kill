@@ -1,8 +1,9 @@
 """When a group's killed/awake state resets, and when it is kept.
 
 State resets only at a login, on a save, or by a hotkey/control call; sleep,
-lid close, lock and switching back keep it (unless a group sets wake_on_lock), and a kill never passes from one
-user to another. Drives the real daemon logic with logind, evdev devices and
+lid close, lock and switching back keep it (unless a group sets wake_on_lock:
+then the lock wakes it and the unlock kills it again), and a kill never
+passes from one user to another. Drives the real daemon logic with logind, evdev devices and
 the control socket faked out. Run: python3 -m unittest discover tests
 """
 
@@ -418,6 +419,10 @@ class WakeOnLock(DaemonTest):
         """kb-kill-push saw `uid`'s screen lock."""
         self.k._apply_command({"cmd": "locked"}, Conn(), uid)  # type: ignore[arg-type]
 
+    def unlocked(self, uid: int) -> None:
+        """kb-kill-push saw `uid`'s screen unlock."""
+        self.k._apply_command({"cmd": "unlocked"}, Conn(), uid)  # type: ignore[arg-type]
+
     def test_lock_wakes_only_wake_on_lock_groups(self) -> None:
         self.login_alice()
         self.push(ALICE, LOCK_CONFIG)
@@ -454,6 +459,113 @@ class WakeOnLock(DaemonTest):
         self.locked(BOB)
         self.locked(GREETER)  # no config at all
         self.assertState(a=True, b=True)
+
+    def test_unlock_kills_again_what_the_lock_woke(self) -> None:
+        self.login_alice()
+        self.push(ALICE, LOCK_CONFIG)
+        self.press(LAPTOP, KILL_A)
+        self.locked(ALICE)
+        self.unlocked(ALICE)
+        self.assertState(a=True, b=True)
+        self.assertGrabbed(LAPTOP, USB)
+        self.assertIn("[a] killed (1 device(s)) (screen unlocked)", self.states)
+
+    def test_unlock_without_a_lock_changes_nothing(self) -> None:
+        self.login_alice()
+        self.push(ALICE, LOCK_CONFIG)
+        self.unlocked(ALICE)
+        self.assertState(a=False, b=True)
+        self.press(LAPTOP, KILL_A)
+        self.locked(ALICE)
+        self.unlocked(ALICE)
+        self.unlocked(ALICE)  # a second unlock signal for the same unlock
+        self.assertState(a=True, b=True)
+
+    def test_unlock_keeps_a_group_that_was_awake_at_lock_awake(self) -> None:
+        self.login_alice()
+        self.push(ALICE, LOCK_CONFIG)
+        self.locked(ALICE)
+        self.unlocked(ALICE)
+        self.assertState(a=False, b=True)
+        self.assertGrabbed(USB)
+
+    def test_a_choice_made_while_locked_stands(self) -> None:
+        """Killed again, or killed and woken with the hotkey, while locked:
+        the unlock leaves it as chosen."""
+        self.login_alice()
+        self.push(ALICE, LOCK_CONFIG)
+        self.press(LAPTOP, KILL_A)
+        self.locked(ALICE)
+        self.command(ALICE, "kill", "a")
+        self.command(ALICE, "wake", "a")
+        self.unlocked(ALICE)
+        self.assertState(a=False, b=True)
+
+    def test_save_while_locked_forgets_the_lock(self) -> None:
+        self.login_alice()
+        self.push(ALICE, LOCK_CONFIG)
+        self.press(LAPTOP, KILL_A)
+        self.locked(ALICE)
+        self.push(
+            ALICE, LOCK_CONFIG.replace("start_killed = true", "start_killed = false")
+        )
+        self.unlocked(ALICE)
+        self.assertState(a=False, b=False)
+
+    def test_unlock_waits_for_the_enter_key(self) -> None:
+        """The key that submits the password is still down when the locker
+        lets go: the grab waits for its release."""
+        self.login_alice()
+        self.push(ALICE, LOCK_CONFIG)
+        self.press(LAPTOP, KILL_A)
+        self.locked(ALICE)
+        dev = self.world[LAPTOP]
+        enter = ecodes.KEY_ENTER
+        dev.held.add(enter)
+        self.k._process(
+            LAPTOP, types.SimpleNamespace(type=ecodes.EV_KEY, code=enter, value=1)
+        )
+        self.unlocked(ALICE)
+        self.assertState(a=True, b=True)
+        self.assertGrabbed(USB)
+        dev.held.discard(enter)
+        self.k._process(
+            LAPTOP, types.SimpleNamespace(type=ecodes.EV_KEY, code=enter, value=0)
+        )
+        self.assertGrabbed(LAPTOP, USB)
+
+    def test_unlock_while_dormant_kills_on_return(self) -> None:
+        self.login_alice()
+        self.push(ALICE, LOCK_CONFIG)
+        self.press(LAPTOP, KILL_A)
+        self.activate("4", BOB)
+        self.locked(ALICE)
+        self.unlocked(ALICE)
+        self.activate("2", ALICE, new=False)
+        self.assertState(a=True, b=True)
+        self.assertGrabbed(LAPTOP, USB)
+
+    def test_lock_across_a_switch_then_unlock(self) -> None:
+        """Locked when switching away, unlocked on the way back."""
+        self.login_alice()
+        self.push(ALICE, LOCK_CONFIG)
+        self.press(LAPTOP, KILL_A)
+        self.locked(ALICE)
+        self.activate("4", BOB)
+        self.activate("2", ALICE, new=False)
+        self.assertState(a=False, b=True)
+        self.unlocked(ALICE)
+        self.assertState(a=True, b=True)
+
+    def test_another_users_unlock_leaves_the_live_user_alone(self) -> None:
+        self.login_alice()
+        self.push(ALICE, LOCK_CONFIG)
+        self.press(LAPTOP, KILL_A)
+        self.locked(ALICE)
+        self.push(BOB, BOB_CONFIG)
+        self.unlocked(BOB)
+        self.unlocked(GREETER)
+        self.assertState(a=False, b=True)
 
     def test_wake_on_lock_must_be_a_bool(self) -> None:
         with self.assertRaises(d.ConfigError):

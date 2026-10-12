@@ -911,7 +911,7 @@ def group_details(win: "ConfigWindow", group: Group) -> list[Adw.PreferencesGrou
     wake = Adw.SwitchRow(
         title="Wake on lock",
         subtitle="Wake this group when the screen locks or the computer sleeps, "
-        "so it can type your password",
+        "so it can type your password; kill it again on unlock",
         active=group.wake_on_lock,
     )
 

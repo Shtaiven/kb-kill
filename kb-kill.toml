@@ -45,7 +45,8 @@
 #     wake_combo as usual.
 #   * Optional per group: wake_on_lock = true — wake the group when the screen
 #     locks or the computer sleeps, so you can type your password on the lock
-#     screen. Not inherited. Needs gdbus (GLib).
+#     screen, and kill it again when you unlock. Not inherited. Needs gdbus
+#     (GLib).
 #   * TOML rule: top-level keys MUST come before any [groups.*] table.
 #   * Give each group a DISTINCT combo (a shared combo just toggles both groups
 #     together — which is how you kill a physical + a virtual target at once).
