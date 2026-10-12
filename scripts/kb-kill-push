@@ -8,9 +8,10 @@ and applies it only while this user controls the seat. Stdlib only.
 
 When a group sets wake_on_lock, it also tells the daemon when this user's
 screen locks and unlocks. Lockers report that to logind in different ways, so
-any of these counts as a lock: the session's Lock signal, its LockedHint
-turning true, and PrepareForSleep (desktops lock on suspend); and as an
-unlock: the session's Unlock signal and LockedHint turning false. COSMIC sets
+any of these counts as a lock: the session's Lock signal and its LockedHint
+turning true; and as an unlock: the session's Unlock signal and LockedHint
+turning false. Sleep is not a lock: a desktop that locks on suspend says so
+with one of these, and one that does not leaves the kill as it was. COSMIC sets
 no LockedHint and tells logind nothing on unlock; its locker keeps
 $XDG_RUNTIME_DIR/cosmic-greeter-<session id>.lock while the screen is locked,
 so that file appearing and vanishing counts too. It listens with
@@ -259,11 +260,6 @@ class LockWatch:
     def _event(self, line: str) -> str | None:
         path, _, signal = line.partition(": ")
         if path == LOGIN1:
-            # Waking from sleep is not an unlock: the lock screen is still up.
-            if signal.startswith(
-                "org.freedesktop.login1.Manager.PrepareForSleep (true"
-            ):
-                return "locked"
             if signal.startswith(
                 (
                     "org.freedesktop.login1.Manager.SessionNew ",

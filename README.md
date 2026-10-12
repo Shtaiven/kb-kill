@@ -247,14 +247,16 @@ together. The old name `virtual_keyboard` is accepted as a deprecated alias.
   changes a group's state, and `wake_on_lock`.
 
 - `wake_on_lock = true` (per group, not inherited) wakes the group when your
-  screen locks or the computer goes to sleep, so a killed keyboard can type
-  your password on the lock screen, and kills it again when you unlock. A
+  screen locks, so a killed keyboard can type your password on the lock
+  screen, and kills it again when you unlock. Sleep is not a lock: a desktop
+  that locks on suspend wakes the group through its lock, and one that does
+  not leaves it killed. A
   hotkey, tray or save in between wins: the unlock then leaves the group as
   you set it. A save while the screen is locked does not kill a
   `start_killed` group with `wake_on_lock` behind the lock screen; it is
   killed at the unlock. `kb-kill-push` watches logind for this, using `gdbus` from
-  GLib: the session's `Lock`/`Unlock` signals, its `LockedHint` (GNOME and
-  KDE set it), and `PrepareForSleep`, since desktops lock on suspend. COSMIC
+  GLib: the session's `Lock`/`Unlock` signals and its `LockedHint` (GNOME
+  and KDE set it). COSMIC
   sets no `LockedHint` and tells logind nothing on unlock, so there the
   locker's `$XDG_RUNTIME_DIR/cosmic-greeter-<session>.lock` file counts too.
   A locker that reports neither leaves the group awake after unlock. When you
