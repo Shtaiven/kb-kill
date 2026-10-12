@@ -92,8 +92,9 @@ rebuild the package or re-run `./install.sh`.
   else that makes a uid live again (switching back, the seat going idle across
   sleep/lid/lock) goes through `_resume`, which reinstalls the groups with the
   `killed` they kept on the dormant Config. A kill is never carried over from
-  another user or across a save, and `_start` refuses to kill a group whose
-  wake hotkey no device can type. A daemon or push restart loses state (the
+  another user or across a save, and `_set_killed` (which `_start` and every
+  other kill go through) refuses to kill a group whose wake hotkey no device
+  can type. A daemon or push restart loses state (the
   pushed config is dropped) and starts awake.
 - **Untrusted input stays bounded.** Configs from any uid are capped
   (`MAX_GROUPS`, `MAX_COMBO_TOKENS`, `MAX_LINE`, checked on every line) and

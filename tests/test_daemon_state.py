@@ -255,7 +255,7 @@ class Login(DaemonTest):
         self.assertEqual(self.k.live_uid, ALICE)
         self.assertState(a=False, b=True)
         self.assertGrabbed(USB)
-        self.assertIn("[b] killed (start_killed)", self.states)
+        self.assertIn("[b] killed (1 device(s)) (start_killed)", self.states)
 
     def test_login_already_active_at_daemon_start_counts(self) -> None:
         """The daemon comes up at boot while the session is seconds old."""
@@ -759,6 +759,20 @@ class NoKillWithoutWay(DaemonTest):
                     },
                 )
             ],
+        )
+
+    def test_start_killed_refusal_tells_the_live_users_clients(self) -> None:
+        """A refused start_killed warns like a refused hotkey: one rule."""
+        self.boot()
+        self.activate("2", ALICE)
+        self.push(ALICE, MOUSE_WAKE + "start_killed = true\n")
+        self.assertState(a=False)
+        self.assertIn(
+            "[a] not killed: no device can type its wake hotkey (start_killed)",
+            self.states,
+        )
+        self.assertIn(
+            "refused", [m["type"] for c, m in self.sent if c is self.conns[ALICE]]
         )
 
     def test_preview_agrees_with_the_live_check(self) -> None:

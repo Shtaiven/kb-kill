@@ -400,7 +400,7 @@ class Tray:
         self._render_queued = False
         self.osd = Osd()
         self._killed: dict[str, bool] | None = None
-        self._pending: dict[str, bool] = {}
+        self._pending: dict[str, tuple[str, str]] = {}  # group -> (icon, text)
         self._osd_timer = 0
         self._settings_timer = 0
         self._settings_monitor = self._watch_settings()
@@ -487,34 +487,40 @@ class Tray:
         )
         if was is None:
             return
-        for name, killed in self._killed.items():
-            if was.get(name, killed) != killed:
-                self._pending[name] = killed
-        if self._pending and not self._osd_timer:
-            self._osd_timer = GLib.timeout_add(OSD_COALESCE_MS, self._flush_osd)
+        for g in self.groups:
+            killed = self._killed[g["name"]]
+            if was.get(g["name"], killed) != killed:
+                self._queue_osd(
+                    g["name"],
+                    OSD_ICON[killed],
+                    f"{g.get('label') or g['name']} {'killed' if killed else 'awake'}",
+                )
 
     def _osd_refused(self, msg: dict) -> None:
         """A kill the daemon refused changes no state, so no state message
-        shows it: warn right away, or the hotkey just seems to do nothing."""
-        name = msg.get("label") or msg.get("group")
-        reason = msg.get("reason")
-        if isinstance(name, str) and isinstance(reason, str):
-            self.osd.show([(ICON_WARNING, f"{name} not killed: {reason}")])
+        shows it: warn, or the hotkey just seems to do nothing. Queued with
+        the state changes, so the same hotkey killing another group shows
+        both cards instead of the kill replacing the warning."""
+        group, reason = msg.get("group"), msg.get("reason")
+        if isinstance(group, str) and isinstance(reason, str):
+            name = msg.get("label") if isinstance(msg.get("label"), str) else group
+            self._queue_osd(group, ICON_WARNING, f"{name} not killed: {reason}")
+
+    def _queue_osd(self, group: str, icon: str, text: str) -> None:
+        self._pending[group] = (icon, text)
+        if not self._osd_timer:
+            self._osd_timer = GLib.timeout_add(OSD_COALESCE_MS, self._flush_osd)
 
     def _flush_osd(self) -> bool:
         self._osd_timer = 0
         pending, self._pending = self._pending, {}
+        order = [g["name"] for g in self.groups]
         self.osd.show(
             [
-                (
-                    OSD_ICON[pending[g["name"]]],
-                    (
-                        f"{g.get('label') or g['name']} "
-                        f"{'killed' if pending[g['name']] else 'awake'}"
-                    ),
+                pending[name]
+                for name in sorted(
+                    pending, key=lambda n: order.index(n) if n in order else len(order)
                 )
-                for g in self.groups
-                if g["name"] in pending
             ]
         )
         return False  # one-shot timer

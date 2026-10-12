@@ -970,41 +970,24 @@ class KbKill:
         return now
 
     def _start(self, groups: list[Group], start_killed: bool) -> None:
-        """Install `groups` awake, or with their start_killed groups killed.
-        Never kills a group whose wake hotkey no device we read can type:
-        that would disable input at every login with no way back. Behind a
+        """Install `groups` awake, then kill their start_killed groups through
+        _set_killed, the one place a kill no device can wake is refused (at
+        every login that would disable input with no way back). Behind a
         locked screen (a save while locked) a wake_on_lock group waits for
         the unlock instead, so the password can still be typed."""
         locked = self.live_uid in self._locked
-        kill: dict[str, bool] = {}
-        for g in groups:
-            g.lock_woken = start_killed and g.start_killed and g.wake_on_lock and locked
-            if start_killed and g.start_killed and not g.lock_woken:
-                kill[g.name] = True
-        self._install_groups(groups, kill)
-        spared = False
+        self._install_groups(groups, {})
+        due = False
         for g in self.groups:
-            if not g.killed:
+            g.lock_woken = False  # a restart forgets what a lock woke
+            if not (start_killed and g.start_killed):
                 continue
-            if not self._can_wake(g):
-                g.killed = False
-                self._once(
-                    f"lockout:{g.name}",
-                    f"[{g.name}] not started killed: no device can type its wake hotkey",
-                    PRI_WARN,
-                )
-                spared = True
-                continue
-            if not g.targets:
-                self._once(
-                    f"notarget:{g.name}",
-                    f"[{g.name}] no target device present; will grab one when it appears",
-                    PRI_WARN,
-                )
-            log_state(f"[{g.name}] killed (start_killed)")
-        if spared:
-            self._reconcile_grabs()  # let go of what the spared group grabbed
-            self._maybe_broadcast()
+            if g.wake_on_lock and locked:
+                g.lock_woken = True
+            else:
+                due |= self._set_killed(g, True, "start")
+        if due:
+            self._reconcile_grabs()
 
     def _resume(self, groups: list[Group]) -> None:
         """Reinstall a user's groups as they last were: switching back, or the
@@ -1302,6 +1285,7 @@ class KbKill:
             "control": " (via control)",
             "lock": " (screen locked)",
             "unlock": " (screen unlocked)",
+            "start": " (start_killed)",
         }.get(how, "")
         if killed and not self._can_wake(group):
             log_state(
