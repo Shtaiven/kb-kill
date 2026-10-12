@@ -139,6 +139,8 @@ class LockWatch:
         self.session = ""  # our display session's object path
         self.lockfile: Path | None = None  # COSMIC's, while the screen is locked
         self.lockfile_seen = False
+        self.gdbus = ""
+        self.looked_at = 0.0  # last _find_session from a stranger's lock
         self.buf = b""
         self.retry_at = 0.0
         self._said_missing = False
@@ -163,12 +165,33 @@ class LockWatch:
                 self._said_missing = True
             self.retry_at = time.monotonic() + LOCK_RETRY_SECONDS
             return
+        self.gdbus = gdbus
+        self._find_session()
+        try:
+            self.proc = subprocess.Popen(
+                [gdbus, "monitor", "--system", "--dest", "org.freedesktop.login1"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as e:
+            log(f"cannot watch for the screen lock: {e}")
+            self.retry_at = time.monotonic() + LOCK_RETRY_SECONDS
+            return
+        self.buf = b""
+        log(f"watching for the screen lock ({self.session or 'no display session'})")
+
+    def _find_session(self) -> None:
+        """Look up our display session. Again whenever logind adds or removes
+        a session, or a lock comes from one we do not know: we may have
+        started before the graphical login (lingering, SSH, a text console
+        first), or the user logged out and in while we kept running."""
         try:
             # "auto" is the caller's session, or for a service outside one
             # (this one) the user's display session.
             out = subprocess.run(
                 [
-                    gdbus,
+                    self.gdbus,
                     "call",
                     "--system",
                     "--dest",
@@ -188,29 +211,21 @@ class LockWatch:
             out = ""
         # "(objectpath '/org/freedesktop/login1/session/_32',)"
         _, quote, rest = out.partition("'")
-        self.session = rest.partition("'")[0] if quote else ""
+        session = rest.partition("'")[0] if quote else ""
+        if session == self.session and self.gdbus and self.proc is not None:
+            return
+        if self.proc is not None:  # not the first lookup
+            log(f"display session now {session or 'none'}")
+        self.session = session
         runtime = os.environ.get("XDG_RUNTIME_DIR")
-        sid = _session_id(self.session) if self.session else ""
+        sid = _session_id(session) if session else ""
         self.lockfile = (
             Path(runtime) / f"cosmic-greeter-{sid}.lock"
             if runtime and sid and "/" not in sid
             else None
         )
-        # Already locked when we start: that lock was not seen, only its end is.
+        # Already locked when we look: that lock was not seen, only its end is.
         self.lockfile_seen = self.lockfile is not None and self.lockfile.exists()
-        try:
-            self.proc = subprocess.Popen(
-                [gdbus, "monitor", "--system", "--dest", "org.freedesktop.login1"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-        except OSError as e:
-            log(f"cannot watch for the screen lock: {e}")
-            self.retry_at = time.monotonic() + LOCK_RETRY_SECONDS
-            return
-        self.buf = b""
-        log(f"watching for the screen lock ({self.session or 'no display session'})")
 
     def stop(self) -> None:
         if self.proc is not None:
@@ -249,9 +264,24 @@ class LockWatch:
                 "org.freedesktop.login1.Manager.PrepareForSleep (true"
             ):
                 return "locked"
+            if signal.startswith(
+                (
+                    "org.freedesktop.login1.Manager.SessionNew ",
+                    "org.freedesktop.login1.Manager.SessionRemoved ",
+                )
+            ):
+                self._find_session()
             return None
-        if not self.session or path != self.session:
+        if not path.startswith(LOGIN1 + "/session/"):
             return None
+        if path != self.session:
+            now = time.monotonic()
+            if not _is_lock_signal(signal) or now - self.looked_at < 1.0:
+                return None  # another user's session; at most one look a second
+            self.looked_at = now
+            self._find_session()  # ours, now? (logind says nothing per user)
+            if path != self.session:
+                return None
         if signal.startswith("org.freedesktop.login1.Session.Lock "):
             return "locked"
         if signal.startswith("org.freedesktop.login1.Session.Unlock "):
@@ -262,6 +292,15 @@ class LockWatch:
             if "'LockedHint': <false>" in signal:
                 return "unlocked"
         return None
+
+
+def _is_lock_signal(signal: str) -> bool:
+    return signal.startswith(
+        (
+            "org.freedesktop.login1.Session.Lock ",
+            "org.freedesktop.login1.Session.Unlock ",
+        )
+    ) or ("'LockedHint'" in signal)
 
 
 def report_errors(buf: bytes) -> bytes:

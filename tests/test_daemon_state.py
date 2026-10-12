@@ -116,6 +116,7 @@ class DaemonTest(unittest.TestCase):
         self.sessions: set[str] = set()  # logind: every session that exists
         self.young: set[str] = set()  # sessions created moments ago
         self.states: list[str] = []  # killed/awake journal lines
+        self.ctrl: list[str] = []  # config/device/warning journal lines
 
         def open_dev(path: str) -> FakeDev:
             if path not in self.world:
@@ -130,7 +131,7 @@ class DaemonTest(unittest.TestCase):
             mock.patch.object(d, "_existing_sessions", lambda: set(self.sessions)),
             mock.patch.object(d, "_is_new_session", lambda sid: sid in self.young),
             mock.patch.object(d, "log_state", lambda m, pri=0: self.states.append(m)),
-            mock.patch.object(d.CTRL_LOG, "emit", lambda m, pri=0: None),
+            mock.patch.object(d.CTRL_LOG, "emit", lambda m, pri=0: self.ctrl.append(m)),
             # Same path, other object: the node was re-created (a replug).
             mock.patch.object(
                 d.KbKill,
@@ -544,6 +545,59 @@ class WakeOnLock(DaemonTest):
         self.activate("2", ALICE, new=False)
         self.assertState(a=True, b=True)
         self.assertGrabbed(LAPTOP, USB)
+
+    def test_save_while_locked_waits_for_the_unlock(self) -> None:
+        """A background save behind the lock screen must not take the keyboard
+        the password is typed on: start_killed waits for the unlock."""
+        self.login_alice()
+        self.push(
+            ALICE, LOCK_CONFIG.replace("[groups.b]", "[groups.b]\nwake_on_lock = true")
+        )
+        self.locked(ALICE)
+        self.push(
+            ALICE, LOCK_CONFIG.replace("[groups.b]", "[groups.b]\nwake_on_lock = true")
+        )
+        self.assertState(a=False, b=False)
+        self.assertGrabbed()
+        self.unlocked(ALICE)
+        self.assertState(a=False, b=True)
+        self.assertGrabbed(USB)
+
+    def test_save_while_locked_still_kills_other_groups(self) -> None:
+        self.login_alice()
+        self.push(ALICE, LOCK_CONFIG)
+        self.locked(ALICE)
+        self.push(ALICE, LOCK_CONFIG)
+        self.assertState(a=False, b=True)  # b has no wake_on_lock
+
+    def test_a_dormant_users_lock_and_unlock_log_nothing(self) -> None:
+        """Any uid with a config may send these; the journal bucket is shared."""
+        self.login_alice()
+        self.push(ALICE, LOCK_CONFIG)
+        self.press(LAPTOP, KILL_A)
+        self.activate("4", BOB)
+        self.states.clear()
+        for _ in range(3):
+            self.locked(ALICE)
+            self.unlocked(ALICE)
+        self.assertEqual(self.states, [])
+
+    def test_unlock_while_dormant_checks_the_wake_hotkey_on_return(self) -> None:
+        self.login_alice()
+        self.push(ALICE, LOCK_CONFIG)
+        self.press(LAPTOP, KILL_A)
+        self.locked(ALICE)
+        self.activate("4", BOB)
+        self.unlocked(ALICE)
+        for path in (LAPTOP, USB):  # every device that can type the wake hotkey
+            self.unplug(path)
+        self.k.rescan()
+        self.activate("2", ALICE, new=False)
+        self.assertState(a=False, b=True)  # b's kill is kept, not new: unchecked
+        self.assertIn(
+            "[a] not killed again on unlock: no device can type its wake hotkey",
+            self.ctrl,
+        )
 
     def test_lock_across_a_switch_then_unlock(self) -> None:
         """Locked when switching away, unlocked on the way back."""

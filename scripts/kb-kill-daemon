@@ -712,6 +712,8 @@ class KbKill:
         # A dormant user's groups keep their killed state for when they are
         # live again; a save while dormant restarts them then instead.
         self._saved: set[int] = set()
+        # Users whose screen is locked, as their kb-kill-push reports it.
+        self._locked: set[int] = set()
         if config is not None:
             self.pushed[os.getuid()] = config
             self.live_uid = os.getuid()
@@ -948,13 +950,16 @@ class KbKill:
     def _start(self, groups: list[Group], start_killed: bool) -> None:
         """Install `groups` awake, or with their start_killed groups killed.
         Never kills a group whose wake hotkey no device we read can type:
-        that would disable input at every login with no way back."""
+        that would disable input at every login with no way back. Behind a
+        locked screen (a save while locked) a wake_on_lock group waits for
+        the unlock instead, so the password can still be typed."""
+        locked = self.live_uid in self._locked
+        kill: dict[str, bool] = {}
         for g in groups:
-            g.lock_woken = False
-        self._install_groups(
-            groups,
-            {g.name: True for g in groups if g.start_killed} if start_killed else {},
-        )
+            g.lock_woken = start_killed and g.start_killed and g.wake_on_lock and locked
+            if start_killed and g.start_killed and not g.lock_woken:
+                kill[g.name] = True
+        self._install_groups(groups, kill)
         spared = False
         for g in self.groups:
             if not g.killed:
@@ -989,6 +994,8 @@ class KbKill:
         for g in self.groups:
             if g.killed:
                 log_state(f"[{g.name}] killed (kept)")
+        if self.live_uid not in self._locked:  # unlocked while away
+            self._kill_lock_woken()
 
     def _can_wake(
         self, group: Group, devices: dict[str, InputDevice] | None = None
@@ -1058,10 +1065,12 @@ class KbKill:
         """`uid`'s screen locked (kb-kill-push watches logind): wake its
         killed wake_on_lock groups, so its lock screen can be typed on, and
         remember them for the unlock. A dormant user's groups are woken on its
-        Config, for when it returns."""
+        Config, for when it returns, without a journal line: any uid with a
+        config may send this, and the journal's rate bucket is shared."""
         cfg = self.pushed.get(uid)
         if cfg is None:
             return
+        self._locked.add(uid)
         live = uid == self.live_uid
         woke = False
         for g in cfg.groups:
@@ -1072,7 +1081,6 @@ class KbKill:
                 self._set_killed(g, False, "lock")
             else:
                 g.killed = False
-                log_state(f"[{g.name}] awake (screen locked, uid {uid})")
             g.lock_woken = True
         if woke and live:
             self._reconcile_grabs()
@@ -1080,20 +1088,24 @@ class KbKill:
     def _on_unlocked(self, uid: int) -> None:
         """`uid`'s screen unlocked: kill again what its lock woke. A hotkey,
         control call, save or login since the lock has cleared `lock_woken`,
-        so a choice made in between stands. The grab waits for the keys that
-        typed the password to be released (_reconcile_grabs)."""
-        cfg = self.pushed.get(uid)
-        if cfg is None:
-            return
-        live = uid == self.live_uid
+        so a choice made in between stands. A dormant user's groups stay
+        marked: _resume kills them on its return, with the lockout check
+        against the devices present then."""
+        self._locked.discard(uid)
+        if uid == self.live_uid:
+            self._kill_lock_woken()
+
+    def _kill_lock_woken(self) -> None:
+        """Kill again the live groups a lock woke. The grab waits for the keys
+        that typed the password to be released (_reconcile_grabs)."""
         killed = False
-        for g in cfg.groups:
+        for g in self.groups:
             if not g.lock_woken:
                 continue
             g.lock_woken = False
             if g.killed:
                 continue
-            if live and not self._can_wake(g):
+            if not self._can_wake(g):
                 self._once(
                     f"lockout:{g.name}",
                     f"[{g.name}] not killed again on unlock: no device can type its wake hotkey",
@@ -1101,12 +1113,8 @@ class KbKill:
                 )
                 continue
             killed = True
-            if live:
-                self._set_killed(g, True, "unlock")
-            else:
-                g.killed = True
-                log_state(f"[{g.name}] killed (screen unlocked, uid {uid})")
-        if killed and live:
+            self._set_killed(g, True, "unlock")
+        if killed:
             self._reconcile_grabs()
 
     def _check_config(self, text: str, uid: int | None = None) -> dict:
@@ -1494,6 +1502,7 @@ class KbKill:
         ):
             CTRL_LOG.emit(f"uid {uid} disconnected; dropping its pushed config")
             self._saved.discard(uid)
+            self._locked.discard(uid)
             if uid == self.live_uid:
                 self._reevaluate_live()
 

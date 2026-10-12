@@ -250,7 +250,9 @@ together. The old name `virtual_keyboard` is accepted as a deprecated alias.
   screen locks or the computer goes to sleep, so a killed keyboard can type
   your password on the lock screen, and kills it again when you unlock. A
   hotkey, tray or save in between wins: the unlock then leaves the group as
-  you set it. `kb-kill-push` watches logind for this, using `gdbus` from
+  you set it. A save while the screen is locked does not kill a
+  `start_killed` group with `wake_on_lock` behind the lock screen; it is
+  killed at the unlock. `kb-kill-push` watches logind for this, using `gdbus` from
   GLib: the session's `Lock`/`Unlock` signals, its `LockedHint` (GNOME and
   KDE set it), and `PrepareForSleep`, since desktops lock on suspend. COSMIC
   sets no `LockedHint` and tells logind nothing on unlock, so there the

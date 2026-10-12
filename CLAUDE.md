@@ -76,8 +76,12 @@ rebuild the package or re-run `./install.sh`.
   `{"cmd":"locked"}` (`kb-kill-push` watching logind via `gdbus monitor`,
   and COSMIC's `cosmic-greeter-<sid>.lock`) wakes only that uid's
   `wake_on_lock` groups, live or dormant, and marks them `lock_woken`;
-  `{"cmd":"unlocked"}` kills those again. Any other `_set_killed` or a
-  `_start` clears the mark, so a choice made while locked stands. Anything
+  `{"cmd":"unlocked"}` kills those again (a dormant uid's on its return,
+  through `_resume`, with the lockout check). Any other `_set_killed` or a
+  `_start` clears the mark, so a choice made while locked stands; a `_start`
+  behind a locked screen (`_locked`) marks a start_killed `wake_on_lock`
+  group instead of killing it. A dormant uid's lock/unlock writes no journal
+  line (any uid may send them). Anything
   else that makes a uid live again (switching back, the seat going idle across
   sleep/lid/lock) goes through `_resume`, which reinstalls the groups with the
   `killed` they kept on the dormant Config. A kill is never carried over from
