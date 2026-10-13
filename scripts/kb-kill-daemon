@@ -53,7 +53,7 @@ except ImportError:
     sys.exit(1)
 
 # Rewritten by packaging/bump-version.sh from the repo-root VERSION file.
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 _CTRL = frozenset({ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL})
 _ALT = frozenset({ecodes.KEY_LEFTALT, ecodes.KEY_RIGHTALT})
@@ -1301,7 +1301,9 @@ class KbKill:
             )
             return False
         group.killed = killed
-        group.lock_woken = False  # any change supersedes the lock's; _on_locked re-marks
+        group.lock_woken = (
+            False  # any change supersedes the lock's; _on_locked re-marks
+        )
         if killed:
             if not group.targets:
                 self._once(

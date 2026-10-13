@@ -36,7 +36,7 @@ LOGIN1 = "/org/freedesktop/login1"
 LOCK_RETRY_SECONDS = 30.0  # gdbus died: try again this much later
 
 # Rewritten by packaging/bump-version.sh from the repo-root VERSION file.
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 
 def log(msg: str) -> None:
