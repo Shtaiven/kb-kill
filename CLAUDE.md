@@ -65,18 +65,36 @@ rebuild the package or re-run `./install.sh`.
   `_sync_latches` is the single place latches are written. `_release_stale_keys`
   only ever drops keys (re-arms, never fires).
 - **Grab deferral.** `_reconcile_grabs` never grabs a device with keys held.
+- **No kill without a way back.** `_set_killed` refuses a kill (hotkey or
+  control) and `_start` a `start_killed` when `_can_wake` finds no read device
+  that has every wake key. `watched()` decides what is read (keyboards,
+  pointers when targeted, any device with a hotkey key) for both the daemon
+  and the `check_config` preview, so the check and reality agree; a device read
+  only for a hotkey key is never a target (`_dev_matches`). `_resume` keeps a
+  kill whose wake device vanished across sleep, on purpose.
 - **A grab never outlives its config; state survives sleep, lock and switches.**
   `_install_groups` ungrabs first and takes killed state only from `preserve`.
-  State is reset only by a login, a save, or a hotkey/control call. A restart
+  State is reset only by a login, a save, a hotkey/control call, or a lock
+  (and its unlock) under `wake_on_lock`. A restart
   (`_start`) begins awake apart from the config's own `start_killed` groups: at
   login (`_track_sessions` arms a session the first time it is active,
   including a second session of the same uid) and on every re-push (saving is
-  a restart; a save while dormant is applied on return, `_saved`). Anything
+  a restart; a save while dormant is applied on return, `_saved`). A uid's
+  `{"cmd":"locked"}` (`kb-kill-push` watching logind via `gdbus monitor`,
+  and COSMIC's `cosmic-greeter-<sid>.lock`) wakes only that uid's
+  `wake_on_lock` groups, live or dormant, and marks them `lock_woken`;
+  `{"cmd":"unlocked"}` kills those again (a dormant uid's on its return,
+  through `_resume`, with the lockout check). Any other `_set_killed` or a
+  `_start` clears the mark, so a choice made while locked stands; a `_start`
+  behind a locked screen (`_locked`) marks a start_killed `wake_on_lock`
+  group instead of killing it. A dormant uid's lock/unlock writes no journal
+  line (any uid may send them). Anything
   else that makes a uid live again (switching back, the seat going idle across
   sleep/lid/lock) goes through `_resume`, which reinstalls the groups with the
   `killed` they kept on the dormant Config. A kill is never carried over from
-  another user or across a save, and `_start` refuses to kill a group whose
-  wake hotkey no device can type. A daemon or push restart loses state (the
+  another user or across a save, and `_set_killed` (which `_start` and every
+  other kill go through) refuses to kill a group whose wake hotkey no device
+  can type. A daemon or push restart loses state (the
   pushed config is dropped) and starts awake.
 - **Untrusted input stays bounded.** Configs from any uid are capped
   (`MAX_GROUPS`, `MAX_COMBO_TOKENS`, `MAX_LINE`, checked on every line) and

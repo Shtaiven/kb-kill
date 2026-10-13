@@ -92,6 +92,8 @@ MAX_LINE = 65536  # bytes buffered per client before a newline
 HANDSHAKE_SECONDS = 10  # drop a connection that never sends a command
 GROUP_NAME_RE = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9 ._-]{0,31}\Z")
 LABEL_MAX_LEN = 64
+# Why a kill is refused: journal, the tray's warning and a control error.
+UNWAKEABLE = "no device can type its wake hotkey"
 SEATS_DIR = "/run/systemd/seats"
 SESSIONS_DIR = "/run/systemd/sessions"
 # A session this young when the daemon first sees it counts as a fresh login
@@ -316,6 +318,7 @@ class Group:
         wake_raw: str,
         virtual: bool | None,
         start_killed: bool = False,
+        wake_on_lock: bool = False,
     ) -> None:
         self.name = name
         self.label = label
@@ -328,9 +331,11 @@ class Group:
         self.wake_combo = _parse_combo(wake_raw)
         self.virtual = virtual  # None = "auto" (pair with a fronting remapper copy)
         self.start_killed = start_killed  # killed when its user becomes live
+        self.wake_on_lock = wake_on_lock  # woken when its user's screen locks
         # runtime
         self.targets: dict[str, InputDevice] = {}
         self.killed = False
+        self.lock_woken = False  # killed until the lock woke it: unlock kills again
         self.kill_held = False  # edge latches; see KbKill._toggle_groups
         self.wake_held = False
 
@@ -382,6 +387,7 @@ _GROUP_KEYS = {
     "virtual",
     "virtual_keyboard",
     "start_killed",
+    "wake_on_lock",
 }
 _TOP_KEYS = {"kill_combo", "wake_combo"}
 _GLOB_META_RE = re.compile(r"[*?]|\[[!^]?\]?[^]]*\]")
@@ -500,9 +506,11 @@ def _build_group(
                 f"{where}: invalid 'label' {_safe(label)!r}: up to {LABEL_MAX_LEN} printable characters"
             )
 
-    start_killed = table.get("start_killed", False)
-    if not isinstance(start_killed, bool):
-        raise ConfigError(f"{where}: 'start_killed' must be true or false")
+    flags = {}
+    for key in ("start_killed", "wake_on_lock"):
+        flags[key] = table.get(key, False)
+        if not isinstance(flags[key], bool):
+            raise ConfigError(f"{where}: '{key}' must be true or false")
 
     kill_raw = table.get("kill_combo", defaults["kill_combo"])
     wake_raw = table.get("wake_combo", defaults["wake_combo"])
@@ -523,7 +531,7 @@ def _build_group(
             kill_raw,
             wake_raw,
             virtual,
-            start_killed,
+            **flags,
         )
     except ConfigError as e:
         raise ConfigError(f"{where}: {e}")
@@ -628,6 +636,28 @@ def is_virtual(dev: InputDevice) -> bool:
     )
 
 
+def hotkey_keys(groups: list[Group]) -> set[int]:
+    """Every key and button some group's kill or wake hotkey names."""
+    keys: set[int] = set()
+    for g in groups:
+        for token in (*g.kill_combo, *g.wake_combo):
+            keys |= token
+    return keys
+
+
+def watched(dev: InputDevice, groups: list[Group], keys: set[int]) -> bool:
+    """What the daemon reads for `groups`: keyboards; pointers when a group
+    targets them; and any other device with a key in `keys` (hotkey_keys),
+    so a hotkey's mouse button or a media key on a keyboard's separate
+    "Consumer Control" node can be typed. The lockout check (_can_wake)
+    counts exactly these devices."""
+    if is_keyboard(dev):
+        return True
+    if is_pointer(dev) and any(g.pointers or g.devices for g in groups):
+        return True
+    return not keys.isdisjoint(dev.capabilities().get(ecodes.EV_KEY, []))
+
+
 def device_class(dev: InputDevice) -> str:
     return "kbd" if is_keyboard(dev) else "ptr" if is_pointer(dev) else "other"
 
@@ -706,6 +736,8 @@ class KbKill:
         # A dormant user's groups keep their killed state for when they are
         # live again; a save while dormant restarts them then instead.
         self._saved: set[int] = set()
+        # Users whose screen is locked, as their kb-kill-push reports it.
+        self._locked: set[int] = set()
         if config is not None:
             self.pushed[os.getuid()] = config
             self.live_uid = os.getuid()
@@ -754,7 +786,8 @@ class KbKill:
         return (
             (hit(group.keyboards) and is_keyboard(dev))
             or (hit(group.pointers) and is_pointer(dev))
-            or hit(group.devices)
+            # A device read only for a hotkey key is never a target.
+            or (hit(group.devices) and (is_keyboard(dev) or is_pointer(dev)))
         )
 
     def _update_fronting(self) -> None:
@@ -805,8 +838,7 @@ class KbKill:
 
     # -- device lifecycle ----------------------------------------------------- #
     def _wanted(self, dev: InputDevice) -> bool:
-        want_pointers = any(g.pointers or g.devices for g in self.groups)
-        return is_keyboard(dev) or (want_pointers and is_pointer(dev))
+        return watched(dev, self.groups, hotkey_keys(self.groups))
 
     def _add_device(self, path: str) -> None:
         try:
@@ -940,36 +972,24 @@ class KbKill:
         return now
 
     def _start(self, groups: list[Group], start_killed: bool) -> None:
-        """Install `groups` awake, or with their start_killed groups killed.
-        Never kills a group whose wake hotkey no device we read can type:
-        that would disable input at every login with no way back."""
-        self._install_groups(
-            groups,
-            {g.name: True for g in groups if g.start_killed} if start_killed else {},
-        )
-        spared = False
+        """Install `groups` awake, then kill their start_killed groups through
+        _set_killed, the one place a kill no device can wake is refused (at
+        every login that would disable input with no way back). Behind a
+        locked screen (a save while locked) a wake_on_lock group waits for
+        the unlock instead, so the password can still be typed."""
+        locked = self.live_uid in self._locked
+        self._install_groups(groups, {})
+        due = False
         for g in self.groups:
-            if not g.killed:
+            g.lock_woken = False  # a restart forgets what a lock woke
+            if not (start_killed and g.start_killed):
                 continue
-            if not self._can_wake(g):
-                g.killed = False
-                self._once(
-                    f"lockout:{g.name}",
-                    f"[{g.name}] not started killed: no device can type its wake hotkey",
-                    PRI_WARN,
-                )
-                spared = True
-                continue
-            if not g.targets:
-                self._once(
-                    f"notarget:{g.name}",
-                    f"[{g.name}] no target device present; will grab one when it appears",
-                    PRI_WARN,
-                )
-            log_state(f"[{g.name}] killed (start_killed)")
-        if spared:
-            self._reconcile_grabs()  # let go of what the spared group grabbed
-            self._maybe_broadcast()
+            if g.wake_on_lock and locked:
+                g.lock_woken = True
+            else:
+                due |= self._set_killed(g, True, "start")
+        if due:
+            self._reconcile_grabs()
 
     def _resume(self, groups: list[Group]) -> None:
         """Reinstall a user's groups as they last were: switching back, or the
@@ -981,6 +1001,8 @@ class KbKill:
         for g in self.groups:
             if g.killed:
                 log_state(f"[{g.name}] killed (kept)")
+        if self.live_uid not in self._locked:  # unlocked while away
+            self._kill_lock_woken()
 
     def _can_wake(
         self, group: Group, devices: dict[str, InputDevice] | None = None
@@ -1046,6 +1068,55 @@ class KbKill:
         else:
             self._reevaluate_live()
 
+    def _on_locked(self, uid: int) -> None:
+        """`uid`'s screen locked (kb-kill-push watches logind): wake its
+        killed wake_on_lock groups, so its lock screen can be typed on, and
+        remember them for the unlock. A dormant user's groups are woken on its
+        Config, for when it returns, without a journal line: any uid with a
+        config may send this, and the journal's rate bucket is shared."""
+        cfg = self.pushed.get(uid)
+        if cfg is None:
+            return
+        self._locked.add(uid)
+        live = uid == self.live_uid
+        woke = False
+        for g in cfg.groups:
+            if not (g.wake_on_lock and g.killed):
+                continue
+            woke = True
+            if live:
+                self._set_killed(g, False, "lock")
+            else:
+                g.killed = False
+            g.lock_woken = True
+        if woke and live:
+            self._reconcile_grabs()
+
+    def _on_unlocked(self, uid: int) -> None:
+        """`uid`'s screen unlocked: kill again what its lock woke. A hotkey,
+        control call, save or login since the lock has cleared `lock_woken`,
+        so a choice made in between stands. A dormant user's groups stay
+        marked: _resume kills them on its return, with the lockout check
+        against the devices present then."""
+        self._locked.discard(uid)
+        if uid == self.live_uid:
+            self._kill_lock_woken()
+
+    def _kill_lock_woken(self) -> None:
+        """Kill again the live groups a lock woke. The grab waits for the keys
+        that typed the password to be released (_reconcile_grabs)."""
+        killed = False
+        for g in self.groups:
+            if not g.lock_woken:
+                continue
+            g.lock_woken = False
+            if g.killed:
+                continue
+            # Refused, and logged, when nothing can type its wake hotkey.
+            killed |= self._set_killed(g, True, "unlock")
+        if killed:
+            self._reconcile_grabs()
+
     def _check_config(self, text: str, uid: int | None = None) -> dict:
         """Parse a candidate config for a settings editor. Nothing reaches the
         journal: warnings and errors go back to the caller only. The live user
@@ -1074,6 +1145,7 @@ class KbKill:
                 "wake": g.wake_raw,
                 "virtual": g.virtual_label,
                 "start_killed": g.start_killed,
+                "wake_on_lock": g.wake_on_lock,
             }
             for g in cfg.groups
         ]
@@ -1081,27 +1153,22 @@ class KbKill:
     def _preview(self, cfg: Config) -> dict:
         """`matches`: per group of `cfg`, the devices it would grab.
         `wakeable`: per group, whether some device can type its wake hotkey
-        (else start_killed is refused). Pointers the live config does not
-        watch are opened just for this, then closed."""
-        want_pointers = any(g.pointers or g.devices for g in cfg.groups)
+        (else it can be neither started killed nor killed). Devices `cfg`
+        would read that the live config does not are opened just for this,
+        then closed."""
+        keys = hotkey_keys(cfg.groups)
         devices = {
-            p: d
-            for p, d in self.devices.items()
-            if is_keyboard(d) or (want_pointers and is_pointer(d))
+            p: d for p, d in self.devices.items() if watched(d, cfg.groups, keys)
         }
         opened: list[InputDevice] = []
         try:
-            # Every keyboard is watched already; only pointers can be missing.
-            unwatched = (
-                set(list_devices()) - self.devices.keys() if want_pointers else ()
-            )
-            for path in sorted(unwatched):
+            for path in sorted(set(list_devices()) - self.devices.keys()):
                 try:
                     dev = InputDevice(path)
                 except (OSError, SystemError):  # SystemError: unplugged mid-open
                     continue
                 opened.append(dev)
-                if is_pointer(dev) or is_keyboard(dev):
+                if watched(dev, cfg.groups, keys):
                     devices[path] = dev
             fronting = fronting_map(devices)
             copy_of = {copy: devices[hw].name for hw, (copy, _d) in fronting.items()}
@@ -1208,14 +1275,33 @@ class KbKill:
         self._sync_latches(held)
 
     def _can_self_wake(self, group: Group) -> bool:
-        caps: set[int] = set()
-        for d in group.targets.values():
-            caps |= set(d.capabilities().get(ecodes.EV_KEY, []))
-        return all(token & caps for token in group.wake_combo)
+        return self._can_wake(group, group.targets)
 
-    def _set_killed(self, group: Group, killed: bool, how: str) -> None:
+    def _set_killed(self, group: Group, killed: bool, how: str) -> bool:
+        """False when a kill is refused: no device can type the group's wake
+        hotkey, so nothing but a reboot or logout would wake it."""
+        via = {
+            "control": " (via control)",
+            "lock": " (screen locked)",
+            "unlock": " (screen unlocked)",
+            "start": " (start_killed)",
+        }.get(how, "")
+        if killed and not self._can_wake(group):
+            log_state(
+                f"[{group.name}] not killed: {UNWAKEABLE}{via}",
+                PRI_WARN,
+            )
+            self._tell_live(
+                {
+                    "type": "refused",
+                    "group": group.name,
+                    "label": group.label or group.name,
+                    "reason": UNWAKEABLE,
+                }
+            )
+            return False
         group.killed = killed
-        via = " (via control)" if how == "control" else ""
+        group.lock_woken = False  # any change supersedes the lock's; _on_locked re-marks
         if killed:
             if not group.targets:
                 self._once(
@@ -1233,6 +1319,7 @@ class KbKill:
         else:
             log_state(f"[{group.name}] awake{via}")
         self._maybe_broadcast()
+        return True
 
     # -- events --------------------------------------------------------------- #
     def _process(self, path: str, event) -> None:
@@ -1425,6 +1512,7 @@ class KbKill:
         ):
             CTRL_LOG.emit(f"uid {uid} disconnected; dropping its pushed config")
             self._saved.discard(uid)
+            self._locked.discard(uid)
             if uid == self.live_uid:
                 self._reevaluate_live()
 
@@ -1480,6 +1568,12 @@ class KbKill:
                     conn, {"type": "error", "error": "check_config needs 'toml'"}
                 )
             return
+        if cmd == "locked":  # any uid; wakes only that uid's own groups
+            self._on_locked(uid)
+            return
+        if cmd == "unlocked":  # any uid; kills only what that uid's lock woke
+            self._on_unlocked(uid)
+            return
         if uid not in (0, self.live_uid):
             CTRL_LOG.emit(
                 f"control: rejected {cmd!r} from uid {uid} (not the live user)",
@@ -1506,7 +1600,15 @@ class KbKill:
                 return
             want = {"kill": True, "wake": False, "toggle": not group.killed}[cmd]
             if want != group.killed:
-                self._set_killed(group, want, "control")
+                if not self._set_killed(group, want, "control"):
+                    self._send(
+                        conn,
+                        {
+                            "type": "error",
+                            "error": f"not killed: {UNWAKEABLE}",
+                        },
+                    )
+                    return
                 self._reconcile_grabs()
         else:
             self._send(conn, {"type": "error", "error": f"unknown command {cmd!r}"})
@@ -1518,10 +1620,14 @@ class KbKill:
         if sig == self._last_sig:
             return
         self._last_sig = sig
-        state = self._state_dict()
+        self._tell_live(self._state_dict())
+
+    def _tell_live(self, msg: dict) -> None:
+        """Send `msg` to the live user's (and root's) clients only: group
+        names and labels are theirs to see."""
         for conn, info in list(self.clients.items()):
             if info["uid"] in (0, self.live_uid):
-                self._send(conn, state)
+                self._send(conn, msg)
 
     # -- main loop ------------------------------------------------------------ #
     def _watch(self, path: str, mask: int, tag: object) -> None:

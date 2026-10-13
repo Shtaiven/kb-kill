@@ -110,6 +110,7 @@ installing this on your system; never run scripts you don't trust.
   Its on-screen display comes from the shell itself on GNOME and KDE; on COSMIC,
   sway and other wlroots compositors it needs `gtk-layer-shell` (GTK 3), and
   without it nothing pops.
+- `wake_on_lock` needs `gdbus` (GLib; on nearly every desktop already).
 - The settings window `kb-kill-config` (optional) needs GTK 4, libadwaita ≥ 1.5
   and `tomlkit`. Without them it opens `kb-kill.toml` in a text editor instead.
   The `.deb`/`.rpm` pull all of these in as weak dependencies; the commands
@@ -228,34 +229,85 @@ together. The old name `virtual_keyboard` is accepted as a deprecated alias.
 
 - Each **`[groups.<name>]`** table is a group. `virtual` is per group and not
   inherited. An optional `label = "…"` is the display name the tray shows.
+
 - The **top level** holds only `kill_combo`/`wake_combo`: the default hotkeys
   every group inherits when it sets none. Group keys there (`keyboards`,
   `label`, `virtual`, …) are a config error; older kb-kill read them as a
   "default" group, and they now belong in a `[groups.<name>]` table
   (`[groups.default]` keeps the old name).
+
 - `start_killed = true` (per group, not inherited) starts the group **killed**
   when you log in (not when you switch back to a session that is already
   running), and whenever the config is saved.
+
 - **Sleep, lid close and lock keep state.** A group killed before stays killed
   after, and an awake one stays awake. logind may report the seat idle for a
   moment across these; the daemon lets go of the grabs meanwhile and takes them
   back when you return. Only a save, a login, a hotkey or a tray/control call
-  changes a group's state.
+  changes a group's state, and `wake_on_lock`.
+
+- `wake_on_lock = true` (per group, not inherited) wakes the group when your
+  screen locks, so a killed keyboard can type your password on the lock
+  screen, and kills it again when you unlock. Sleep is not a lock: a desktop
+  that locks on suspend wakes the group through its lock, and one that does
+  not leaves it killed. A
+  hotkey, tray or save in between wins: the unlock then leaves the group as
+  you set it. A save while the screen is locked does not kill a
+  `start_killed` group with `wake_on_lock` behind the lock screen; it is
+  killed at the unlock. `kb-kill-push` watches logind for this, using `gdbus` from
+  GLib: the session's `Lock`/`Unlock` signals and its `LockedHint` (GNOME
+  and KDE set it). COSMIC
+  sets no `LockedHint` and tells logind nothing on unlock, so there the
+  locker's `$XDG_RUNTIME_DIR/cosmic-greeter-<session>.lock` file counts too.
+  A locker that reports neither leaves the group awake after unlock. When you
+  switch to another user, a desktop that locks the session you leave wakes the
+  group too.
+
+  wlroots lockers (swaylock, hyprlock, gtklock, waylock) and swayidle/hypridle
+  set no `LockedHint`, so the unlock goes unseen. Set it around the locker
+  yourself, e.g. in a script your idle daemon runs as its lock command:
+
+  ```sh
+  #!/bin/sh
+  hint() {
+      busctl call org.freedesktop.login1 /org/freedesktop/login1/session/auto \
+          org.freedesktop.login1.Session SetLockedHint b "$1"
+  }
+  hint true
+  swaylock && hint false
+  ```
+
+  Keep the `&&`: the locker exits 0 only on a real unlock, and clearing the
+  hint after a crash would kill the keyboard again behind a still-locked
+  screen. The `lockhinter` crate does the same as a wrapper around the locker.
+
 - **Saving is a restart:** every change to the file (kb-kill-push re-sends it)
   starts every group awake again, except the `start_killed` ones, which start
   killed. A daemon or `kb-kill-push` restart mid-session starts everything
   awake (the daemon counts a session as a fresh login only if logind created it
   in the last two minutes).
-- A group is never started killed when no device the daemon reads can type its
-  wake hotkey: that would disable input at every login with no way back. The
-  journal says so, and the settings window warns on the group's **Start
-  killed** switch.
+
+- A group is never killed when no device the daemon reads can type its wake
+  hotkey, neither at login (`start_killed`) nor by its kill hotkey or the tray:
+  there would be no way back short of logging out. The journal says so
+  (`not killed: no device can type its wake hotkey`), the tray shows it as a
+  warning on-screen display, and the settings window warns on the group's
+  **Start killed** switch. The daemon reads every keyboard,
+  pointers when a group targets them, and any other device that has a key or
+  button some hotkey names: a mouse button in a keyboard group's wake hotkey,
+  or a media key on a keyboard's separate "Consumer Control" device. A device
+  read only for a hotkey key is never a target; it only types the hotkey.
+
 - Limits: at most 64 groups, and 16 keys per hotkey.
+
 - A group **name** is up to 32 characters of letters, digits, space, `.`, `_`, `-`
   (it appears in log lines). A label is up to 64 printable characters.
+
 - TOML rule: top-level keys come **before** any `[groups.*]` table.
+
 - Groups sharing a combo toggle together. `kill_combo == wake_combo` makes a
   single toggle hotkey.
+
 - Hotkeys fire on the **press** that completes the combo, never while it is held,
   so you can keep the modifiers down and tap one group's key, then another's.
 
@@ -440,9 +492,12 @@ defaults above.
 
 The socket is a small newline-delimited JSON protocol if you want to script it:
 `{"cmd":"kill|wake|toggle","group":"<name>"}`, `{"cmd":"status"}`,
-`{"cmd":"devices","all":true}`; the daemon replies and broadcasts
+`{"cmd":"devices","all":true}`, `{"cmd":"locked"}` and `{"cmd":"unlocked"}`
+(from any user with a config: wake that user's `wake_on_lock` groups, then
+kill again what the lock woke); the daemon replies and broadcasts
 `{"type":"state","groups":[{name,label,killed,targets,kill,wake,kill_codes,wake_codes}]}`
-to the active user's clients on every change. Config is delivered the same way
+to the active user's clients on every change, and
+`{"type":"refused","group","label","reason"}` when it refuses a kill. Config is delivered the same way
 (`{"cmd":"set_config","toml":"…"}`, what `kb-kill-push` sends), and
 `{"cmd":"check_config","toml":"…"}` parses a candidate without applying it,
 replying `{"type":"config_check","ok":…,"error":…,"warnings":[…],"groups":[…]}`
@@ -482,7 +537,8 @@ keycodes arrive.
 
 ## Security model
 
-kb-kill reads all keyboard input (and mouse buttons, for pointer groups), so it
+kb-kill reads all keyboard input (and mouse buttons, for pointer groups, and
+key events of any other device that has a key a hotkey names), so it
 is keylogger-*capable*. The design minimizes and contains that:
 
 - **No keystroke content is ever stored or transmitted.** The daemon keeps only

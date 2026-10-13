@@ -368,6 +368,7 @@ class Group:
     wake: str = ""
     virtual: str = "auto"  # "auto" | "true" | "false"
     start_killed: bool = False
+    wake_on_lock: bool = False
     key: str = field(default_factory=lambda: f"g{next(_keys)}")
 
     def matchers(self, name: str) -> list[str]:
@@ -382,6 +383,7 @@ class Group:
             self.wake.strip(),
             self.virtual,
             self.start_killed,
+            self.wake_on_lock,
         )
 
 
@@ -414,7 +416,14 @@ class TopLevelGroupError(ValueError):
 
 
 # Keys that only make sense in a [groups.<name>] table.
-GROUP_ONLY_KEYS = (*MATCH_KEYS, "label", "virtual", "virtual_keyboard", "start_killed")
+GROUP_ONLY_KEYS = (
+    *MATCH_KEYS,
+    "label",
+    "virtual",
+    "virtual_keyboard",
+    "start_killed",
+    "wake_on_lock",
+)
 
 
 def _names(value: object) -> list[str]:
@@ -439,6 +448,7 @@ def _group_from(name: str, table: dict, orig: str | None) -> Group:
         wake=str(table.get("wake_combo") or ""),
         virtual="true" if virtual is True else "false" if virtual is False else "auto",
         start_killed=table.get("start_killed") is True,
+        wake_on_lock=table.get("wake_on_lock") is True,
     )
 
 
@@ -515,6 +525,8 @@ def _write_fields(container, old: Group, new: Group) -> None:
         )
     if old.start_killed != new.start_killed:
         _set(container, "start_killed", True if new.start_killed else None)
+    if old.wake_on_lock != new.wake_on_lock:
+        _set(container, "wake_on_lock", True if new.wake_on_lock else None)
     _write_combos(container, old.kill, old.wake, new.kill, new.wake)
 
 
@@ -877,7 +889,8 @@ class ComboRow(Adw.EntryRow):
 
 
 def group_details(win: "ConfigWindow", group: Group) -> list[Adw.PreferencesGroup]:
-    """Matchers, startup state and remapper choice for one group's page."""
+    """Matchers, startup and lock behavior, and remapper choice for one
+    group's page."""
     out: list[Adw.PreferencesGroup] = [MatcherList(win, group, m) for m in MATCH_KEYS]
     startup = Adw.PreferencesGroup(title="Startup")
     start = Adw.SwitchRow(
@@ -894,6 +907,21 @@ def group_details(win: "ConfigWindow", group: Group) -> list[Adw.PreferencesGrou
     startup.add(start)
     out.append(startup)
     startup.start_row = start  # GroupPage.show_wakeable() warns on it
+    lock = Adw.PreferencesGroup(title="Lock screen")
+    wake = Adw.SwitchRow(
+        title="Wake on lock",
+        subtitle="Wake this group when the screen locks, so it can type your "
+        "password; kill it again on unlock",
+        active=group.wake_on_lock,
+    )
+
+    def wake_toggled(row, _pspec) -> None:
+        group.wake_on_lock = row.get_active()
+        win.changed()
+
+    wake.connect("notify::active", wake_toggled)
+    lock.add(wake)
+    out.append(lock)
     advanced = Adw.PreferencesGroup(title="Remappers")
     choice = Adw.ComboRow(
         title="Remapped Devices",
@@ -1006,14 +1034,14 @@ class GroupPage(Adw.PreferencesPage):
 
     def show_wakeable(self, wakeable: bool | None) -> None:
         """Say on the Start killed switch when the wake hotkey cannot be typed:
-        the daemon would then refuse to start the group killed."""
+        the daemon would then refuse to kill the group, at login or by hotkey."""
         row = self._start_row
         if row is None:
             return
         if wakeable is False:
             row.set_subtitle(
-                "No device can type this group's wake hotkey, so it will not "
-                "start killed"
+                "No device can type this group's wake hotkey, so it cannot be "
+                "killed"
             )
             row.add_css_class("warning")
         else:
