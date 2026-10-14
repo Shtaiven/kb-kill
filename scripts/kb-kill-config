@@ -701,7 +701,11 @@ class RecordDialog(Adw.Dialog):
 # --------------------------------------------------------------------------- #
 MATCHER_INFO = {
     "keyboards": ("Keyboards", "Keyboard-class devices, by name or glob", "kbd"),
-    "pointers": ("Pointers", "Mice, trackballs and touchpads, by name or glob", "ptr"),
+    "pointers": (
+        "Pointers",
+        "Mice, touchpads, touchscreens, joysticks: anything with X/Y motion",
+        "ptr",
+    ),
     "devices": ("Any Device", "Keyboards and pointers alike, by name or glob", None),
 }
 VIRTUAL_CHOICES = [

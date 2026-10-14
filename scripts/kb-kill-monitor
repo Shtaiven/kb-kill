@@ -70,7 +70,7 @@ def is_key_device(dev: InputDevice) -> bool:
     """Keyboards and pointers (anything with keys or buttons we care about)."""
     keys = dev.capabilities().get(ecodes.EV_KEY, [])
     return (
-        ecodes.KEY_ENTER in keys or ecodes.BTN_LEFT in keys or ecodes.BTN_MOUSE in keys
+        ecodes.KEY_ENTER in keys or ecodes.BTN_LEFT in keys or ecodes.BTN_TOUCH in keys
     )
 
 

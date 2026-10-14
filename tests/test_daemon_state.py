@@ -71,10 +71,13 @@ keyboards = "Laptop Keyboard"
 class FakeDev:
     """An evdev InputDevice as far as the daemon uses one."""
 
-    def __init__(self, name: str, keys: list[int] = KEYS, rel: bool = False) -> None:
+    def __init__(
+        self, name: str, keys: list[int] = KEYS, rel: bool = False, abs_: bool = False
+    ) -> None:
         self.name, self.phys = name, f"phys/{name}"
         self._keys = list(keys)
         self._rel = rel  # relative motion: a mouse
+        self._abs = abs_  # absolute X/Y: a touch surface, joystick, accelerometer
         self._r, self._w = os.pipe()  # a real fd, so the selector accepts it
         self.fd = self._r
         self.held: set[int] = set()
@@ -83,10 +86,12 @@ class FakeDev:
     def fileno(self) -> int:
         return self._r
 
-    def capabilities(self) -> dict[int, list[int]]:
+    def capabilities(self, absinfo: bool = True) -> dict[int, list[int]]:
         caps = {ecodes.EV_KEY: self._keys}
         if self._rel:
             caps[ecodes.EV_REL] = [ecodes.REL_X, ecodes.REL_Y]
+        if self._abs:
+            caps[ecodes.EV_ABS] = [ecodes.ABS_X, ecodes.ABS_Y]
         return caps
 
     def active_keys(self) -> list[int]:
@@ -166,9 +171,14 @@ class DaemonTest(unittest.TestCase):
 
     # -- the world ------------------------------------------------------------ #
     def plug(
-        self, path: str, name: str, keys: list[int] = KEYS, rel: bool = False
+        self,
+        path: str,
+        name: str,
+        keys: list[int] = KEYS,
+        rel: bool = False,
+        abs_: bool = False,
     ) -> FakeDev:
-        dev = FakeDev(name, keys, rel)
+        dev = FakeDev(name, keys, rel, abs_)
         self.made.append(dev)
         self.world[path] = dev
         return dev
@@ -843,6 +853,47 @@ class WakeHint(DaemonTest):
         self.assertGrabbed(USB)
         self.mash(LAPTOP, d.WAKE_HINT_PRESSES)
         self.assertEqual(self.hints(), [])
+
+
+TOUCH, STICK, TILT = "/dev/input/event11", "/dev/input/event12", "/dev/input/event13"
+
+POINTERS = """\
+[groups.a]
+pointers = "*"
+kill_combo = "ctrl+alt+k"
+wake_combo = "ctrl+alt+u"
+"""
+
+
+class Pointers(DaemonTest):
+    """What `pointers` targets: relative or absolute X/Y motion."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.plug(MOUSE, "Some Mouse", [ecodes.BTN_LEFT], rel=True)
+        self.plug(TOUCH, "Some Touchscreen", [ecodes.BTN_TOUCH], abs_=True)
+        self.plug(VIDEO, "Buttonless Trackball", [], rel=True)
+        self.plug(STICK, "Some Joystick", [ecodes.BTN_TRIGGER], abs_=True)
+        self.plug(TILT, "Some Accelerometer", [], abs_=True)
+        self.plug(MEDIA, "USB Keyboard Consumer Control", [ecodes.KEY_MUTE])
+        self.boot()
+        self.activate("2", ALICE)
+        self.push(ALICE, POINTERS)
+
+    def test_kill_grabs_everything_with_x_y_motion(self) -> None:
+        self.press(LAPTOP, KILL_A)
+        self.assertState(a=True)
+        self.assertGrabbed(MOUSE, TOUCH, VIDEO, STICK, TILT)  # no keyboard, no media
+        self.press(LAPTOP, WAKE)
+        self.assertState(a=False)
+        self.assertGrabbed()
+
+    def test_grab_waits_for_a_finger_to_lift(self) -> None:
+        self.key(TOUCH, ecodes.BTN_TOUCH, 1)
+        self.press(LAPTOP, KILL_A)
+        self.assertGrabbed(MOUSE, VIDEO, STICK, TILT)
+        self.key(TOUCH, ecodes.BTN_TOUCH, 0)
+        self.assertGrabbed(MOUSE, TOUCH, VIDEO, STICK, TILT)
 
 
 class PushRestart(DaemonTest):

@@ -621,15 +621,16 @@ def is_keyboard(dev: InputDevice) -> bool:
 
 
 def is_pointer(dev: InputDevice) -> bool:
-    """A mouse button plus relative motion (mouse) or a touch surface (touchpad)."""
-    caps = dev.capabilities()
-    keys = caps.get(ecodes.EV_KEY, [])
-    rel = caps.get(ecodes.EV_REL, [])
-    has_button = ecodes.BTN_LEFT in keys or ecodes.BTN_MOUSE in keys
-    has_motion = (
-        ecodes.REL_X in rel and ecodes.REL_Y in rel
-    ) or ecodes.BTN_TOUCH in keys
-    return has_button and has_motion
+    """X/Y motion, relative (mouse, trackball, even a buttonless one) or
+    absolute (touchpad, touchscreen, pen tablet, joystick, accelerometer)."""
+    caps = dev.capabilities(absinfo=False)
+    return any(
+        x in axes and y in axes
+        for axes, x, y in (
+            (caps.get(ecodes.EV_REL, []), ecodes.REL_X, ecodes.REL_Y),
+            (caps.get(ecodes.EV_ABS, []), ecodes.ABS_X, ecodes.ABS_Y),
+        )
+    )
 
 
 def is_virtual(dev: InputDevice) -> bool:
@@ -1765,7 +1766,7 @@ class KbKill:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="kb-kill-daemon",
-        description="Disable/enable input devices (keyboards, mice, touchpads) on a global hotkey.",
+        description="Disable/enable input devices (keyboards, mice, touchpads, touchscreens, joysticks) on a global hotkey.",
     )
     parser.add_argument("command", nargs="?", choices=["run"], help=argparse.SUPPRESS)
     parser.add_argument(
