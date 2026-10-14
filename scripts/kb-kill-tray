@@ -89,6 +89,7 @@ def socket_path() -> str:
 
 # -- on-screen display -------------------------------------------------------- #
 OSD_SECONDS = 1.6
+WAKE_HINT_SECONDS = 5.0  # long enough to read a hotkey off the screen
 OSD_MARGIN = 96  # px clear of the bottom edge, so a dock does not cover it
 OSD_MARGIN_MAX = 2000  # a typo in the config must not park the OSD off-screen
 OSD_OPACITY = 0.92
@@ -117,22 +118,28 @@ def tray_config_path() -> str:
     return os.path.expanduser("~/.config/kb-kill/tray.toml")
 
 
-def load_settings() -> tuple[bool, int, float]:
+def load_settings() -> tuple[bool, int, float, bool]:
     """Defaults for whatever the file leaves out, gets wrong or puts out of
     range: a hand-edited file is never a reason to leave the tray silent."""
-    enabled, margin, opacity = True, OSD_MARGIN, OSD_OPACITY
+    enabled, margin, opacity, wake_hint = True, OSD_MARGIN, OSD_OPACITY, True
     try:
         with open(tray_config_path(), "rb") as fh:
             doc = tomllib.load(fh)
     except (OSError, tomllib.TOMLDecodeError, ValueError):
-        return enabled, margin, opacity
+        return enabled, margin, opacity, wake_hint
     enabled = bool(doc.get("osd", enabled))
+    wake_hint = bool(doc.get("wake_hint", wake_hint))
     raw_margin, raw_opacity = doc.get("osd_margin"), doc.get("osd_opacity")
     if _finite(raw_margin):
         margin = max(0, min(round(raw_margin), OSD_MARGIN_MAX))
     if _finite(raw_opacity):
         opacity = max(0.0, min(float(raw_opacity), 1.0))
-    return enabled, margin, opacity
+    return enabled, margin, opacity, wake_hint
+
+
+def pretty_combo(spec: str) -> str:
+    """ctrl+alt+u -> Ctrl+Alt+U, for a person reading it off the screen."""
+    return "+".join(t.strip().capitalize() for t in spec.split("+") if t.strip())
 
 
 def _finite(value: object) -> TypeGuard[int | float]:
@@ -182,7 +189,7 @@ class Osd:
     """
 
     def __init__(self) -> None:
-        self.enabled, self._margin, self._opacity = load_settings()
+        self.enabled, self._margin, self._opacity, _ = load_settings()
         if icons := icon_dir():
             # Our own window resolves ICON_* through the theme, not a set path.
             Gtk.IconTheme.get_default().append_search_path(icons)
@@ -194,6 +201,7 @@ class Osd:
         self._radius = OSD_RADIUS
         self._rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self._timer = 0
+        self._seconds = OSD_SECONDS
 
     def apply(self, enabled: bool, margin: int, opacity: float) -> bool:
         """Take new settings from tray.toml onto a live window. True when the
@@ -217,10 +225,14 @@ class Osd:
             self._searched, self._backend = True, self._pick()
         return self._backend is not None
 
-    def show(self, entries: list[tuple[str, str]]) -> None:
+    def show(
+        self, entries: list[tuple[str, str]], seconds: float = OSD_SECONDS
+    ) -> None:
         """One card per entry, stacked. The shell-provided OSDs own a single
-        widget, so there they collapse into one line instead."""
+        widget, so there they collapse into one line instead, and keep their
+        own timeout: `seconds` is for the display we draw ourselves."""
         if entries and self.enabled and self.available() and self._backend is not None:
+            self._seconds = seconds
             self._backend(entries)
 
     # -- backend selection ---------------------------------------------------- #
@@ -332,7 +344,7 @@ class Osd:
         win.show_all()
         if self._timer:
             GLib.source_remove(self._timer)
-        self._timer = GLib.timeout_add(int(OSD_SECONDS * 1000), self._hide)
+        self._timer = GLib.timeout_add(int(self._seconds * 1000), self._hide)
 
     def _hide(self) -> bool:
         self._timer = 0
@@ -401,7 +413,9 @@ class Tray:
         self.osd = Osd()
         self._killed: dict[str, bool] | None = None
         self._pending: dict[str, tuple[str, str]] = {}  # group -> (icon, text)
+        self._pending_seconds = OSD_SECONDS  # longer when a wake hint is queued
         self._osd_timer = 0
+        self.wake_hint = load_settings()[3]
         self._settings_timer = 0
         self._settings_monitor = self._watch_settings()
         self._render()
@@ -462,6 +476,8 @@ class Tray:
                 self._schedule_render()
             elif msg.get("type") == "refused":
                 self._osd_refused(msg)
+            elif msg.get("type") == "wake_hint":
+                self._osd_wake_hint(msg)
         return True
 
     def _send(self, obj: dict[str, str]) -> None:
@@ -506,18 +522,37 @@ class Tray:
             name = msg.get("label") if isinstance(msg.get("label"), str) else group
             self._queue_osd(group, ICON_WARNING, f"{name} not killed: {reason}")
 
-    def _queue_osd(self, group: str, icon: str, text: str) -> None:
+    def _osd_wake_hint(self, msg: dict) -> None:
+        """Someone keeps pressing a killed device: show how to wake it, for
+        whoever forgot (or panicked). The daemon sends at most one per group
+        per cooldown."""
+        group, wake = msg.get("group"), msg.get("wake")
+        if self.wake_hint and isinstance(group, str) and isinstance(wake, str):
+            name = msg.get("label") if isinstance(msg.get("label"), str) else group
+            self._queue_osd(
+                group,
+                ICON_KILLED,
+                f"{name} is killed · press {pretty_combo(wake)} to wake",
+                WAKE_HINT_SECONDS,
+            )
+
+    def _queue_osd(
+        self, group: str, icon: str, text: str, seconds: float = OSD_SECONDS
+    ) -> None:
         self._pending[group] = (icon, text)
+        self._pending_seconds = max(self._pending_seconds, seconds)
         if not self._osd_timer:
             self._osd_timer = GLib.timeout_add(OSD_COALESCE_MS, self._flush_osd)
 
     def _flush_osd(self) -> bool:
         self._osd_timer = 0
         pending, self._pending = self._pending, {}
+        seconds, self._pending_seconds = self._pending_seconds, OSD_SECONDS
         # In the groups' order; one gone since it was queued goes last.
         self.osd.show(
             [pending.pop(g["name"]) for g in self.groups if g["name"] in pending]
-            + list(pending.values())
+            + list(pending.values()),
+            seconds,
         )
         return False  # one-shot timer
 
@@ -642,7 +677,8 @@ class Tray:
 
     def _reload_settings(self) -> bool:
         self._settings_timer = 0
-        if self.osd.apply(*load_settings()):
+        *osd, self.wake_hint = load_settings()
+        if self.osd.apply(*osd):
             self.osd.show([(ICON_AWAKE, "On-screen display")])
         return False  # one-shot timer
 

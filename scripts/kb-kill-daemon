@@ -36,6 +36,7 @@ import struct
 import sys
 import time
 import tomllib
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 
@@ -86,6 +87,11 @@ MODIFIER_ALIASES: dict[str, frozenset[int]] = {
 
 RESCAN_INTERVAL = 10.0  # backstop only; inotify on /dev/input drives rescans
 FRONTED_GRACE = 10.0  # leave fronted hardware alone this long after its copy vanishes
+# Presses on a killed device that make the tray show how to wake it: this many
+# within the window, then at most one hint per group per cooldown.
+WAKE_HINT_PRESSES = 6
+WAKE_HINT_WINDOW = 3.0
+WAKE_HINT_COOLDOWN = 10.0
 MAX_CLIENTS = 16
 MAX_CONNS_PER_UID = 8  # push + tray, plus restart overlap
 MAX_LINE = 65536  # bytes buffered per client before a newline
@@ -338,6 +344,9 @@ class Group:
         self.lock_woken = False  # killed until the lock woke it: unlock kills again
         self.kill_held = False  # edge latches; see KbKill._toggle_groups
         self.wake_held = False
+        # recent presses on its grabbed targets; see KbKill._count_dead_press
+        self.presses: deque[float] = deque(maxlen=WAKE_HINT_PRESSES)
+        self.hint_after = 0.0  # no wake hint before this (monotonic)
 
     @property
     def virtual_label(self) -> str:
@@ -1301,6 +1310,7 @@ class KbKill:
             )
             return False
         group.killed = killed
+        group.presses.clear()  # a fresh kill counts from zero
         group.lock_woken = (
             False  # any change supersedes the lock's; _on_locked re-marks
         )
@@ -1334,12 +1344,40 @@ class KbKill:
         pressed = self.pressed[path]
         if event.value == 1:
             pressed.add(event.code)
+            if path in self.grabbed:
+                self._count_dead_press(path)
         else:
             pressed.discard(event.code)
         held = self._global_pressed()
         self._toggle_groups(held)  # on up as well as down: a release re-arms the latch
         self._debug_progress(held, path)
         self._reconcile_grabs()
+
+    def _count_dead_press(self, path: str) -> None:
+        """Someone keeps pressing a killed device: tell the tray, which shows
+        how to wake it. Never journaled, only to the live user's clients, and
+        at most once per group per WAKE_HINT_COOLDOWN, so never at key rate.
+        Only grabbed devices count: a deferred grab still reaches the OS."""
+        now = time.monotonic()
+        for g in self.groups:
+            if not g.killed or path not in g.targets:
+                continue
+            g.presses.append(now)
+            if (
+                len(g.presses) == WAKE_HINT_PRESSES
+                and now - g.presses[0] <= WAKE_HINT_WINDOW
+                and now >= g.hint_after
+            ):
+                g.presses.clear()
+                g.hint_after = now + WAKE_HINT_COOLDOWN
+                self._tell_live(
+                    {
+                        "type": "wake_hint",
+                        "group": g.name,
+                        "label": g.label or g.name,
+                        "wake": g.wake_raw,
+                    }
+                )
 
     def _resync(self, path: str) -> None:
         """The kernel dropped queued events: reload this device's held keys and
