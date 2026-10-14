@@ -188,11 +188,14 @@ metacharacter is a **glob**:
 | `"Logitech {MX*,USB Keyboard}"` | `{a,b}` either alternative (braces may nest)                        |
 | `"*"`                           | every device of that class                                          |
 
-| field       | matches                                                                                                        |
-| ----------- | -------------------------------------------------------------------------------------------------------------- |
-| `keyboards` | keyboard-class devices only                                                                                    |
-| `pointers`  | anything with X/Y motion: mice, trackballs, touchpads, touchscreens, pens, joysticks, gamepads, accelerometers |
-| `devices`   | keyboards and pointers alike, whichever class                                                                  |
+| field       | matches                                                                                                       |
+| ----------- | ------------------------------------------------------------------------------------------------------------- |
+| `keyboards` | anything with keys: keyboards, numpads, macro pads, pedals, presenters, remotes, media and power-button keys  |
+| `pointers`  | X/Y motion or keyless axes: mice, trackballs, touchpads, touchscreens, pens, joysticks, dials, accelerometers |
+| `devices`   | keyboards and pointers alike, whichever class                                                                 |
+
+Switches (lid, tablet mode, headphone jack) are in neither class and are never
+grabbed.
 
 At least one field is required; set several to target them together. A pointer
 group can **self-wake** if its `wake_combo` is a mouse-button combo; otherwise
@@ -293,11 +296,11 @@ together. The old name `virtual_keyboard` is accepted as a deprecated alias.
   there would be no way back short of logging out. The journal says so
   (`not killed: no device can type its wake hotkey`), the tray shows it as a
   warning on-screen display, and the settings window warns on the group's
-  **Start killed** switch. The daemon reads every keyboard,
-  pointers when a group targets them, and any other device that has a key or
-  button some hotkey names: a mouse button in a keyboard group's wake hotkey,
-  or a media key on a keyboard's separate "Consumer Control" device. A device
-  read only for a hotkey key is never a target; it only types the hotkey.
+  **Start killed** switch. The daemon reads every keyboard (any
+  device with keys), pointers when a group targets them, and any other device that has a
+  button some hotkey names (a mouse button in a keyboard group's wake hotkey).
+  A device read only for a hotkey button is never a target; it only types the
+  hotkey.
 
 - Limits: at most 64 groups, and 16 keys per hotkey.
 
@@ -547,9 +550,10 @@ keycodes arrive.
 
 ## Security model
 
-kb-kill reads all keyboard input (and the buttons and touch contacts of pointers, for pointer groups, and
-key events of any other device that has a key a hotkey names), so it
-is keylogger-*capable*. The design minimizes and contains that:
+kb-kill reads the key events of every device that has keys (keyboards, but
+also media and power keys, numpads, pedals and remotes), the buttons and touch
+contacts of pointers for pointer groups, and the buttons of any other device a
+hotkey names, so it is keylogger-*capable*. The design minimizes and contains that:
 
 - **No keystroke content is ever stored or transmitted.** The daemon keeps only
   the set of keys *currently held*, discarded on release. Pointer motion, touch

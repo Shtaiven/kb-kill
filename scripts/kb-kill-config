@@ -700,10 +700,14 @@ class RecordDialog(Adw.Dialog):
 # Group editing widgets
 # --------------------------------------------------------------------------- #
 MATCHER_INFO = {
-    "keyboards": ("Keyboards", "Keyboard-class devices, by name or glob", "kbd"),
+    "keyboards": (
+        "Keyboards",
+        "Anything with keys: keyboards, numpads, pedals, remotes, media keys",
+        "kbd",
+    ),
     "pointers": (
         "Pointers",
-        "Mice, touchpads, touchscreens, joysticks: anything with X/Y motion",
+        "Anything that moves: mice, touchscreens, joysticks, dials, pedals",
         "ptr",
     ),
     "devices": ("Any Device", "Keyboards and pointers alike, by name or glob", None),
@@ -3076,8 +3080,8 @@ class ConfigWindow(Adw.ApplicationWindow):
             return [], f"No device list: {error}"
         seen: dict[str, str] = {}
         for d in reply.get("devices", []):
-            # kb-kill only watches keyboards and pointers: a headphone jack or
-            # a video bus could be matched but never disabled, so not offered.
+            # kb-kill only watches keyboards and pointers: a lid switch or a
+            # headphone jack could be matched but never disabled, so not offered.
             if d.get("class") not in ((cls,) if cls else ("kbd", "ptr")):
                 continue
             name = d.get("name") or ""
