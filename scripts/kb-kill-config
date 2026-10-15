@@ -1146,24 +1146,26 @@ TRAY_TEMPLATE = """\
 osd = true
 osd_margin = 96  # px above the bottom of the screen
 osd_opacity = 0.92  # 0.0 clear .. 1.0 solid
+wake_hint = true  # show how to wake a killed device when someone keeps typing on it
 """
 
 
-def load_tray_settings() -> tuple[bool, int, float]:
+def load_tray_settings() -> tuple[bool, int, float, bool]:
     """kb-kill-tray's load_settings: defaults for anything missing or wrong."""
-    enabled, margin, opacity = True, OSD_MARGIN, OSD_OPACITY
+    enabled, margin, opacity, wake_hint = True, OSD_MARGIN, OSD_OPACITY, True
     try:
         with open(tray_config_path(), "rb") as fh:
             doc = tomllib.load(fh)
     except (OSError, tomllib.TOMLDecodeError, ValueError):
-        return enabled, margin, opacity
+        return enabled, margin, opacity, wake_hint
     enabled = bool(doc.get("osd", enabled))
+    wake_hint = bool(doc.get("wake_hint", wake_hint))
     raw_margin, raw_opacity = doc.get("osd_margin"), doc.get("osd_opacity")
     if _finite(raw_margin):
         margin = max(0, min(round(raw_margin), OSD_MARGIN_MAX))
     if _finite(raw_opacity):
         opacity = max(0.0, min(float(raw_opacity), 1.0))
-    return enabled, margin, opacity
+    return enabled, margin, opacity, wake_hint
 
 
 def _finite(value: object) -> TypeGuard[int | float]:
@@ -1181,7 +1183,7 @@ class TrayPage(Adw.PreferencesPage):
         self._win = win
         self._timer = 0
         self._loading = False
-        enabled, margin, opacity = load_tray_settings()
+        enabled, margin, opacity, wake_hint = load_tray_settings()
 
         startup = Adw.PreferencesGroup(title="Startup")
         self._at_login = Adw.SwitchRow(
@@ -1203,6 +1205,15 @@ class TrayPage(Adw.PreferencesPage):
         )
         self._enabled = Adw.SwitchRow(title="Show On-Screen Display", active=enabled)
         osd.add(self._enabled)
+        self._wake_hint = Adw.SwitchRow(
+            title="Wake Hint",
+            subtitle="When someone keeps typing on a killed device, show how to wake it",
+            active=wake_hint,
+        )
+        self._enabled.bind_property(
+            "active", self._wake_hint, "sensitive", GObject.BindingFlags.SYNC_CREATE
+        )
+        osd.add(self._wake_hint)
         self.add(osd)
 
         look = Adw.PreferencesGroup(
@@ -1224,6 +1235,7 @@ class TrayPage(Adw.PreferencesPage):
         self.add(look)
 
         self._enabled.connect("notify::active", self._schedule)
+        self._wake_hint.connect("notify::active", self._schedule)
         self._margin.connect("notify::value", self._schedule)
         self._opacity.connect("notify::value", self._schedule)
         # Follow hand edits, so the next change here does not undo them.
@@ -1240,10 +1252,11 @@ class TrayPage(Adw.PreferencesPage):
 
     def load(self) -> None:
         """Show what tray.toml holds now, without writing it back."""
-        enabled, margin, opacity = load_tray_settings()
+        enabled, margin, opacity, wake_hint = load_tray_settings()
         self._loading = True
         try:
             self._enabled.set_active(enabled)
+            self._wake_hint.set_active(wake_hint)
             self._margin.set_value(margin)
             self._opacity.set_value(opacity)
         finally:
@@ -1288,6 +1301,7 @@ class TrayPage(Adw.PreferencesPage):
             self._win.toast(f"Not saved: fix tray.toml as text first ({e})")
             return False
         doc["osd"] = self._enabled.get_active()
+        doc["wake_hint"] = self._wake_hint.get_active()
         doc["osd_margin"] = int(self._margin.get_value())
         doc["osd_opacity"] = round(self._opacity.get_value(), 2)
         try:

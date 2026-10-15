@@ -469,6 +469,12 @@ On every toggle it also flashes an on-screen display near the bottom of the scre
 One hotkey can flip several groups at once, and each gets its own card, stacked
 (the daemon announces every edge separately, so the tray holds them together for
 a moment to show them as one stack).
+
+If someone keeps typing on a killed device (a few presses within a few
+seconds), the tray also shows how to wake it, for 5 seconds:
+"Laptop keyboard is killed · press Ctrl+Alt+U to wake". The hint pops at most
+once every 10 seconds per group, never reaches the journal, and can be turned
+off with **Wake Hint** on the settings window's **Tray** tab.
 There is no shared protocol for this, so the tray picks a backend at runtime:
 `org.gnome.Shell.ShowOSD` on GNOME, `org.kde.osdService` on KDE, and everywhere
 else a `gtk-layer-shell` surface it draws itself (mutter does not support
@@ -484,6 +490,7 @@ The file is plain TOML if you would rather edit it:
 osd = true          # show the on-screen display
 osd_margin = 96     # px above the bottom of the screen
 osd_opacity = 0.92  # 0.0 clear .. 1.0 solid
+wake_hint = true    # show how to wake a killed device that keeps being typed on
 ```
 
 Colours, font and (on COSMIC) corner radius come from the desktop, so only the
@@ -497,7 +504,9 @@ The socket is a small newline-delimited JSON protocol if you want to script it:
 kill again what the lock woke); the daemon replies and broadcasts
 `{"type":"state","groups":[{name,label,killed,targets,kill,wake,kill_codes,wake_codes}]}`
 to the active user's clients on every change, and
-`{"type":"refused","group","label","reason"}` when it refuses a kill. Config is delivered the same way
+`{"type":"refused","group","label","reason"}` when it refuses a kill, and
+`{"type":"wake_hint","group","label","wake"}` when a killed group's device
+keeps being pressed. Config is delivered the same way
 (`{"cmd":"set_config","toml":"…"}`, what `kb-kill-push` sends), and
 `{"cmd":"check_config","toml":"…"}` parses a candidate without applying it,
 replying `{"type":"config_check","ok":…,"error":…,"warnings":[…],"groups":[…]}`

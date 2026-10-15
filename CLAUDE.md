@@ -56,7 +56,9 @@ rebuild the package or re-run `./install.sh`.
   rate (timing alone leaks typing); state lines go through the global
   `STATE_LOG` bucket, config/device lines through `CTRL_LOG`; all text passes
   `_safe()`; group names/labels are charset-checked. Key-rate diagnostics go
-  only to a root client that sent `{"cmd":"debug"}`. `check_config` (any uid)
+  only to a root client that sent `{"cmd":"debug"}`. A `wake_hint` (presses on
+  a killed device) goes only to the live uid/root, at most once per group per
+  `WAKE_HINT_COOLDOWN`, and is never journaled. `check_config` (any uid)
   must log nothing: parser warnings go to the `warn` sink it passes, and back
   to the caller only. Its `matches` preview (device names, like `devices`) goes
   only to the live uid or root, and resolves through the same

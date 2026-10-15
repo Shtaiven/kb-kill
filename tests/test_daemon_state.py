@@ -775,6 +775,76 @@ class NoKillWithoutWay(DaemonTest):
         self.assertEqual(self.k._preview(cfg)["wakeable"], {"a": True})
 
 
+class WakeHint(DaemonTest):
+    """Someone keeps pressing a killed device: the tray is told how to wake it,
+    rate-limited, and the journal hears nothing. Group b starts killed, so
+    the USB keyboard is grabbed from login on."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.now = 1000.0
+        clock = mock.patch.object(d.time, "monotonic", lambda: self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+        self.login_alice()
+        self.assertGrabbed(USB)
+        self.sent.clear()
+        self.states.clear()
+        self.ctrl.clear()
+
+    def mash(self, path: str, presses: int, every: float = 0.1) -> None:
+        for _ in range(presses):
+            self.press(path, (ecodes.KEY_A,))
+            self.now += every
+
+    def hints(self) -> list[dict]:
+        return [m for _c, m in self.sent if m["type"] == "wake_hint"]
+
+    def test_mashing_a_killed_device_tells_the_live_user_how_to_wake_it(self) -> None:
+        self.mash(USB, d.WAKE_HINT_PRESSES)
+        self.assertEqual(
+            [(c, m) for c, m in self.sent if m["type"] == "wake_hint"],
+            [
+                (
+                    self.conns[ALICE],
+                    {
+                        "type": "wake_hint",
+                        "group": "b",
+                        "label": "b",
+                        "wake": "ctrl+alt+u",
+                    },
+                )
+            ],
+        )
+        self.assertEqual((self.states, self.ctrl), ([], []))  # never journaled
+
+    def test_too_few_or_too_slow_presses_say_nothing(self) -> None:
+        self.mash(USB, d.WAKE_HINT_PRESSES - 1)
+        self.now += d.WAKE_HINT_WINDOW
+        self.mash(USB, d.WAKE_HINT_PRESSES, every=d.WAKE_HINT_WINDOW)
+        self.assertEqual(self.hints(), [])
+
+    def test_at_most_one_hint_per_cooldown(self) -> None:
+        self.mash(USB, d.WAKE_HINT_PRESSES)
+        self.mash(USB, d.WAKE_HINT_PRESSES)
+        self.assertEqual(len(self.hints()), 1)
+        self.now += d.WAKE_HINT_COOLDOWN
+        self.mash(USB, d.WAKE_HINT_PRESSES)
+        self.assertEqual(len(self.hints()), 2)
+
+    def test_awake_device_says_nothing(self) -> None:
+        self.mash(LAPTOP, d.WAKE_HINT_PRESSES)
+        self.assertEqual(self.hints(), [])
+
+    def test_deferred_grab_says_nothing(self) -> None:
+        """Its keys still reach the OS: it is not dead yet."""
+        self.key(LAPTOP, ecodes.KEY_J, 1)
+        self.command(ALICE, "kill", "a")
+        self.assertGrabbed(USB)
+        self.mash(LAPTOP, d.WAKE_HINT_PRESSES)
+        self.assertEqual(self.hints(), [])
+
+
 class PushRestart(DaemonTest):
     def test_push_restart_drops_state_and_starts_awake(self) -> None:
         self.login_alice()
