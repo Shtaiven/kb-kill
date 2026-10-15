@@ -916,6 +916,28 @@ class Pointers(DaemonTest):
         self.key(TOUCH, ecodes.BTN_TOUCH, 0)
         self.assertGrabbed(MOUSE, TOUCH, VIDEO, STICK, TILT, DIAL, PEDALS)
 
+    def test_tapping_a_killed_touchscreen_hints_how_to_wake_it(self) -> None:
+        """A tap arrives as BTN_TOUCH, so it counts like a key press."""
+        with mock.patch.object(d.time, "monotonic", lambda: 1000.0):
+            self.press(LAPTOP, KILL_A)
+            self.sent.clear()
+            for _ in range(d.WAKE_HINT_PRESSES):
+                self.press(TOUCH, (ecodes.BTN_TOUCH,))
+        self.assertEqual(
+            [(c, m) for c, m in self.sent if m["type"] == "wake_hint"],
+            [
+                (
+                    self.conns[ALICE],
+                    {
+                        "type": "wake_hint",
+                        "group": "a",
+                        "label": "a",
+                        "wake": "ctrl+alt+u",
+                    },
+                )
+            ],
+        )
+
 
 KEYBOARDS = """\
 [groups.a]
