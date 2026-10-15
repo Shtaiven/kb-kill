@@ -677,8 +677,8 @@ class Tray:
 
     def _reload_settings(self) -> bool:
         self._settings_timer = 0
-        *osd, self.wake_hint = load_settings()
-        if self.osd.apply(*osd):
+        enabled, margin, opacity, self.wake_hint = load_settings()
+        if self.osd.apply(enabled, margin, opacity):
             self.osd.show([(ICON_AWAKE, "On-screen display")])
         return False  # one-shot timer
 
