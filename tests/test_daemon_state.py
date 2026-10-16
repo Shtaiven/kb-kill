@@ -40,6 +40,7 @@ KEYS = [
     ecodes.KEY_LEFTCTRL,
     ecodes.KEY_LEFTALT,
 ]
+ABS_XY = {ecodes.EV_ABS: [ecodes.ABS_X, ecodes.ABS_Y]}  # touch, joystick, tilt
 KILL_A = (ecodes.KEY_LEFTCTRL, ecodes.KEY_LEFTALT, ecodes.KEY_K)
 WAKE = (ecodes.KEY_LEFTCTRL, ecodes.KEY_LEFTALT, ecodes.KEY_U)
 
@@ -71,10 +72,17 @@ keyboards = "Laptop Keyboard"
 class FakeDev:
     """An evdev InputDevice as far as the daemon uses one."""
 
-    def __init__(self, name: str, keys: list[int] = KEYS, rel: bool = False) -> None:
+    def __init__(
+        self,
+        name: str,
+        keys: list[int] = KEYS,
+        rel: bool = False,
+        axes: dict[int, list[int]] | None = None,
+    ) -> None:
         self.name, self.phys = name, f"phys/{name}"
         self._keys = list(keys)
         self._rel = rel  # relative motion: a mouse
+        self._axes = axes or {}  # any other axes, by event type (ABS_XY, ...)
         self._r, self._w = os.pipe()  # a real fd, so the selector accepts it
         self.fd = self._r
         self.held: set[int] = set()
@@ -83,10 +91,11 @@ class FakeDev:
     def fileno(self) -> int:
         return self._r
 
-    def capabilities(self) -> dict[int, list[int]]:
+    def capabilities(self, absinfo: bool = True) -> dict[int, list[int]]:
         caps = {ecodes.EV_KEY: self._keys}
         if self._rel:
             caps[ecodes.EV_REL] = [ecodes.REL_X, ecodes.REL_Y]
+        caps.update(self._axes)
         return caps
 
     def active_keys(self) -> list[int]:
@@ -166,9 +175,14 @@ class DaemonTest(unittest.TestCase):
 
     # -- the world ------------------------------------------------------------ #
     def plug(
-        self, path: str, name: str, keys: list[int] = KEYS, rel: bool = False
+        self,
+        path: str,
+        name: str,
+        keys: list[int] = KEYS,
+        rel: bool = False,
+        axes: dict[int, list[int]] | None = None,
     ) -> FakeDev:
-        dev = FakeDev(name, keys, rel)
+        dev = FakeDev(name, keys, rel, axes)
         self.made.append(dev)
         self.world[path] = dev
         return dev
@@ -683,13 +697,13 @@ class NoKillWithoutWay(DaemonTest):
         self.assertIn(MEDIA, self.k.devices)
         self.press(LAPTOP, KILL_A)
         self.assertState(a=True)
-        self.assertGrabbed(LAPTOP, USB)  # devices = "*" still skips the media node
+        self.assertGrabbed(LAPTOP, USB, MEDIA)  # killed, yet still read
         self.key(LAPTOP, ecodes.KEY_LEFTCTRL, 1)
         self.key(MEDIA, ecodes.KEY_MUTE, 1)
         self.assertState(a=False)
 
-    def test_device_without_a_hotkey_key_is_not_read(self) -> None:
-        self.plug(VIDEO, "Video Bus", [ecodes.KEY_BRIGHTNESSUP])
+    def test_switch_is_not_read(self) -> None:
+        self.plug(VIDEO, "Lid Switch", [])  # EV_SW only: no keys, no axes
         self.login_alice()
         self.assertNotIn(VIDEO, self.k.devices)
 
@@ -792,9 +806,11 @@ class WakeHint(DaemonTest):
         self.states.clear()
         self.ctrl.clear()
 
-    def mash(self, path: str, presses: int, every: float = 0.1) -> None:
+    def mash(
+        self, path: str, presses: int, every: float = 0.1, key: int = ecodes.KEY_A
+    ) -> None:
         for _ in range(presses):
-            self.press(path, (ecodes.KEY_A,))
+            self.press(path, (key,))
             self.now += every
 
     def hints(self) -> list[dict]:
@@ -832,6 +848,21 @@ class WakeHint(DaemonTest):
         self.mash(USB, d.WAKE_HINT_PRESSES)
         self.assertEqual(len(self.hints()), 2)
 
+    def test_the_press_that_wakes_is_not_counted(self) -> None:
+        self.mash(USB, d.WAKE_HINT_PRESSES - len(WAKE))
+        self.press(USB, WAKE)  # its last key would be the hint's last press
+        self.assertState(a=False, b=False)
+        self.assertEqual(self.hints(), [])
+
+    def test_tapping_a_killed_touchscreen_hints_too(self) -> None:
+        """A tap arrives as BTN_TOUCH, so it counts like a key press."""
+        self.plug(TOUCH, "Some Touchscreen", [ecodes.BTN_TOUCH], axes=ABS_XY)
+        self.k.rescan()
+        self.push(ALICE, POINTERS)
+        self.press(LAPTOP, KILL_A)
+        self.mash(TOUCH, d.WAKE_HINT_PRESSES, key=ecodes.BTN_TOUCH)
+        self.assertEqual([h["group"] for h in self.hints()], ["a"])
+
     def test_awake_device_says_nothing(self) -> None:
         self.mash(LAPTOP, d.WAKE_HINT_PRESSES)
         self.assertEqual(self.hints(), [])
@@ -843,6 +874,98 @@ class WakeHint(DaemonTest):
         self.assertGrabbed(USB)
         self.mash(LAPTOP, d.WAKE_HINT_PRESSES)
         self.assertEqual(self.hints(), [])
+
+
+TOUCH, STICK, TILT = "/dev/input/event11", "/dev/input/event12", "/dev/input/event13"
+DIAL, PEDALS, PAD = "/dev/input/event14", "/dev/input/event15", "/dev/input/event16"
+
+POINTERS = """\
+[groups.a]
+pointers = "*"
+kill_combo = "ctrl+alt+k"
+wake_combo = "ctrl+alt+u"
+"""
+
+
+class Pointers(DaemonTest):
+    """What `pointers` targets: relative or absolute X/Y motion."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.plug(MOUSE, "Some Mouse", [ecodes.BTN_LEFT], rel=True)
+        self.plug(TOUCH, "Some Touchscreen", [ecodes.BTN_TOUCH], axes=ABS_XY)
+        self.plug(VIDEO, "Buttonless Trackball", [], rel=True)
+        self.plug(STICK, "Some Joystick", [ecodes.BTN_TRIGGER], axes=ABS_XY)
+        self.plug(TILT, "Some Accelerometer", [], axes=ABS_XY)
+        self.plug(
+            DIAL, "Some Dial", [ecodes.BTN_0], axes={ecodes.EV_REL: [ecodes.REL_DIAL]}
+        )
+        self.plug(PEDALS, "Some Pedals", [], axes={ecodes.EV_ABS: [ecodes.ABS_Z]})
+        self.plug(
+            MEDIA,
+            "USB Keyboard Consumer Control",
+            [ecodes.KEY_MUTE],
+            axes={
+                ecodes.EV_REL: [ecodes.REL_HWHEEL],
+                ecodes.EV_ABS: [ecodes.ABS_VOLUME],
+            },
+        )
+        self.boot()
+        self.activate("2", ALICE)
+        self.push(ALICE, POINTERS)
+
+    def test_kill_grabs_everything_with_an_axis_but_media_keys(self) -> None:
+        self.press(LAPTOP, KILL_A)
+        self.assertState(a=True)
+        self.assertGrabbed(MOUSE, TOUCH, VIDEO, STICK, TILT, DIAL, PEDALS)
+        self.press(LAPTOP, WAKE)
+        self.assertState(a=False)
+        self.assertGrabbed()
+
+    def test_grab_waits_for_a_finger_to_lift(self) -> None:
+        self.key(TOUCH, ecodes.BTN_TOUCH, 1)
+        self.press(LAPTOP, KILL_A)
+        self.assertGrabbed(MOUSE, VIDEO, STICK, TILT, DIAL, PEDALS)
+        self.key(TOUCH, ecodes.BTN_TOUCH, 0)
+        self.assertGrabbed(MOUSE, TOUCH, VIDEO, STICK, TILT, DIAL, PEDALS)
+
+    def test_a_pointer_with_a_key_is_both_classes(self) -> None:
+        """So the settings window offers it as a pointer, too."""
+        mouse = self.plug(VIDEO, "Mouse With Mute", [ecodes.KEY_MUTE], rel=True)
+        self.assertEqual(d.device_classes(mouse), ["kbd", "ptr"])
+        self.assertEqual(d.device_classes(self.world[TOUCH]), ["ptr"])
+        self.assertEqual(d.device_classes(self.world[LAPTOP]), ["kbd"])
+
+
+KEYBOARDS = """\
+[groups.a]
+keyboards = "*"
+kill_combo = "ctrl+alt+k"
+wake_combo = "ctrl+alt+u"
+"""
+
+
+class Keyboards(DaemonTest):
+    """What `keyboards` targets: anything with a KEY_* code, not only BTN_*."""
+
+    def test_kill_grabs_every_device_with_keys(self) -> None:
+        self.plug(PAD, "Some Numpad", [ecodes.KEY_KP1, ecodes.KEY_KPENTER])
+        self.plug(MEDIA, "USB Keyboard Consumer Control", [ecodes.KEY_MUTE])
+        self.plug(VIDEO, "Power Button", [ecodes.KEY_POWER])
+        mouse_buttons = list(
+            range(ecodes.BTN_LEFT, ecodes.BTN_LEFT + 16)
+        )  # 0x110-0x11f
+        self.plug(MOUSE, "Some Mouse", mouse_buttons, rel=True)
+        self.plug(STICK, "Lid Switch", [])
+        self.boot()
+        self.activate("2", ALICE)
+        self.push(ALICE, KEYBOARDS)
+        self.press(LAPTOP, KILL_A)
+        self.assertState(a=True)
+        self.assertGrabbed(LAPTOP, USB, PAD, MEDIA, VIDEO)  # no mouse, no switch
+        self.press(LAPTOP, WAKE)
+        self.assertState(a=False)
+        self.assertGrabbed()
 
 
 class PushRestart(DaemonTest):

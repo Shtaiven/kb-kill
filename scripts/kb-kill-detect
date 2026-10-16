@@ -113,7 +113,7 @@ def main() -> int:
 
     print("\nDevices:")
     for d in devices.get("devices", []):
-        kind = f"{d['class']}/{'virtual' if d['virtual'] else 'physical'}"
+        kind = f"{'+'.join(d['classes']) or 'other'}/{'virtual' if d['virtual'] else 'physical'}"
         flags = []
         if d.get("targets"):
             flags.append(f"TARGET of {', '.join(d['targets'])}")
