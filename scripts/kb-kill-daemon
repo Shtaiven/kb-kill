@@ -1360,12 +1360,12 @@ class KbKill:
         pressed = self.pressed[path]
         if event.value == 1:
             pressed.add(event.code)
-            if path in self.grabbed:
-                self._count_dead_press(path)
         else:
             pressed.discard(event.code)
         held = self._global_pressed()
         self._toggle_groups(held)  # on up as well as down: a release re-arms the latch
+        if event.value == 1 and path in self.grabbed:
+            self._count_dead_press(path)  # after: the press that wakes is not dead
         self._debug_progress(held, path)
         self._reconcile_grabs()
 

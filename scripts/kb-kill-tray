@@ -412,8 +412,7 @@ class Tray:
         self._render_queued = False
         self.osd = Osd()
         self._killed: dict[str, bool] | None = None
-        self._pending: dict[str, tuple[str, str]] = {}  # group -> (icon, text)
-        self._pending_seconds = OSD_SECONDS  # longer when a wake hint is queued
+        self._pending: dict[str, tuple[str, str, float]] = {}  # group -> card
         self._osd_timer = 0
         self.wake_hint = load_settings()[3]
         self._settings_timer = 0
@@ -539,20 +538,19 @@ class Tray:
     def _queue_osd(
         self, group: str, icon: str, text: str, seconds: float = OSD_SECONDS
     ) -> None:
-        self._pending[group] = (icon, text)
-        self._pending_seconds = max(self._pending_seconds, seconds)
+        self._pending[group] = (icon, text, seconds)
         if not self._osd_timer:
             self._osd_timer = GLib.timeout_add(OSD_COALESCE_MS, self._flush_osd)
 
     def _flush_osd(self) -> bool:
         self._osd_timer = 0
         pending, self._pending = self._pending, {}
-        seconds, self._pending_seconds = self._pending_seconds, OSD_SECONDS
         # In the groups' order; one gone since it was queued goes last.
+        cards = [pending.pop(g["name"]) for g in self.groups if g["name"] in pending]
+        cards += pending.values()
+        # The shortest wins: a wake hint must not hold other groups' cards up.
         self.osd.show(
-            [pending.pop(g["name"]) for g in self.groups if g["name"] in pending]
-            + list(pending.values()),
-            seconds,
+            [(icon, text) for icon, text, _s in cards], min(s for *_, s in cards)
         )
         return False  # one-shot timer
 

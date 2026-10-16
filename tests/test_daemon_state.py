@@ -850,6 +850,12 @@ class WakeHint(DaemonTest):
         self.mash(USB, d.WAKE_HINT_PRESSES)
         self.assertEqual(len(self.hints()), 2)
 
+    def test_the_press_that_wakes_is_not_counted(self) -> None:
+        self.mash(USB, d.WAKE_HINT_PRESSES - len(WAKE))
+        self.press(USB, WAKE)  # its last key would be the hint's last press
+        self.assertState(a=False, b=False)
+        self.assertEqual(self.hints(), [])
+
     def test_awake_device_says_nothing(self) -> None:
         self.mash(LAPTOP, d.WAKE_HINT_PRESSES)
         self.assertEqual(self.hints(), [])
