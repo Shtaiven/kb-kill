@@ -40,6 +40,7 @@ KEYS = [
     ecodes.KEY_LEFTCTRL,
     ecodes.KEY_LEFTALT,
 ]
+ABS_XY = {ecodes.EV_ABS: [ecodes.ABS_X, ecodes.ABS_Y]}  # touch, joystick, tilt
 KILL_A = (ecodes.KEY_LEFTCTRL, ecodes.KEY_LEFTALT, ecodes.KEY_K)
 WAKE = (ecodes.KEY_LEFTCTRL, ecodes.KEY_LEFTALT, ecodes.KEY_U)
 
@@ -76,14 +77,12 @@ class FakeDev:
         name: str,
         keys: list[int] = KEYS,
         rel: bool = False,
-        abs_: bool = False,
         axes: dict[int, list[int]] | None = None,
     ) -> None:
         self.name, self.phys = name, f"phys/{name}"
         self._keys = list(keys)
         self._rel = rel  # relative motion: a mouse
-        self._abs = abs_  # absolute X/Y: a touch surface, joystick, accelerometer
-        self._axes = axes or {}  # any other axes, by event type
+        self._axes = axes or {}  # any other axes, by event type (ABS_XY, ...)
         self._r, self._w = os.pipe()  # a real fd, so the selector accepts it
         self.fd = self._r
         self.held: set[int] = set()
@@ -96,8 +95,6 @@ class FakeDev:
         caps = {ecodes.EV_KEY: self._keys}
         if self._rel:
             caps[ecodes.EV_REL] = [ecodes.REL_X, ecodes.REL_Y]
-        if self._abs:
-            caps[ecodes.EV_ABS] = [ecodes.ABS_X, ecodes.ABS_Y]
         caps.update(self._axes)
         return caps
 
@@ -183,10 +180,9 @@ class DaemonTest(unittest.TestCase):
         name: str,
         keys: list[int] = KEYS,
         rel: bool = False,
-        abs_: bool = False,
         axes: dict[int, list[int]] | None = None,
     ) -> FakeDev:
-        dev = FakeDev(name, keys, rel, abs_, axes)
+        dev = FakeDev(name, keys, rel, axes)
         self.made.append(dev)
         self.world[path] = dev
         return dev
@@ -810,9 +806,11 @@ class WakeHint(DaemonTest):
         self.states.clear()
         self.ctrl.clear()
 
-    def mash(self, path: str, presses: int, every: float = 0.1) -> None:
+    def mash(
+        self, path: str, presses: int, every: float = 0.1, key: int = ecodes.KEY_A
+    ) -> None:
         for _ in range(presses):
-            self.press(path, (ecodes.KEY_A,))
+            self.press(path, (key,))
             self.now += every
 
     def hints(self) -> list[dict]:
@@ -856,6 +854,15 @@ class WakeHint(DaemonTest):
         self.assertState(a=False, b=False)
         self.assertEqual(self.hints(), [])
 
+    def test_tapping_a_killed_touchscreen_hints_too(self) -> None:
+        """A tap arrives as BTN_TOUCH, so it counts like a key press."""
+        self.plug(TOUCH, "Some Touchscreen", [ecodes.BTN_TOUCH], axes=ABS_XY)
+        self.k.rescan()
+        self.push(ALICE, POINTERS)
+        self.press(LAPTOP, KILL_A)
+        self.mash(TOUCH, d.WAKE_HINT_PRESSES, key=ecodes.BTN_TOUCH)
+        self.assertEqual([h["group"] for h in self.hints()], ["a"])
+
     def test_awake_device_says_nothing(self) -> None:
         self.mash(LAPTOP, d.WAKE_HINT_PRESSES)
         self.assertEqual(self.hints(), [])
@@ -886,10 +893,10 @@ class Pointers(DaemonTest):
     def setUp(self) -> None:
         super().setUp()
         self.plug(MOUSE, "Some Mouse", [ecodes.BTN_LEFT], rel=True)
-        self.plug(TOUCH, "Some Touchscreen", [ecodes.BTN_TOUCH], abs_=True)
+        self.plug(TOUCH, "Some Touchscreen", [ecodes.BTN_TOUCH], axes=ABS_XY)
         self.plug(VIDEO, "Buttonless Trackball", [], rel=True)
-        self.plug(STICK, "Some Joystick", [ecodes.BTN_TRIGGER], abs_=True)
-        self.plug(TILT, "Some Accelerometer", [], abs_=True)
+        self.plug(STICK, "Some Joystick", [ecodes.BTN_TRIGGER], axes=ABS_XY)
+        self.plug(TILT, "Some Accelerometer", [], axes=ABS_XY)
         self.plug(
             DIAL, "Some Dial", [ecodes.BTN_0], axes={ecodes.EV_REL: [ecodes.REL_DIAL]}
         )
@@ -928,28 +935,6 @@ class Pointers(DaemonTest):
         self.assertEqual(d.device_classes(mouse), ["kbd", "ptr"])
         self.assertEqual(d.device_classes(self.world[TOUCH]), ["ptr"])
         self.assertEqual(d.device_classes(self.world[LAPTOP]), ["kbd"])
-
-    def test_tapping_a_killed_touchscreen_hints_how_to_wake_it(self) -> None:
-        """A tap arrives as BTN_TOUCH, so it counts like a key press."""
-        with mock.patch.object(d.time, "monotonic", lambda: 1000.0):
-            self.press(LAPTOP, KILL_A)
-            self.sent.clear()
-            for _ in range(d.WAKE_HINT_PRESSES):
-                self.press(TOUCH, (ecodes.BTN_TOUCH,))
-        self.assertEqual(
-            [(c, m) for c, m in self.sent if m["type"] == "wake_hint"],
-            [
-                (
-                    self.conns[ALICE],
-                    {
-                        "type": "wake_hint",
-                        "group": "a",
-                        "label": "a",
-                        "wake": "ctrl+alt+u",
-                    },
-                )
-            ],
-        )
 
 
 KEYBOARDS = """\

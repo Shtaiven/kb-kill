@@ -632,7 +632,7 @@ def _has_keys(caps: dict) -> bool:
 def is_keyboard(dev: InputDevice) -> bool:
     """Any KEY_* code: full keyboards, and also numpads, macro pads, pedals,
     presenters, remotes, media and power-button nodes."""
-    return _has_keys(dev.capabilities())
+    return _has_keys(dev.capabilities(absinfo=False))
 
 
 def is_pointer(dev: InputDevice) -> bool:
@@ -673,9 +673,9 @@ def hotkey_keys(groups: list[Group]) -> set[int]:
 
 def watched(dev: InputDevice, groups: list[Group], keys: set[int]) -> bool:
     """What the daemon reads for `groups`: keyboards; pointers when a group
-    targets them; and any other device with a key in `keys` (hotkey_keys),
-    so a hotkey's mouse button can be typed on an untargeted mouse. The lockout check (_can_wake)
-    counts exactly these devices."""
+    targets them; and any other device with a hotkey's button in `keys`
+    (hotkey_keys), such as an untargeted mouse. The lockout check
+    (_can_wake) counts exactly these devices."""
     if is_keyboard(dev):
         return True
     if is_pointer(dev) and any(g.pointers or g.devices for g in groups):
