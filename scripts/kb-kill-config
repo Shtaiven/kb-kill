@@ -712,6 +712,15 @@ MATCHER_INFO = {
     ),
     "devices": ("Any Device", "Keyboards and pointers alike, by name or glob", None),
 }
+# What a bare "*" also catches, for the warning on save. More than one
+# kind at once uses the "devices" line, which covers both.
+EVERYTHING_EXAMPLES = MappingProxyType(
+    {
+        "keyboards": "power button, sleep button, laptop hotkeys and media keys",
+        "pointers": "touchscreen, touchpad, pen and screen-rotation sensor",
+        "devices": "power button, laptop hotkeys, touchscreen and touchpad",
+    }
+)
 VIRTUAL_CHOICES = [
     ("auto", "Auto", "Target the forwarded copy of anything input-remapper fronts"),
     ("true", "Virtual Devices Only", "Never grab a physical device"),
@@ -2933,7 +2942,9 @@ class ConfigWindow(Adw.ApplicationWindow):
         self._rebuild()
         self.changed()
 
-    def save(self, then=None, overwrite: bool = False) -> None:
+    def save(
+        self, then=None, overwrite: bool = False, everything: bool = False
+    ) -> None:
         if not self.readable:
             return
         names = [g.name.strip() for g in self.model.groups]
@@ -2942,6 +2953,16 @@ class ConfigWindow(Adw.ApplicationWindow):
                 "Not Saved",
                 f"Two groups are named {dup}, and one would replace the other. "
                 "Change one of their labels first.",
+            )
+            return
+        # overwrite: _confirm_overwrite is only reached past this check.
+        if not (overwrite or everything) and (warning := self._everything()):
+            self._confirm(
+                "Warning!",
+                warning,
+                "Save Anyway",
+                lambda: self.save(then, everything=True),
+                Adw.ResponseAppearance.DESTRUCTIVE,
             )
             return
         if not overwrite and self._read_text() != self.text:
@@ -2959,6 +2980,26 @@ class ConfigWindow(Adw.ApplicationWindow):
             "config_check",
             cmd="check_config",
             toml=text,
+        )
+
+    def _everything(self) -> str:
+        """The warning for every new bare "*": it kills more than the name
+        suggests. One already saved is not asked about again."""
+        saved = {g.key: g for g in self.saved.groups}
+        where, kinds = [], []
+        for g in self.model.groups:
+            old = saved.get(g.key)
+            for kind in MATCH_KEYS:
+                if "*" in g.matchers(kind) and not (old and "*" in old.matchers(kind)):
+                    where.append(f'{g.label.strip() or g.name.strip()} {kind}="*"')
+                    kinds += [] if kind in kinds else [kind]
+        if not where:
+            return ""
+        what = ", ".join(kinds[:-1]) + " and " + kinds[-1] if kinds[1:] else kinds[0]
+        examples = EVERYTHING_EXAMPLES[kinds[0] if len(kinds) == 1 else "devices"]
+        return (
+            "\n".join(where) + "\n\n"
+            f"This will kill all {what}, potentially including your {examples}!"
         )
 
     def _checked(self, text, snapshot, result, error, then, overwrite) -> None:
@@ -3140,11 +3181,18 @@ class ConfigWindow(Adw.ApplicationWindow):
         dialog.add_response("close", "Close")
         dialog.present(self)
 
-    def _confirm(self, heading: str, body: str, yes: str, then) -> None:
+    def _confirm(
+        self,
+        heading: str,
+        body: str,
+        yes: str,
+        then,
+        appearance=Adw.ResponseAppearance.SUGGESTED,
+    ) -> None:
         dialog = Adw.AlertDialog(heading=heading, body=body)
         dialog.add_response("cancel", "Cancel")
         dialog.add_response("yes", yes)
-        dialog.set_response_appearance("yes", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_response_appearance("yes", appearance)
         dialog.set_close_response("cancel")
         dialog.connect("response", lambda _d, r: r == "yes" and then())
         dialog.present(self)
