@@ -922,6 +922,13 @@ class Pointers(DaemonTest):
         self.key(TOUCH, ecodes.BTN_TOUCH, 0)
         self.assertGrabbed(MOUSE, TOUCH, VIDEO, STICK, TILT, DIAL, PEDALS)
 
+    def test_a_pointer_with_a_key_is_both_classes(self) -> None:
+        """So the settings window offers it as a pointer, too."""
+        mouse = self.plug(VIDEO, "Mouse With Mute", [ecodes.KEY_MUTE], rel=True)
+        self.assertEqual(d.device_classes(mouse), ["kbd", "ptr"])
+        self.assertEqual(d.device_classes(self.world[TOUCH]), ["ptr"])
+        self.assertEqual(d.device_classes(self.world[LAPTOP]), ["kbd"])
+
     def test_tapping_a_killed_touchscreen_hints_how_to_wake_it(self) -> None:
         """A tap arrives as BTN_TOUCH, so it counts like a key press."""
         with mock.patch.object(d.time, "monotonic", lambda: 1000.0):

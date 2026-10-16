@@ -683,8 +683,9 @@ def watched(dev: InputDevice, groups: list[Group], keys: set[int]) -> bool:
     return not keys.isdisjoint(dev.capabilities().get(ecodes.EV_KEY, []))
 
 
-def device_class(dev: InputDevice) -> str:
-    return "kbd" if is_keyboard(dev) else "ptr" if is_pointer(dev) else "other"
+def device_classes(dev: InputDevice) -> list[str]:
+    """Both when both: a mouse with a consumer key is still a pointer."""
+    return [c for c, test in (("kbd", is_keyboard), ("ptr", is_pointer)) if test(dev)]
 
 
 def fronting_map(devices: dict[str, InputDevice]) -> dict[str, tuple[str, InputDevice]]:
@@ -1203,7 +1204,7 @@ class KbKill:
                     {
                         "path": path,
                         "name": _safe(dev.name),
-                        "class": device_class(dev),
+                        "classes": device_classes(dev),
                         "virtual": is_virtual(dev),
                         "instead_of": _safe(copy_of[path]) if path in copy_of else None,
                     }
@@ -1480,7 +1481,7 @@ class KbKill:
         return {
             "path": path,
             "name": dev.name,
-            "class": device_class(dev),
+            "classes": device_classes(dev),
             "virtual": is_virtual(dev),
             "monitored": monitored,
             "grabbed": path in self.grabbed,

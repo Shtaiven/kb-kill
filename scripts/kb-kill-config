@@ -1075,7 +1075,12 @@ class GroupPage(Adw.PreferencesPage):
             rows.append(empty)
         for d in devices or []:
             kind = "virtual" if d.get("virtual") else "physical"
-            what = self.CLASS_WORDS.get(d.get("class"), "device")
+            what = (
+                " and ".join(
+                    self.CLASS_WORDS.get(c, "device") for c in d.get("classes", [])
+                )
+                or "device"
+            )
             parts = [f"{kind} {what}", str(d.get("path", ""))]
             if d.get("instead_of"):
                 parts.append(f"input-remapper's copy of {d['instead_of']}")
@@ -3082,7 +3087,7 @@ class ConfigWindow(Adw.ApplicationWindow):
         for d in reply.get("devices", []):
             # kb-kill only watches keyboards and pointers: a lid switch or a
             # headphone jack could be matched but never disabled, so not offered.
-            if d.get("class") not in ((cls,) if cls else ("kbd", "ptr")):
+            if not set(d.get("classes", [])) & ({cls} if cls else {"kbd", "ptr"}):
                 continue
             name = d.get("name") or ""
             if name and name not in seen:
