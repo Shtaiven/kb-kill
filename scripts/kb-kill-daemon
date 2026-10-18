@@ -615,21 +615,38 @@ def load_config_text(text: str, source: str, warn: Warn = _journal_warn) -> Conf
 # --------------------------------------------------------------------------- #
 # Devices
 # --------------------------------------------------------------------------- #
+def _is_key(code: int) -> bool:
+    """A KEY_* code, not a BTN_*. By range, not by name: mice report unnamed
+    button codes (0x118-0x11f) that ecodes.BTN does not list."""
+    if ecodes.BTN_DPAD_UP <= code <= ecodes.BTN_DPAD_RIGHT:
+        return False
+    return (
+        0 < code < ecodes.BTN_MISC or ecodes.KEY_OK <= code < ecodes.BTN_TRIGGER_HAPPY
+    )
+
+
+def _has_keys(caps: dict) -> bool:
+    return any(_is_key(c) for c in caps.get(ecodes.EV_KEY, []))
+
+
 def is_keyboard(dev: InputDevice) -> bool:
-    keys = dev.capabilities().get(ecodes.EV_KEY, [])
-    return ecodes.KEY_A in keys and ecodes.KEY_Z in keys and ecodes.KEY_ENTER in keys
+    """Any KEY_* code: full keyboards, and also numpads, macro pads, pedals,
+    presenters, remotes, media and power-button nodes."""
+    return _has_keys(dev.capabilities(absinfo=False))
 
 
 def is_pointer(dev: InputDevice) -> bool:
-    """A mouse button plus relative motion (mouse) or a touch surface (touchpad)."""
-    caps = dev.capabilities()
-    keys = caps.get(ecodes.EV_KEY, [])
-    rel = caps.get(ecodes.EV_REL, [])
-    has_button = ecodes.BTN_LEFT in keys or ecodes.BTN_MOUSE in keys
-    has_motion = (
-        ecodes.REL_X in rel and ecodes.REL_Y in rel
-    ) or ecodes.BTN_TOUCH in keys
-    return has_button and has_motion
+    """X/Y motion, relative (mouse, trackball) or absolute (touchpad,
+    touchscreen, pen tablet, joystick, accelerometer); or any axis on a device
+    without keys (dial, scroll knob, pedals). A media node's volume and
+    scroll axes do not make it a pointer."""
+    caps = dev.capabilities(absinfo=False)
+    rel, abs_ = caps.get(ecodes.EV_REL, []), caps.get(ecodes.EV_ABS, [])
+    if (ecodes.REL_X in rel and ecodes.REL_Y in rel) or (
+        ecodes.ABS_X in abs_ and ecodes.ABS_Y in abs_
+    ):
+        return True
+    return bool(rel or abs_) and not _has_keys(caps)
 
 
 def is_virtual(dev: InputDevice) -> bool:
@@ -656,10 +673,9 @@ def hotkey_keys(groups: list[Group]) -> set[int]:
 
 def watched(dev: InputDevice, groups: list[Group], keys: set[int]) -> bool:
     """What the daemon reads for `groups`: keyboards; pointers when a group
-    targets them; and any other device with a key in `keys` (hotkey_keys),
-    so a hotkey's mouse button or a media key on a keyboard's separate
-    "Consumer Control" node can be typed. The lockout check (_can_wake)
-    counts exactly these devices."""
+    targets them; and any other device with a hotkey's button in `keys`
+    (hotkey_keys), such as an untargeted mouse. The lockout check
+    (_can_wake) counts exactly these devices."""
     if is_keyboard(dev):
         return True
     if is_pointer(dev) and any(g.pointers or g.devices for g in groups):
@@ -667,8 +683,9 @@ def watched(dev: InputDevice, groups: list[Group], keys: set[int]) -> bool:
     return not keys.isdisjoint(dev.capabilities().get(ecodes.EV_KEY, []))
 
 
-def device_class(dev: InputDevice) -> str:
-    return "kbd" if is_keyboard(dev) else "ptr" if is_pointer(dev) else "other"
+def device_classes(dev: InputDevice) -> list[str]:
+    """Both when both: a mouse with a consumer key is still a pointer."""
+    return [c for c, test in (("kbd", is_keyboard), ("ptr", is_pointer)) if test(dev)]
 
 
 def fronting_map(devices: dict[str, InputDevice]) -> dict[str, tuple[str, InputDevice]]:
@@ -1187,7 +1204,7 @@ class KbKill:
                     {
                         "path": path,
                         "name": _safe(dev.name),
-                        "class": device_class(dev),
+                        "classes": device_classes(dev),
                         "virtual": is_virtual(dev),
                         "instead_of": _safe(copy_of[path]) if path in copy_of else None,
                     }
@@ -1344,12 +1361,12 @@ class KbKill:
         pressed = self.pressed[path]
         if event.value == 1:
             pressed.add(event.code)
-            if path in self.grabbed:
-                self._count_dead_press(path)
         else:
             pressed.discard(event.code)
         held = self._global_pressed()
         self._toggle_groups(held)  # on up as well as down: a release re-arms the latch
+        if event.value == 1 and path in self.grabbed:
+            self._count_dead_press(path)  # after: the press that wakes is not dead
         self._debug_progress(held, path)
         self._reconcile_grabs()
 
@@ -1464,7 +1481,7 @@ class KbKill:
         return {
             "path": path,
             "name": dev.name,
-            "class": device_class(dev),
+            "classes": device_classes(dev),
             "virtual": is_virtual(dev),
             "monitored": monitored,
             "grabbed": path in self.grabbed,
@@ -1765,7 +1782,7 @@ class KbKill:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="kb-kill-daemon",
-        description="Disable/enable input devices (keyboards, mice, touchpads) on a global hotkey.",
+        description="Disable/enable input devices (keyboards, mice, touchscreens, joysticks, ...) on a global hotkey.",
     )
     parser.add_argument("command", nargs="?", choices=["run"], help=argparse.SUPPRESS)
     parser.add_argument(

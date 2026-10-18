@@ -67,11 +67,8 @@ def socket_path() -> str:
 
 
 def is_key_device(dev: InputDevice) -> bool:
-    """Keyboards and pointers (anything with keys or buttons we care about)."""
-    keys = dev.capabilities().get(ecodes.EV_KEY, [])
-    return (
-        ecodes.KEY_ENTER in keys or ecodes.BTN_LEFT in keys or ecodes.BTN_MOUSE in keys
-    )
+    """Anything with a key or button: every key event the daemon could see."""
+    return bool(dev.capabilities().get(ecodes.EV_KEY))
 
 
 def mask_to_keys(fd: int) -> None:

@@ -4,18 +4,19 @@
 
 # kb-kill
 
-Disable/enable a target keyboard, mouse, or touchpad with a global hotkey, as a
-background service.
+Disable/enable a target keyboard, mouse, touchpad, or touchscreen with a global
+hotkey, as a background service.
 
 Press the **kill** hotkey on *any* keyboard to disable a target keyboard (e.g.
 the laptop's built-in keyboard). While disabled, every key from the target is
 swallowed **except** the **wake** hotkey, so a killed keyboard can always wake
 itself. There is no way to lock yourself out.
 
-It works for **mice and touchpads** too: a group can target pointing devices
+It works for **mice, trackballs, touchpads, touchscreens and joysticks** too: a group can target pointing devices
 (`pointers`) or both kinds at once (`devices`), and even a keyboard and a mouse
 together. A killed pointer self-wakes with a mouse-button combo, or you wake it
-from the keyboard. See [Configuration](#configuration).
+from the keyboard (a device without mouse buttons, like a touchscreen, joystick or
+buttonless trackball, always wakes from the keyboard). See [Configuration](#configuration).
 
 Typical use: your cat is sitting on your laptop keyboard while you work on an
 external keyboard. Kill the laptop keyboard with a hotkey. Or disable the
@@ -187,11 +188,14 @@ metacharacter is a **glob**:
 | `"Logitech {MX*,USB Keyboard}"` | `{a,b}` either alternative (braces may nest)                        |
 | `"*"`                           | every device of that class                                          |
 
-| field       | matches                                            |
-| ----------- | -------------------------------------------------- |
-| `keyboards` | keyboard-class devices only                        |
-| `pointers`  | pointing devices only: mice, trackballs, touchpads |
-| `devices`   | keyboards and pointers alike, whichever class      |
+| field       | matches                                                                                                       |
+| ----------- | ------------------------------------------------------------------------------------------------------------- |
+| `keyboards` | anything with keys: keyboards, numpads, macro pads, pedals, presenters, remotes, media and power-button keys  |
+| `pointers`  | X/Y motion or keyless axes: mice, trackballs, touchpads, touchscreens, pens, joysticks, dials, accelerometers |
+| `devices`   | keyboards and pointers alike, whichever class                                                                 |
+
+Switches (lid, tablet mode, headphone jack) are in neither class and are never
+grabbed.
 
 At least one field is required; set several to target them together. A pointer
 group can **self-wake** if its `wake_combo` is a mouse-button combo; otherwise
@@ -292,11 +296,11 @@ together. The old name `virtual_keyboard` is accepted as a deprecated alias.
   there would be no way back short of logging out. The journal says so
   (`not killed: no device can type its wake hotkey`), the tray shows it as a
   warning on-screen display, and the settings window warns on the group's
-  **Start killed** switch. The daemon reads every keyboard,
-  pointers when a group targets them, and any other device that has a key or
-  button some hotkey names: a mouse button in a keyboard group's wake hotkey,
-  or a media key on a keyboard's separate "Consumer Control" device. A device
-  read only for a hotkey key is never a target; it only types the hotkey.
+  **Start killed** switch. The daemon reads every keyboard (any
+  device with keys), pointers when a group targets them, and any other device that has a
+  button some hotkey names (a mouse button in a keyboard group's wake hotkey).
+  A device read only for a hotkey button is never a target; it only types the
+  hotkey.
 
 - Limits: at most 64 groups, and 16 keys per hotkey.
 
@@ -546,13 +550,14 @@ keycodes arrive.
 
 ## Security model
 
-kb-kill reads all keyboard input (and mouse buttons, for pointer groups, and
-key events of any other device that has a key a hotkey names), so it
-is keylogger-*capable*. The design minimizes and contains that:
+kb-kill reads the key events of every device that has keys (keyboards, but
+also media and power keys, numpads, pedals and remotes), the buttons and touch
+contacts of pointers for pointer groups, and the buttons of any other device a
+hotkey names, so it is keylogger-*capable*. The design minimizes and contains that:
 
 - **No keystroke content is ever stored or transmitted.** The daemon keeps only
-  the set of keys *currently held*, discarded on release. Pointer motion never
-  reaches the process: every device fd carries an `EVIOCSMASK` so the kernel
+  the set of keys *currently held*, discarded on release. Pointer motion, touch
+  positions and joystick/accelerometer axes never reach the process: every device fd carries an `EVIOCSMASK` so the kernel
   delivers key events only. The control socket carries config text and group
   state, never key data; the root-only `debug` stream names combo tokens and
   devices, not typed keys.
