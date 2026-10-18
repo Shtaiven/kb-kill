@@ -14,7 +14,7 @@ import stat
 import sys
 
 # Rewritten by packaging/bump-version.sh from the repo-root VERSION file.
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 
 
 def socket_path() -> str:
